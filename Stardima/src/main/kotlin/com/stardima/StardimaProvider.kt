@@ -8,7 +8,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 
-// ==================== JSON API MODELS ====================
+// ==================== STARDIMA API MODELS ====================
 
 data class StardimaSearchResponse(
     @JsonProperty("videos") val videos: List<StardimaSearchVideo>?,
@@ -68,6 +68,31 @@ data class StardimaSeasonDetail(
     @JsonProperty("number") val number: Int?
 )
 
+// ==================== HYPERWATCHING API MODELS ====================
+
+data class HyperwatchingLinkResponse(
+    @JsonProperty("success") val success: Boolean?,
+    @JsonProperty("status") val status: String?,
+    @JsonProperty("watch_url") val watchUrl: String?,
+    @JsonProperty("server_name") val serverName: String?
+)
+
+data class HyperwatchingTokenResponse(
+    @JsonProperty("token") val token: String?
+)
+
+data class HyperwatchingExtractResponse(
+    @JsonProperty("success") val success: Boolean?,
+    @JsonProperty("data") val data: HyperwatchingExtractData?
+)
+
+data class HyperwatchingExtractData(
+    @JsonProperty("file") val file: String?,
+    @JsonProperty("headers") val headers: Map<String, String>?
+)
+
+// ==================== PROVIDER ====================
+
 class StardimaProvider : MainAPI() {
     override var mainUrl = "https://www.stardima.com"
     override var name = "ستارديما"
@@ -90,14 +115,12 @@ class StardimaProvider : MainAPI() {
         val doc = app.get(mainUrl, headers = headers).document
         val sections = mutableListOf<HomePageList>()
 
-        // Each section: h2 heading + embla carousel in the same parent container
         val sectionHeadings = doc.select("h2.text-white")
 
         for (heading in sectionHeadings) {
             val sectionTitle = heading.text().trim()
             if (sectionTitle.isBlank()) continue
 
-            // The embla carousel is a sibling after the heading's parent
             val emblaContainer = heading.parent()?.parent()?.selectFirst("div.embla")
                 ?: heading.parent()?.parent()?.nextElementSiblings()?.select("div.embla")?.first()
                 ?: continue
@@ -111,7 +134,6 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        // Fallback: try finding all embla carousels
         if (sections.isEmpty()) {
             doc.select("div.embla").forEach { carousel ->
                 val title = carousel.parent()?.selectFirst("h2")?.text()?.trim() ?: "الرئيسية"
@@ -142,7 +164,6 @@ class StardimaProvider : MainAPI() {
             val fullUrl = if (url.startsWith("http")) url else "$mainUrl$url"
             val title = video.title ?: return@mapNotNull null
 
-            // Poster URL can be relative or absolute
             val posterUrl = video.posterUrl?.let { poster ->
                 if (poster.startsWith("http")) poster else "$mainUrl/storage/$poster"
             }
@@ -193,7 +214,6 @@ class StardimaProvider : MainAPI() {
         description: String?,
         tags: List<String>?
     ): LoadResponse {
-        // Movie play URL is at /play/{slug}
         val playUrl = doc.selectFirst("a[href*=/play/]")?.attr("href")
             ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
             ?: url
@@ -216,12 +236,10 @@ class StardimaProvider : MainAPI() {
         val episodes = mutableListOf<Episode>()
         val seriesSlug = url.trimEnd('/').substringAfterLast("/")
 
-        // Step 1: Find the first play link to get the initial episode ID
         val firstPlayHref = doc.selectFirst("a[href*='/play/']")?.attr("href")
             ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
 
         if (firstPlayHref == null) {
-            // No play link found, return with empty episodes
             return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
                 this.plot = description
@@ -229,18 +247,14 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        // Step 2: Fetch the play page to get season data
         val playDoc = app.get(firstPlayHref, headers = headers).document
 
-        // Step 3: Find all season items on the play page
         val seasonItems = playDoc.select(".season-item")
 
         if (seasonItems.isNotEmpty()) {
-            // Fetch episodes for each season via the API
             for (seasonEl in seasonItems) {
                 val seasonId = seasonEl.attr("data-season-id")
                 val seasonNumberStr = seasonEl.attr("data-season-number")
-                // Extract number from "Season 1", "one piece S01", etc.
                 val seasonNumber = Regex("""(\d+)""").find(seasonNumberStr)?.groupValues?.get(1)?.toIntOrNull() ?: 1
 
                 if (seasonId.isNotBlank()) {
@@ -270,7 +284,6 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        // Fallback: parse episode list items from play page HTML
         if (episodes.isEmpty()) {
             val episodeItems = playDoc.select(".episode-list-item")
             for (epEl in episodeItems) {
@@ -305,60 +318,150 @@ class StardimaProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // For TV show episodes: data is /tvshow/{slug}/play/{episodeId}
-        // For movies: data is /play/{slug}
-
         val isTvEpisode = data.contains("/tvshow/") && data.contains("/play/")
+        var hyperwatchingUrl: String? = null
 
         if (isTvEpisode) {
-            // Extract episode ID from URL
             val episodeId = data.trimEnd('/').substringAfterLast("/")
             if (episodeId.all { it.isDigit() }) {
-                // Use the episode API to get watch_url directly
                 try {
                     val apiResponse = app.get(
                         "$mainUrl/series/episode/$episodeId",
                         headers = apiHeaders
                     )
                     val epData = apiResponse.parsedSafe<StardimaEpisodeDetailResponse>()
-                    val watchUrl = epData?.episode?.watchUrl
-                    if (!watchUrl.isNullOrBlank()) {
-                        loadExtractor(watchUrl, data, subtitleCallback, callback)
-                        return true
-                    }
+                    hyperwatchingUrl = epData?.episode?.watchUrl
                 } catch (_: Exception) {}
             }
-
-            // Fallback: try scraping the play page for iframe
-            val doc = app.get(data, headers = headers).document
-            val iframeUrl = doc.selectFirst("#video-player-container iframe")?.attr("src")
-                ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
-
-            if (!iframeUrl.isNullOrBlank()) {
-                loadExtractor(iframeUrl, data, subtitleCallback, callback)
-                return true
-            }
         } else {
-            // Movie: /play/{slug} — the iframe src is directly in the HTML
             val doc = app.get(data, headers = headers).document
-            val iframeUrl = doc.selectFirst("#video-player-container iframe")?.attr("src")
+            hyperwatchingUrl = doc.selectFirst("#video-player-container iframe")?.attr("src")
                 ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
 
-            if (!iframeUrl.isNullOrBlank()) {
-                loadExtractor(iframeUrl, data, subtitleCallback, callback)
-                return true
-            }
-
-            // Fallback: search all iframes
-            doc.select("iframe[src]").forEach { iframe ->
-                val src = iframe.attr("src")
-                if (src.isNotBlank() && src.startsWith("http") && !src.contains("about:blank")) {
-                    loadExtractor(src, data, subtitleCallback, callback)
+            if (hyperwatchingUrl.isNullOrBlank()) {
+                doc.select("iframe[src]").forEach { iframe ->
+                    val src = iframe.attr("src")
+                    if (src.isNotBlank() && src.startsWith("http") && !src.contains("about:blank")) {
+                        loadExtractor(src, data, subtitleCallback, callback)
+                    }
                 }
             }
         }
 
+        if (!hyperwatchingUrl.isNullOrBlank()) {
+            extractFromHyperwatching(hyperwatchingUrl!!, subtitleCallback, callback)
+        }
+
         return true
+    }
+
+    // ==================== HYPERWATCHING EXTRACTOR ====================
+
+    private suspend fun extractFromHyperwatching(
+        iframeUrl: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        try {
+            val pageResponse = app.get(iframeUrl, headers = headers)
+            val html = pageResponse.text
+
+            val csrf = Regex("""csrf:\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1) ?: return
+
+            val serverPattern = Regex("""\{id:\s*['"](\d+)['"],\s*name:\s*['"]([^'"]+)['"]""")
+            val servers = serverPattern.findAll(html).map {
+                it.groupValues[1] to it.groupValues[2]
+            }.toList()
+
+            if (servers.isEmpty()) {
+                val simpleServers = Regex("""id:\s*['"](\d+)['"]""").findAll(html).map {
+                    it.groupValues[1] to "Server"
+                }.toList()
+                if (simpleServers.isEmpty()) return
+                extractFromServers(simpleServers, csrf, iframeUrl, html, subtitleCallback, callback)
+            } else {
+                extractFromServers(servers, csrf, iframeUrl, html, subtitleCallback, callback)
+            }
+        } catch (_: Exception) {}
+    }
+
+    private suspend fun extractFromServers(
+        servers: List<Pair<String, String>>,
+        csrf: String,
+        iframeUrl: String,
+        html: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val linkRoute = Regex("""link:\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1) ?: return
+        val tokenRoute = Regex("""token:\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1)
+        val extractRoute = Regex("""extract:\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1)
+
+        val hyperApiHeaders = mapOf(
+            "X-CSRF-TOKEN" to csrf,
+            "Content-Type" to "application/x-www-form-urlencoded",
+            "Accept" to "application/json",
+            "Referer" to iframeUrl,
+            "User-Agent" to headers["User-Agent"]!!
+        )
+
+        for ((serverId, serverName) in servers) {
+            try {
+                val linkResponse = app.post(
+                    linkRoute,
+                    headers = hyperApiHeaders,
+                    data = mapOf("server_link_id" to serverId)
+                )
+                val linkData = linkResponse.parsedSafe<HyperwatchingLinkResponse>()
+
+                if (linkData?.watchUrl.isNullOrBlank()) continue
+                val watchUrl = linkData!!.watchUrl!!
+
+                if (!tokenRoute.isNullOrBlank() && !extractRoute.isNullOrBlank()) {
+                    try {
+                        val tokenResponse = app.post(
+                            tokenRoute,
+                            headers = hyperApiHeaders,
+                            data = mapOf("url" to watchUrl)
+                        )
+                        val tokenData = tokenResponse.parsedSafe<HyperwatchingTokenResponse>()
+                        val token = tokenData?.token
+
+                        if (!token.isNullOrBlank()) {
+                            val extractResponse = app.post(
+                                extractRoute,
+                                headers = hyperApiHeaders,
+                                data = mapOf("token" to token)
+                            )
+                            val extractData = extractResponse.parsedSafe<HyperwatchingExtractResponse>()
+
+                            if (extractData?.success == true && !extractData.data?.file.isNullOrBlank()) {
+                                val directUrl = extractData.data!!.file!!
+                                val extraHeaders = extractData.data.headers ?: emptyMap()
+
+                                callback.invoke(
+                                    newExtractorLink(
+                                        source = serverName,
+                                        name = "$name - $serverName",
+                                        url = directUrl,
+                                        type = INFER_TYPE
+                                    ) {
+                                        this.referer = extraHeaders["Referer"] ?: iframeUrl
+                                        this.quality = Qualities.Unknown.value
+                                    }
+                                )
+                                continue
+                            }
+                        }
+                    } catch (_: Exception) {}
+                }
+
+                try {
+                    loadExtractor(watchUrl, iframeUrl, subtitleCallback, callback)
+                } catch (_: Exception) {}
+
+            } catch (_: Exception) {}
+        }
     }
 
     // ==================== HELPERS ====================
