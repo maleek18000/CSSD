@@ -56,6 +56,26 @@
   "url": "https://github.com/Abodabodd/re-3arabi/raw/refs/heads/main/build/Shahidwbas.cs3",
   "name": "Shahidwbas"
 },
+{
+  "iconUrl": "https://www.stardima.com/favicon.ico",
+  "apiVersion": 1,
+  "repositoryUrl": "https://github.com/Abodabodd/re-3arabi",
+  "fileSize": 28088,
+  "status": 1,
+  "language": "ar",
+  "authors": [
+    "Abodabodd"
+  ],
+  "tvTypes": [
+    "TvSeries",
+    "Movie",
+    "Anime"
+  ],
+  "version": 1,
+  "internalName": "Stardima",
+  "url": "https://github.com/Abodabodd/re-3arabi/raw/refs/heads/main/build/Stardima.cs3",
+  "name": "ستارديما"
+},
   {
     "iconUrl": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcS9Lci-tXtOtWaHcEp9An7bqIkXs4yzH7EcfA&s",
     "apiVersion": 1,
