@@ -8,20 +8,40 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 
-data class SeasonEpisodesResponse(
-    @JsonProperty("status") val status: Boolean?,
-    @JsonProperty("html") val html: String?
+data class StardimaSeasonEpisodesResponse(
+    @JsonProperty("episodes") val episodes: List<StardimaEpisode>?,
+    @JsonProperty("series_id") val seriesId: String?
 )
 
-data class EpisodeData(
+data class StardimaEpisode(
     @JsonProperty("id") val id: Int?,
     @JsonProperty("title") val title: String?,
-    @JsonProperty("watch_url") val watchUrl: String?
+    @JsonProperty("is_exclusive") val isExclusive: Boolean?
 )
 
-data class EpisodeDetailResponse(
-    @JsonProperty("status") val status: Boolean?,
-    @JsonProperty("data") val data: EpisodeData?
+data class StardimaEpisodeDetailResponse(
+    @JsonProperty("episode") val episode: StardimaEpisodeDetail?,
+    @JsonProperty("series") val series: StardimaSeriesDetail?,
+    @JsonProperty("season") val season: StardimaSeasonDetail?
+)
+
+data class StardimaEpisodeDetail(
+    @JsonProperty("id") val id: Int?,
+    @JsonProperty("episode_number") val episodeNumber: Int?,
+    @JsonProperty("title") val title: String?,
+    @JsonProperty("watch_url") val watchUrl: String?,
+    @JsonProperty("can_watch") val canWatch: Boolean?
+)
+
+data class StardimaSeriesDetail(
+    @JsonProperty("slug") val slug: String?,
+    @JsonProperty("title") val title: String?,
+    @JsonProperty("poster_url") val posterUrl: String?
+)
+
+data class StardimaSeasonDetail(
+    @JsonProperty("id") val id: Int?,
+    @JsonProperty("number") val number: Int?
 )
 
 class StardimaProvider : MainAPI() {
@@ -42,12 +62,17 @@ class StardimaProvider : MainAPI() {
 
         val sections = mutableListOf<HomePageList>()
 
-        // Parse homepage sections from Embla carousels
-        doc.select("div.embla").forEach { carousel ->
-            val sectionTitle = carousel.selectFirst("h2, h3, .section-title, .embla__title")
-                ?.text()?.trim() ?: return@forEach
+        val sectionHeadings = doc.select("h2.text-white")
 
-            val items = carousel.select("div.embla__slide").mapNotNull { slide ->
+        for (heading in sectionHeadings) {
+            val sectionTitle = heading.text().trim()
+            if (sectionTitle.isBlank()) continue
+
+            val emblaContainer = heading.parent()?.parent()?.selectFirst("div.embla")
+                ?: heading.parent()?.parent()?.nextElementSiblings()?.select("div.embla")?.first()
+                ?: continue
+
+            val items = emblaContainer.select("div.embla__slide").mapNotNull { slide ->
                 slide.toSearchResponse()
             }
 
@@ -56,13 +81,17 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        // If no Embla sections found, try generic card containers
         if (sections.isEmpty()) {
-            val allCards = doc.select("div.card, article.post, div.post-item, div.movie-card, div.series-card").mapNotNull {
-                it.toSearchResponse()
-            }
-            if (allCards.isNotEmpty()) {
-                sections.add(HomePageList("الرئيسية", allCards))
+            doc.select("div.embla").forEach { carousel ->
+                val title = carousel.parent()?.selectFirst("h2")?.text()?.trim() ?: "الرئيسية"
+
+                val items = carousel.select("div.embla__slide").mapNotNull { slide ->
+                    slide.toSearchResponse()
+                }
+
+                if (items.isNotEmpty()) {
+                    sections.add(HomePageList(title, items))
+                }
             }
         }
 
@@ -74,8 +103,13 @@ class StardimaProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val doc = app.get("$mainUrl/?s=$query", headers = headers).document
 
-        return doc.select("div.embla__slide, div.card, article.post, div.post-item, div.movie-card, div.series-card, div.search-result")
-            .mapNotNull { it.toSearchResponse() }
+        return doc.select("div.embla__slide").mapNotNull { slide ->
+            slide.toSearchResponse()
+        }.ifEmpty {
+            doc.select("div.group/item, a[href*=/movie/], a[href*=/tvshow/]").mapNotNull {
+                it.toSearchResponseFromLink()
+            }
+        }
     }
 
     // ==================== LOAD ====================
@@ -83,52 +117,43 @@ class StardimaProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse? {
         val doc = app.get(url, headers = headers).document
 
-        val title = doc.selectFirst("h1, .post-title, .entry-title, .hero-title")
-            ?.text()?.trim() ?: return null
+        val title = doc.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
+            ?: doc.selectFirst("h1")?.text()?.trim()
+            ?: return null
 
-        val poster = doc.selectFirst(".post-thumbnail img, .hero-image img, .poster img, meta[property=og:image]")
-            ?.let { img ->
-                img.attr("data-src").ifBlank { img.attr("src") }.ifBlank { img.attr("content") }
-            }
+        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")?.trim()
 
-        val description = doc.selectFirst(".post-content, .entry-content, .description, .synopsis, meta[property=og:description]")
-            ?.let { el ->
-                el.text()?.trim()?.ifBlank { el.attr("content") }
-            }
+        val description = doc.selectFirst("meta[property=og:description]")?.attr("content")?.trim()
+            ?: doc.selectFirst("meta[name=description]")?.attr("content")?.trim()
 
-        val year = doc.selectFirst(".year, .release-year, meta[property=og:release_date]")
-            ?.text()?.trim()?.toIntOrNull()
+        val tags = doc.select("meta[name=keywords]")?.attr("content")?.split(",")?.map { it.trim() }
+            ?: emptyList()
 
-        val tags = doc.select(".genres a, .category a, .tags a").map { it.text().trim() }
-
-        val isTvSeries = url.contains("/tvshow/") || url.contains("/series/")
+        val isTvSeries = url.contains("/tvshow/")
 
         return if (isTvSeries) {
-            loadTvSeries(url, doc, title, poster, description, year, tags)
+            loadTvSeries(url, doc, title, poster, description, tags)
         } else {
-            loadMovie(url, doc, title, poster, description, year, tags)
+            loadMovie(url, doc, title, poster, description, tags)
         }
     }
 
+    // FIX 1: Added "suspend" keyword
     private suspend fun loadMovie(
         url: String,
         doc: org.jsoup.nodes.Document,
         title: String,
         poster: String?,
         description: String?,
-        year: Int?,
-        tags: List<String>
+        tags: List<String>?
     ): LoadResponse {
-        // Find the play link for the movie
-        val playUrl = doc.selectFirst("a[href*=/play/]")
-            ?.attr("href")
+        val playUrl = doc.selectFirst("a[href*=/play/]")?.attr("href")
             ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
             ?: url
 
         return newMovieLoadResponse(title, url, TvType.Movie, playUrl) {
             this.posterUrl = poster
             this.plot = description
-            this.year = year
             this.tags = tags
         }
     }
@@ -139,109 +164,64 @@ class StardimaProvider : MainAPI() {
         title: String,
         poster: String?,
         description: String?,
-        year: Int?,
-        tags: List<String>
+        tags: List<String>?
     ): LoadResponse {
         val episodes = mutableListOf<Episode>()
+        val seriesSlug = url.trimEnd('/').substringAfterLast("/")
 
-        // Strategy 1: Parse seasons from the page HTML
-        val seasonElements = doc.select("div.season, div#seasons li, ul.seasons-list li, [data-season]")
+        // Strategy 1: Parse season items from the page HTML
+        val seasonItems = doc.select(".season-item")
 
-        if (seasonElements.isNotEmpty()) {
-            seasonElements.forEachIndexed { seasonIndex, seasonEl ->
-                val seasonName = seasonEl.text().trim()
-                val seasonNumber = seasonName.filter { it.isDigit() }.toIntOrNull() ?: (seasonIndex + 1)
+        if (seasonItems.isNotEmpty()) {
+            for (seasonEl in seasonItems) {
+                val seasonId = seasonEl.attr("data-season-id")
+                val seasonNumberStr = seasonEl.attr("data-season-number")
+                val seasonNumber = seasonNumberStr.filter { it.isDigit() }.toIntOrNull() ?: 1
 
-                // Try to get season data-id for the API call
-                val seasonDataId = seasonEl.attr("data-id")
-                    .ifBlank { seasonEl.selectFirst("a")?.attr("data-id") }
-                    ?.ifBlank { seasonEl.selectFirst("a")?.attr("href")?.substringAfterLast("/") }
-
-                if (!seasonDataId.isNullOrBlank()) {
+                if (seasonId.isNotBlank()) {
                     try {
                         val apiHeaders = headers + mapOf(
                             "X-Requested-With" to "XMLHttpRequest",
-                            "Accept" to "application/json, text/html, */*"
+                            "Accept" to "application/json"
                         )
                         val apiResponse = app.get(
-                            "$mainUrl/series/season/$seasonDataId",
+                            "$mainUrl/series/season/$seasonId",
                             headers = apiHeaders
                         )
+                        val seasonData = apiResponse.parsedSafe<StardimaSeasonEpisodesResponse>()
 
-                        // Try parsing as JSON first
-                        try {
-                            val seasonData = apiResponse.parsedSafe<SeasonEpisodesResponse>()
-                            if (seasonData?.html != null) {
-                                val epDoc = org.jsoup.Jsoup.parse(seasonData.html)
-                                epDoc.select("a, li, div.episode").forEach { epEl ->
-                                    val epTitle = epEl.text().trim()
-                                    val epHref = epEl.attr("href")
-                                        .ifBlank { epEl.selectFirst("a")?.attr("href") ?: "" }
+                        if (seasonData?.episodes != null) {
+                            for (ep in seasonData.episodes) {
+                                val epId = ep.id ?: continue
+                                val epTitle = ep.title ?: "حلقة $epId"
+                                val slug = seasonData.seriesId ?: seriesSlug
+                                val playUrl = "$mainUrl/tvshow/$slug/play/$epId"
 
-                                    if (epHref.isNotBlank()) {
-                                        val fullEpUrl = if (epHref.startsWith("http")) epHref else "$mainUrl$epHref"
-                                        episodes.add(
-                                            newEpisode(fullEpUrl) {
-                                                name = epTitle
-                                                season = seasonNumber
-                                            }
-                                        )
+                                episodes.add(
+                                    newEpisode(playUrl) {
+                                        name = epTitle
+                                        season = seasonNumber
                                     }
-                                }
-                            }
-                        } catch (_: Exception) {}
-
-                        // Try parsing the response body directly as HTML
-                        val epDoc2 = org.jsoup.Jsoup.parse(apiResponse.text)
-                        epDoc2.select("a, li, div.episode").forEach { epEl ->
-                            val epTitle = epEl.text().trim()
-                            val epHref = epEl.attr("href")
-                                .ifBlank { epEl.selectFirst("a")?.attr("href") ?: "" }
-
-                            if (epHref.isNotBlank()) {
-                                val fullEpUrl = if (epHref.startsWith("http")) epHref else "$mainUrl$epHref"
-                                // Avoid duplicates
-                                if (episodes.none { it.data == fullEpUrl }) {
-                                    episodes.add(
-                                        newEpisode(fullEpUrl) {
-                                            name = epTitle
-                                            season = seasonNumber
-                                        }
-                                    )
-                                }
+                                )
                             }
                         }
                     } catch (_: Exception) {}
                 }
-
-                // Fallback: parse episodes directly from the season element on the page
-                seasonEl.select("a[href*=/play/], a[href*=/episode/], li.episode a").forEach { epLink ->
-                    val epTitle = epLink.text().trim()
-                    val epHref = epLink.attr("href")
-                    if (epHref.isNotBlank()) {
-                        val fullEpUrl = if (epHref.startsWith("http")) epHref else "$mainUrl$epHref"
-                        if (episodes.none { it.data == fullEpUrl }) {
-                            episodes.add(
-                                newEpisode(fullEpUrl) {
-                                    name = epTitle
-                                    season = seasonNumber
-                                }
-                            )
-                        }
-                    }
-                }
             }
         }
 
-        // Strategy 2: If no season elements found, try direct episode links on the page
+        // Strategy 2: Parse episode list items directly from the HTML
         if (episodes.isEmpty()) {
-            doc.select("a[href*=/play/], a[href*=/episode/]").forEach { epLink ->
-                val epTitle = epLink.text().trim()
-                val epHref = epLink.attr("href")
-                if (epHref.isNotBlank()) {
-                    val fullEpUrl = if (epHref.startsWith("http")) epHref else "$mainUrl$epHref"
+            val episodeItems = doc.select("li.episode-list-item")
+            for (epEl in episodeItems) {
+                val epId = epEl.attr("data-episode-id")
+                val epTitle = epEl.selectFirst("a")?.text()?.trim() ?: "حلقة $epId"
+
+                if (epId.isNotBlank()) {
+                    val playUrl = "$mainUrl/tvshow/$seriesSlug/play/$epId"
+
                     episodes.add(
-                        newEpisode(fullEpUrl) {
+                        newEpisode(playUrl) {
                             name = epTitle
                             season = 1
                         }
@@ -250,39 +230,78 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        // Strategy 3: Try the episode API directly
+        // Strategy 3: Load the play page to find season/episode data
         if (episodes.isEmpty()) {
-            val seriesId = url.trimEnd('/').substringAfterLast("/")
-            try {
-                val apiHeaders = headers + mapOf(
-                    "X-Requested-With" to "XMLHttpRequest",
-                    "Accept" to "application/json, text/html, */*"
-                )
-                val apiResponse = app.get(
-                    "$mainUrl/series/season/$seriesId",
-                    headers = apiHeaders
-                )
-                val epDoc = org.jsoup.Jsoup.parse(apiResponse.text)
-                epDoc.select("a, li, div.episode").forEach { epEl ->
-                    val epTitle = epEl.text().trim()
-                    val epHref = epEl.attr("href")
-                    if (epHref.isNotBlank()) {
-                        val fullEpUrl = if (epHref.startsWith("http")) epHref else "$mainUrl$epHref"
-                        episodes.add(
-                            newEpisode(fullEpUrl) {
-                                name = epTitle
-                                season = 1
-                            }
-                        )
-                    }
+            val firstPlayUrl = doc.selectFirst("meta[property=og:video]")?.attr("content")
+                ?: doc.selectFirst("a[href*=/play/]")?.attr("href")?.let {
+                    if (it.startsWith("http")) it else "$mainUrl$it"
                 }
-            } catch (_: Exception) {}
+
+            if (!firstPlayUrl.isNullOrBlank()) {
+                try {
+                    val playDoc = app.get(firstPlayUrl, headers = headers).document
+
+                    val playSeasonItems = playDoc.select(".season-item")
+                    for (seasonEl in playSeasonItems) {
+                        val seasonId = seasonEl.attr("data-season-id")
+                        val seasonNumberStr = seasonEl.attr("data-season-number")
+                        val seasonNumber = seasonNumberStr.filter { it.isDigit() }.toIntOrNull() ?: 1
+
+                        if (seasonId.isNotBlank()) {
+                            try {
+                                val apiHeaders = headers + mapOf(
+                                    "X-Requested-With" to "XMLHttpRequest",
+                                    "Accept" to "application/json"
+                                )
+                                val apiResponse = app.get(
+                                    "$mainUrl/series/season/$seasonId",
+                                    headers = apiHeaders
+                                )
+                                val seasonData = apiResponse.parsedSafe<StardimaSeasonEpisodesResponse>()
+
+                                if (seasonData?.episodes != null) {
+                                    for (ep in seasonData.episodes) {
+                                        val epId = ep.id ?: continue
+                                        val epTitle = ep.title ?: "حلقة $epId"
+                                        // FIX 2: Use seriesSlug instead of undefined "slug"
+                                        val slug = seasonData.seriesId ?: seriesSlug
+                                        val playUrl = "$mainUrl/tvshow/$slug/play/$epId"
+
+                                        episodes.add(
+                                            newEpisode(playUrl) {
+                                                name = epTitle
+                                                season = seasonNumber
+                                            }
+                                        )
+                                    }
+                                }
+                            } catch (_: Exception) {}
+                        }
+                    }
+
+                    if (episodes.isEmpty()) {
+                        val playEpItems = playDoc.select("li.episode-list-item")
+                        for (epEl in playEpItems) {
+                            val epId = epEl.attr("data-episode-id")
+                            val epTitle = epEl.selectFirst("a")?.text()?.trim() ?: "حلقة $epId"
+                            if (epId.isNotBlank()) {
+                                val playUrl = "$mainUrl/tvshow/$seriesSlug/play/$epId"
+                                episodes.add(
+                                    newEpisode(playUrl) {
+                                        name = epTitle
+                                        season = 1
+                                    }
+                                )
+                            }
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
         }
 
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             this.posterUrl = poster
             this.plot = description
-            this.year = year
             this.tags = tags
         }
     }
@@ -298,8 +317,7 @@ class StardimaProvider : MainAPI() {
         val doc = app.get(data, headers = headers).document
 
         // Strategy 1: Look for iframe in the video player container
-        val iframeUrl = doc.selectFirst("#video-player-container iframe, .video-container iframe, .player iframe")
-            ?.attr("src")
+        val iframeUrl = doc.selectFirst("#video-player-container iframe")?.attr("src")
             ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
 
         if (!iframeUrl.isNullOrBlank()) {
@@ -307,8 +325,8 @@ class StardimaProvider : MainAPI() {
         }
 
         // Strategy 2: Try the episode API to get watch_url
-        if (data.contains("/play/") || data.contains("/episode/")) {
-            val episodeId = data.trimEnd('/').substringAfterLast("/")
+        val episodeId = data.trimEnd('/').substringAfterLast("/")
+        if (episodeId.all { it.isDigit() }) {
             try {
                 val apiHeaders = headers + mapOf(
                     "X-Requested-With" to "XMLHttpRequest",
@@ -318,20 +336,24 @@ class StardimaProvider : MainAPI() {
                     "$mainUrl/series/episode/$episodeId",
                     headers = apiHeaders
                 )
-                val epData = apiResponse.parsedSafe<EpisodeDetailResponse>()
-                val watchUrl = epData?.data?.watchUrl
+                val epData = apiResponse.parsedSafe<StardimaEpisodeDetailResponse>()
+                val watchUrl = epData?.episode?.watchUrl
                 if (!watchUrl.isNullOrBlank()) {
                     loadExtractor(watchUrl, data, subtitleCallback, callback)
                 }
             } catch (_: Exception) {}
         }
 
-        // Strategy 3: Search for any iframe in the page
+        // Strategy 3: Search for any other iframes in the page
         coroutineScope {
-            doc.select("iframe").map { iframe ->
+            doc.select("iframe[src]").map { iframe ->
                 async {
-                    val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }
-                    if (src.isNotBlank() && src.startsWith("http")) {
+                    val src = iframe.attr("src")
+                    if (src.isNotBlank() && src.startsWith("http") &&
+                        !src.contains("about:blank") &&
+                        iframe.attr("style")?.contains("display: none") != true &&
+                        iframe.attr("width") != "1"
+                    ) {
                         loadExtractor(src, data, subtitleCallback, callback)
                     }
                 }
@@ -343,50 +365,33 @@ class StardimaProvider : MainAPI() {
             try {
                 val jsonStr = script.html()
                 val embedUrl = Regex("""embedUrl"\s*:\s*"([^"]+)"""").find(jsonStr)?.groupValues?.get(1)
-                if (!embedUrl.isNullOrBlank()) {
+                if (!embedUrl.isNullOrBlank() && embedUrl.startsWith("http")) {
                     loadExtractor(embedUrl, data, subtitleCallback, callback)
                 }
             } catch (_: Exception) {}
         }
 
-        // Strategy 5: Look for direct video source tags
-        doc.select("video source, video[src], .player video").forEach { videoEl ->
-            val src = videoEl.attr("src").ifBlank { videoEl.selectFirst("source")?.attr("src") ?: "" }
-            if (src.isNotBlank() && (src.endsWith(".mp4") || src.endsWith(".m3u8"))) {
-                val fullSrc = if (src.startsWith("http")) src else "$mainUrl$src"
-                callback.invoke(
-                    newExtractorLink(
-                        source = this.name,
-                        name = this.name,
-                        url = fullSrc,
-                    ) {
-                        referer = mainUrl
-                        quality = Qualities.Unknown.value
-                    }
-                )
-            }
-        }
-
         return true
     }
 
-    // ==================== HELPER ====================
+    // ==================== HELPERS ====================
 
     private fun Element.toSearchResponse(): SearchResponse? {
-        val titleEl = selectFirst("a, h2, h3, .title, .card-title")
-        val title = titleEl?.text()?.trim() ?: return null
-
-        val href = titleEl.attr("href")
-            .ifBlank { selectFirst("a")?.attr("href") ?: "" }
-        if (href.isBlank()) return null
-
+        val linkEl = selectFirst("a[href*=/movie/], a[href*=/tvshow/]")
+        val href = linkEl?.attr("href") ?: return null
         val fullUrl = if (href.startsWith("http")) href else "$mainUrl$href"
+
+        val title = linkEl.selectFirst("h3")?.text()?.trim()
+            ?: selectFirst("h4 a")?.text()?.trim()
+            ?: selectFirst("h4")?.text()?.trim()
+            ?: linkEl.attr("title").ifBlank { null }
+            ?: return null
 
         val posterUrl = selectFirst("img")?.let { img ->
             img.attr("data-src").ifBlank { img.attr("src") }
-        }
+        }?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
 
-        val isTvSeries = fullUrl.contains("/tvshow/") || fullUrl.contains("/series/")
+        val isTvSeries = fullUrl.contains("/tvshow/")
 
         return if (isTvSeries) {
             newTvSeriesSearchResponse(title, fullUrl) {
@@ -396,6 +401,21 @@ class StardimaProvider : MainAPI() {
             newMovieSearchResponse(title, fullUrl) {
                 this.posterUrl = posterUrl
             }
+        }
+    }
+
+    private fun Element.toSearchResponseFromLink(): SearchResponse? {
+        val href = attr("href")
+        if (!href.contains("/movie/") && !href.contains("/tvshow/")) return null
+        val fullUrl = if (href.startsWith("http")) href else "$mainUrl$href"
+
+        val title = attr("title").ifBlank { text().trim() }.ifBlank { return null }
+        val isTvSeries = fullUrl.contains("/tvshow/")
+
+        return if (isTvSeries) {
+            newTvSeriesSearchResponse(title, fullUrl) { this.posterUrl = null }
+        } else {
+            newMovieSearchResponse(title, fullUrl) { this.posterUrl = null }
         }
     }
 }
