@@ -66,21 +66,8 @@ data class HyperLinkResponse(
     @JsonProperty("success") val success: Boolean?,
     @JsonProperty("status") val status: String?,
     @JsonProperty("watch_url") val watchUrl: String?,
-    @JsonProperty("server_name") val serverName: String?
-)
-
-data class HyperTokenResponse(
-    @JsonProperty("token") val token: String?
-)
-
-data class HyperExtractResponse(
-    @JsonProperty("success") val success: Boolean?,
-    @JsonProperty("data") val data: HyperExtractData?
-)
-
-data class HyperExtractData(
-    @JsonProperty("file") val file: String?,
-    @JsonProperty("headers") val headers: Map<String, String>?
+    @JsonProperty("server_name") val serverName: String?,
+    @JsonProperty("message") val message: String?
 )
 
 class StardimaProvider : MainAPI() {
@@ -225,12 +212,10 @@ class StardimaProvider : MainAPI() {
                             val epTitle = ep.title ?: "حلقة ${ep.episodeNumber ?: epId}"
                             val slug = seasonData.seriesId ?: seriesSlug
                             val playUrl = "$mainUrl/tvshow/$slug/play/$epId"
-                            val epData = if (!ep.watchUrl.isNullOrBlank()) {
-                                "${ep.watchUrl}|$playUrl"
-                            } else {
-                                playUrl
-                            }
-                            episodes.add(newEpisode(epData) {
+
+                            // Store only the play URL - we'll get watch_url at loadLinks time
+                            // This avoids stale watch_url data
+                            episodes.add(newEpisode(playUrl) {
                                 name = epTitle
                                 season = seasonNumber
                                 episode = ep.episodeNumber ?: 0
@@ -263,39 +248,31 @@ class StardimaProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val parts = data.split("|")
-        val watchUrl = if (parts.size >= 2) parts[0] else null
-        val playUrl = if (parts.size >= 2) parts[1] else data
-        val isTvEpisode = playUrl.contains("/tvshow/") && playUrl.contains("/play/")
+        val isTvEpisode = data.contains("/tvshow/") && data.contains("/play/")
 
-        // Strategy 1: Use watch_url directly
-        if (!watchUrl.isNullOrBlank()) {
-            routeUrl(watchUrl, subtitleCallback, callback)
-        }
-
-        // Strategy 2: Call stardima episode API
-        if (watchUrl.isNullOrBlank() && isTvEpisode) {
-            val episodeId = playUrl.trimEnd('/').substringAfterLast("/")
+        if (isTvEpisode) {
+            val episodeId = data.trimEnd('/').substringAfterLast("/")
             if (episodeId.all { it.isDigit() }) {
+                // Step 1: Get hyperwatching iframe URL from stardima API
                 try {
                     val apiResp = app.get("$mainUrl/series/episode/$episodeId", headers = apiHeaders)
                     val epData = apiResp.parsedSafe<StardimaEpisodeDetailResponse>()
-                    val apiWatchUrl = epData?.episode?.watchUrl
-                    if (!apiWatchUrl.isNullOrBlank()) {
-                        routeUrl(apiWatchUrl, subtitleCallback, callback)
+                    val hyperUrl = epData?.episode?.watchUrl
+                    if (!hyperUrl.isNullOrBlank()) {
+                        // Step 2: Extract ALL servers from the hyperwatching iframe page
+                        // This is critical - server IDs are per-episode!
+                        extractAllHyperServers(hyperUrl, subtitleCallback, callback)
                     }
                 } catch (_: Exception) {}
             }
-        }
-
-        // Strategy 3: Scrape play page for iframes
-        if (!isTvEpisode || watchUrl.isNullOrBlank()) {
+        } else {
+            // Movie: scrape the play page for iframe
             try {
-                val doc = app.get(playUrl, headers = headers).document
+                val doc = app.get(data, headers = headers).document
                 doc.select("iframe[src]").forEach { iframe ->
                     val src = iframe.attr("src")
                     if (src.isNotBlank() && src.startsWith("http") && !src.contains("about:blank")) {
-                        routeUrl(src, subtitleCallback, callback)
+                        extractAllHyperServers(src, subtitleCallback, callback)
                     }
                 }
             } catch (_: Exception) {}
@@ -304,24 +281,141 @@ class StardimaProvider : MainAPI() {
         return true
     }
 
+    /**
+     * Fetch the hyperwatching iframe page for THIS specific episode,
+     * parse the per-episode server list, then try each server in parallel.
+     */
+    private suspend fun extractAllHyperServers(
+        hyperUrl: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        try {
+            // Clean URL - remove query params that may cause issues
+            val cleanUrl = hyperUrl.split("?").first()
+
+            val pageResponse = app.get(cleanUrl, headers = headers)
+            val html = pageResponse.text
+
+            // Parse server list from config.servers
+            // Pattern: { id: "123456", name: "Lulustream", icon: "..." }
+            val servers = mutableListOf<Pair<String, String>>()
+            val serverRegex = Regex("""id:\s*["'](\d+)["'],\s*name:\s*["']([^"']+)["']""")
+            serverRegex.findAll(html).forEach { match ->
+                servers.add(Pair(match.groupValues[1], match.groupValues[2]))
+            }
+
+            if (servers.isEmpty()) {
+                // Try CloudStream built-in extractors as fallback
+                safeLoadExtractor(cleanUrl, subtitleCallback, callback)
+                return
+            }
+
+            // Parse the link API route
+            val linkRoute = Regex("""link:\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
+            if (linkRoute.isNullOrBlank()) {
+                safeLoadExtractor(cleanUrl, subtitleCallback, callback)
+                return
+            }
+
+            // Try all servers in parallel
+            coroutineScope {
+                servers.map { server ->
+                    async {
+                        tryHyperServer(
+                            server.first, server.second, linkRoute,
+                            subtitleCallback, callback
+                        )
+                    }
+                }.awaitAll()
+            }
+        } catch (_: Exception) {
+            // Fallback to CloudStream's built-in extractors
+            safeLoadExtractor(hyperUrl, subtitleCallback, callback)
+        }
+    }
+
+    /**
+     * Try a single hyperwatching server:
+     * 1. POST to link API to get the third-party embed URL
+     * 2. Route that URL to the appropriate extractor (lulustream, uqload, etc.)
+     */
+    private suspend fun tryHyperServer(
+        serverId: String, serverName: String,
+        linkRoute: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        try {
+            val linkResp = app.post(
+                linkRoute,
+                headers = mapOf(
+                    "Content-Type" to "application/x-www-form-urlencoded",
+                    "Accept" to "application/json",
+                    "User-Agent" to headers["User-Agent"]!!
+                ),
+                data = mapOf("server_link_id" to serverId)
+            )
+            val linkData = linkResp.parsedSafe<HyperLinkResponse>()
+
+            // Skip failed servers
+            if (linkData?.success != true) return
+            if (linkData.watchUrl.isNullOrBlank()) return
+
+            val watchUrl = linkData.watchUrl
+
+            // Route the URL to the right extractor
+            routeUrl(watchUrl, serverName, subtitleCallback, callback)
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * Route a URL to the appropriate extractor based on its domain
+     */
     private suspend fun routeUrl(
-        url: String,
+        url: String, serverName: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
         when {
-            url.contains("hyperwatching.com") -> extractHyperwatching(url, subtitleCallback, callback)
-            url.contains("lulustream.com") || url.contains("luluvdo.com") -> extractLulustream(url, callback)
-            url.contains("uqload") -> extractUqload(url, callback)
+            url.contains("lulustream.com") || url.contains("luluvdo.com") -> {
+                extractLulustream(url, callback)
+            }
             url.contains("strema.top") -> {
+                // strema.top wraps other hosts - extract the inner URL from id parameter
                 val innerUrl = Regex("""[?&]id=(https?://[^&]+)""").find(url)?.groupValues?.get(1)
                 if (!innerUrl.isNullOrBlank()) {
-                    routeUrl(java.net.URLDecoder.decode(innerUrl, "UTF-8"), subtitleCallback, callback)
+                    val decoded = java.net.URLDecoder.decode(innerUrl, "UTF-8")
+                    routeUrl(decoded, serverName, subtitleCallback, callback)
                 } else {
                     safeLoadExtractor(url, subtitleCallback, callback)
                 }
             }
-            else -> safeLoadExtractor(url, subtitleCallback, callback)
+            url.contains("uqload") -> {
+                extractUqload(url, callback)
+            }
+            url.contains("hgplaycdn.com") || url.contains("streamhg") -> {
+                extractStreamhg(url, callback)
+            }
+            url.contains("darkibox.com") -> {
+                extractDarkibox(url, callback)
+            }
+            url.contains("krakenfiles.com") -> {
+                safeLoadExtractor(url, subtitleCallback, callback)
+            }
+            url.contains("goodstream") -> {
+                // goodstream is also wrapped in strema.top
+                val innerUrl = Regex("""[?&]id=(https?://[^&]+)""").find(url)?.groupValues?.get(1)
+                if (!innerUrl.isNullOrBlank()) {
+                    val decoded = java.net.URLDecoder.decode(innerUrl, "UTF-8")
+                    safeLoadExtractor(decoded, subtitleCallback, callback)
+                } else {
+                    safeLoadExtractor(url, subtitleCallback, callback)
+                }
+            }
+            else -> {
+                safeLoadExtractor(url, subtitleCallback, callback)
+            }
         }
     }
 
@@ -414,7 +508,7 @@ class StardimaProvider : MainAPI() {
                 return
             }
 
-            // Fallback: look for .mp4 URL
+            // Fallback: look for .mp4 URL in playerjs
             val altRegex = Regex("""["'](https?://[^"']*\.mp4[^"']*)""")
             val altMatch = altRegex.find(html)
             if (altMatch != null) {
@@ -433,109 +527,60 @@ class StardimaProvider : MainAPI() {
         } catch (_: Exception) {}
     }
 
-    // ==================== HYPERWATCHING EXTRACTOR ====================
+    // ==================== STREAMHG EXTRACTOR ====================
 
-    private suspend fun extractHyperwatching(
-        iframeUrl: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
+    private suspend fun extractStreamhg(url: String, callback: (ExtractorLink) -> Unit) {
         try {
-            val pageResponse = app.get(iframeUrl, headers = headers)
-            val html = pageResponse.text
+            val html = app.get(url, headers = headers).text
 
-            val csrf = Regex("""csrf:\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1) ?: return
-
-            val servers = mutableListOf<Pair<String, String>>()
-
-            // Pattern: {id: "123", name: "Uqload"}
-            val sRegex1 = Regex("""\{id:\s*['"](\d+)['"],\s*name:\s*['"]([^'"]+)['"]""")
-            sRegex1.findAll(html).forEach { match ->
-                servers.add(Pair(match.groupValues[1], match.groupValues[2]))
-            }
-
-            // Fallback pattern: just id + nearby name
-            if (servers.isEmpty()) {
-                val sRegex2 = Regex("""id:\s*['"](\d+)['"]""")
-                sRegex2.findAll(html).forEach { match ->
-                    val start = maxOf(0, match.range.first - 200)
-                    val end = minOf(html.length, match.range.last + 200)
-                    val nearby = html.substring(start, end)
-                    val nameMatch = Regex("""name:\s*['"]([^'"]+)['"]""").find(nearby)
-                    servers.add(Pair(match.groupValues[1], nameMatch?.groupValues?.get(1) ?: "Server"))
-                }
-            }
-
-            if (servers.isEmpty()) return
-
-            val linkRoute = Regex("""link:\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1) ?: return
-            val tokenRoute = Regex("""token:\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1)
-            val extractRoute = Regex("""extract:\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1)
-
-            val hyperHeaders = mapOf(
-                "X-CSRF-TOKEN" to csrf,
-                "Content-Type" to "application/x-www-form-urlencoded",
-                "Accept" to "application/json",
-                "Referer" to iframeUrl,
-                "User-Agent" to headers["User-Agent"]!!
-            )
-
-            // Try all servers in parallel
-            coroutineScope {
-                servers.map { server ->
-                    async {
-                        tryServer(
-                            server.first, server.second, linkRoute, tokenRoute, extractRoute,
-                            hyperHeaders, iframeUrl, subtitleCallback, callback
-                        )
+            // Look for m3u8 URL in the page source
+            val m3u8Regex = Regex("""["'](https?://[^"']+\.m3u8[^"']*)""")
+            val m3u8Match = m3u8Regex.find(html)
+            if (m3u8Match != null) {
+                callback.invoke(
+                    newExtractorLink(
+                        source = "Streamhg",
+                        name = "$name - Streamhg",
+                        url = m3u8Match.groupValues[1],
+                        type = INFER_TYPE
+                    ) {
+                        this.referer = url
+                        this.quality = Qualities.Unknown.value
                     }
-                }.awaitAll()
+                )
+                return
             }
+
+            // Try CloudStream's built-in as fallback
+            safeLoadExtractor(url, { _ -> }, callback)
         } catch (_: Exception) {}
     }
 
-    private suspend fun tryServer(
-        serverId: String, serverName: String,
-        linkRoute: String, tokenRoute: String?, extractRoute: String?,
-        hyperHeaders: Map<String, String>, iframeUrl: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
+    // ==================== DARKIBOX EXTRACTOR ====================
+
+    private suspend fun extractDarkibox(url: String, callback: (ExtractorLink) -> Unit) {
         try {
-            val linkResp = app.post(linkRoute, headers = hyperHeaders, data = mapOf("server_link_id" to serverId))
-            val linkData = linkResp.parsedSafe<HyperLinkResponse>()
-            if (linkData?.watchUrl.isNullOrBlank()) return
-            val watchUrl = linkData!!.watchUrl!!
+            val html = app.get(url, headers = headers).text
 
-            // Route the embed URL through our custom extractors
-            routeUrl(watchUrl, subtitleCallback, callback)
-
-            // Also try secure extract chain
-            if (!tokenRoute.isNullOrBlank() && !extractRoute.isNullOrBlank()) {
-                try {
-                    val tokenResp = app.post(tokenRoute, headers = hyperHeaders, data = mapOf("url" to watchUrl))
-                    val tokenData = tokenResp.parsedSafe<HyperTokenResponse>()
-                    if (!tokenData?.token.isNullOrBlank()) {
-                        val extractResp = app.post(extractRoute, headers = hyperHeaders, data = mapOf("token" to tokenData!!.token))
-                        val extractData = extractResp.parsedSafe<HyperExtractResponse>()
-                        if (extractData?.success == true && !extractData.data?.file.isNullOrBlank()) {
-                            val directUrl = extractData.data!!.file!!
-                            val extraHeaders = extractData.data.headers ?: emptyMap()
-                            callback.invoke(
-                                newExtractorLink(
-                                    source = serverName,
-                                    name = "$name - $serverName",
-                                    url = directUrl,
-                                    type = INFER_TYPE
-                                ) {
-                                    this.referer = extraHeaders["Referer"] ?: iframeUrl
-                                    this.quality = Qualities.Unknown.value
-                                }
-                            )
-                        }
+            // Look for video URL in the page
+            val videoRegex = Regex("""["'](https?://[^"']+\.(?:mp4|m3u8)[^"']*)""")
+            val videoMatch = videoRegex.find(html)
+            if (videoMatch != null) {
+                callback.invoke(
+                    newExtractorLink(
+                        source = "Darkibox",
+                        name = "$name - Darkibox",
+                        url = videoMatch.groupValues[1],
+                        type = INFER_TYPE
+                    ) {
+                        this.referer = url
+                        this.quality = Qualities.Unknown.value
                     }
-                } catch (_: Exception) {}
+                )
+                return
             }
+
+            safeLoadExtractor(url, { _ -> }, callback)
         } catch (_: Exception) {}
     }
 
