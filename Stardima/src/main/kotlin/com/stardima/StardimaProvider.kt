@@ -270,9 +270,7 @@ class StardimaProvider : MainAPI() {
                             val epTitle = ep.title ?: "حلقة ${ep.episodeNumber ?: epId}"
                             val slug = seasonData.seriesId ?: seriesSlug
 
-                            // Encode both watch_url and play URL in episode data
-                            // Format: watch_url|play_url  (if watch_url exists)
-                            // Or just: play_url (if no watch_url)
+                            // Encode watch_url + play_url in episode data
                             val playUrl = "$mainUrl/tvshow/$slug/play/$epId"
                             val epData = if (!ep.watchUrl.isNullOrBlank()) {
                                 "${ep.watchUrl}|$playUrl"
@@ -293,7 +291,6 @@ class StardimaProvider : MainAPI() {
             }
         }
 
-        // Fallback: parse episode list items from play page HTML
         if (episodes.isEmpty()) {
             val episodeItems = playDoc.select(".episode-list-item")
             for (epEl in episodeItems) {
@@ -328,22 +325,20 @@ class StardimaProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        var foundAny = false
-
         // Parse episode data - could be "watch_url|play_url" or just a URL
         val parts = data.split("|")
-        val watchUrl = if (parts.size == 2) parts[0] else null
-        val playUrl = if (parts.size == 2) parts[1] else data
+        val watchUrl = if (parts.size >= 2) parts[0] else null
+        val playUrl = if (parts.size >= 2) parts[1] else data
 
         val isTvEpisode = playUrl.contains("/tvshow/") && playUrl.contains("/play/")
 
-        // Strategy 1: If we have a direct watch_url, try extracting from it
+        // Strategy 1: Use watch_url directly (fastest - already have the hyperwatching URL)
         if (!watchUrl.isNullOrBlank()) {
-            foundAny = tryExtractFromUrl(watchUrl, subtitleCallback, callback) || foundAny
+            tryExtractFromUrl(watchUrl, subtitleCallback, callback)
         }
 
-        // Strategy 2: For TV episodes, call the stardima episode API
-        if (isTvEpisode && !foundAny) {
+        // Strategy 2: For TV episodes without watch_url, call stardima episode API
+        if (watchUrl.isNullOrBlank() && isTvEpisode) {
             val episodeId = playUrl.trimEnd('/').substringAfterLast("/")
             if (episodeId.all { it.isDigit() }) {
                 try {
@@ -354,76 +349,47 @@ class StardimaProvider : MainAPI() {
                     val epData = apiResponse.parsedSafe<StardimaEpisodeDetailResponse>()
                     val apiWatchUrl = epData?.episode?.watchUrl
                     if (!apiWatchUrl.isNullOrBlank()) {
-                        foundAny = tryExtractFromUrl(apiWatchUrl, subtitleCallback, callback) || foundAny
+                        tryExtractFromUrl(apiWatchUrl, subtitleCallback, callback)
                     }
                 } catch (_: Exception) {}
             }
         }
 
         // Strategy 3: Scrape the play page for iframes
-        if (!foundAny) {
-            try {
-                val doc = app.get(playUrl, headers = headers).document
-
-                // Check main video player iframe
-                val iframeUrl = doc.selectFirst("#video-player-container iframe")?.attr("src")
-                    ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
-
-                if (!iframeUrl.isNullOrBlank()) {
-                    foundAny = tryExtractFromUrl(iframeUrl, subtitleCallback, callback) || foundAny
-                }
-
-                // Check all other iframes
-                doc.select("iframe[src]").forEach { iframe ->
-                    val src = iframe.attr("src")
-                    if (src.isNotBlank() && src.startsWith("http") && !src.contains("about:blank")) {
-                        foundAny = tryExtractFromUrl(src, subtitleCallback, callback) || foundAny
-                    }
-                }
-            } catch (_: Exception) {}
-        }
-
-        // Strategy 4: For movies, try the movie play page
-        if (!isTvEpisode && !foundAny) {
+        if (!isTvEpisode || watchUrl.isNullOrBlank()) {
             try {
                 val doc = app.get(playUrl, headers = headers).document
                 doc.select("iframe[src]").forEach { iframe ->
                     val src = iframe.attr("src")
                     if (src.isNotBlank() && src.startsWith("http") && !src.contains("about:blank")) {
-                        foundAny = tryExtractFromUrl(src, subtitleCallback, callback) || foundAny
+                        tryExtractFromUrl(src, subtitleCallback, callback)
                     }
                 }
             } catch (_: Exception) {}
         }
 
-        return foundAny
+        return true
     }
 
     /**
      * Try all extraction methods for a given URL:
-     * 1. If it's a hyperwatching URL, use our custom extractor
-     * 2. Try CloudStream's built-in extractors (loadExtractor)
+     * 1. Try CloudStream's built-in extractors first (fast)
+     * 2. If it's a hyperwatching URL, also use our custom extractor (tries servers in parallel)
      */
     private suspend fun tryExtractFromUrl(
         url: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        var found = false
-
-        // If it's a hyperwatching URL, use our custom extractor
-        if (url.contains("hyperwatching.com")) {
-            found = extractFromHyperwatching(url, subtitleCallback, callback) || found
-        }
-
-        // Always also try CloudStream's built-in extractors
-        // This covers uqload, streamhg, darkibox, lulustream, etc.
+    ) {
+        // Fast path: try CloudStream's built-in extractors first
         try {
             loadExtractor(url, url, subtitleCallback, callback)
-            found = true
         } catch (_: Exception) {}
 
-        return found
+        // If it's a hyperwatching URL, also use our custom extractor
+        if (url.contains("hyperwatching.com")) {
+            extractFromHyperwatching(url, subtitleCallback, callback)
+        }
     }
 
     // ==================== HYPERWATCHING EXTRACTOR ====================
@@ -432,42 +398,36 @@ class StardimaProvider : MainAPI() {
         iframeUrl: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    ) {
         try {
+            // Step 1: Fetch the iframe page (one request)
             val pageResponse = app.get(iframeUrl, headers = headers)
             val html = pageResponse.text
 
             // Parse CSRF token
-            val csrf = Regex("""csrf:\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1) ?: return false
+            val csrf = Regex("""csrf:\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1) ?: return
 
-            // Parse server IDs and names - try multiple patterns
+            // Parse servers - try multiple patterns
             val servers = mutableListOf<Pair<String, String>>()
 
             // Pattern 1: {id: "123", name: "Uqload"}
-            val serverPattern1 = Regex("""\{id:\s*['"](\d+)['"],\s*name:\s*['"]([^'"]+)['"]""")
-            serverPattern1.findAll(html).forEach {
-                servers.add(it.groupValues[1] to it.groupValues[2])
-            }
+            Regex("""\{id:\s*['"](\d+)['"],\s*name:\s*['"]([^'"]+)['"]""")
+                .findAll(html).forEach { servers.add(it.groupValues[1] to it.groupValues[2]) }
 
-            // Pattern 2: just id: "123"
+            // Pattern 2: just id + nearby name
             if (servers.isEmpty()) {
-                val serverPattern2 = Regex("""id:\s*['"](\d+)['"]""")
-                serverPattern2.findAll(html).forEach { match ->
-                    // Try to find the name near this id
+                Regex("""id:\s*['"](\d+)['"]""").findAll(html).forEach { match ->
                     val nearbyName = Regex("""name:\s*['"]([^'"]+)['"]""").find(
-                        html.substring(
-                            maxOf(0, match.range.first - 100),
-                            minOf(html.length, match.range.last + 100)
-                        )
+                        html.substring(maxOf(0, match.range.first - 200), minOf(html.length, match.range.last + 200))
                     )?.groupValues?.get(1) ?: "Server"
                     servers.add(match.groupValues[1] to nearbyName)
                 }
             }
 
-            if (servers.isEmpty()) return false
+            if (servers.isEmpty()) return
 
             // Parse API routes
-            val linkRoute = Regex("""link:\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1) ?: return false
+            val linkRoute = Regex("""link:\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1) ?: return
             val tokenRoute = Regex("""token:\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1)
             val extractRoute = Regex("""extract:\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1)
 
@@ -479,77 +439,96 @@ class StardimaProvider : MainAPI() {
                 "User-Agent" to headers["User-Agent"]!!
             )
 
-            var foundAny = false
+            // Step 2: Try all servers IN PARALLEL (max 4) - this is the key speedup
+            val limitedServers = servers.take(4)
 
-            for ((serverId, serverName) in servers) {
-                try {
-                    // Get the third-party embed URL from this server
-                    val linkResponse = app.post(
-                        linkRoute,
-                        headers = hyperApiHeaders,
-                        data = mapOf("server_link_id" to serverId)
-                    )
-                    val linkData = linkResponse.parsedSafe<HyperwatchingLinkResponse>()
-
-                    if (linkData?.watchUrl.isNullOrBlank()) continue
-                    val watchUrl = linkData!!.watchUrl!!
-
-                    // Try secure extract chain for direct m3u8/mp4 URL
-                    if (!tokenRoute.isNullOrBlank() && !extractRoute.isNullOrBlank()) {
-                        try {
-                            val tokenResponse = app.post(
-                                tokenRoute,
-                                headers = hyperApiHeaders,
-                                data = mapOf("url" to watchUrl)
-                            )
-                            val tokenData = tokenResponse.parsedSafe<HyperwatchingTokenResponse>()
-                            val token = tokenData?.token
-
-                            if (!token.isNullOrBlank()) {
-                                val extractResponse = app.post(
-                                    extractRoute,
-                                    headers = hyperApiHeaders,
-                                    data = mapOf("token" to token)
-                                )
-                                val extractData = extractResponse.parsedSafe<HyperwatchingExtractResponse>()
-
-                                if (extractData?.success == true && !extractData.data?.file.isNullOrBlank()) {
-                                    val directUrl = extractData.data!!.file!!
-                                    val extraHeaders = extractData.data.headers ?: emptyMap()
-
-                                    callback.invoke(
-                                        newExtractorLink(
-                                            source = serverName,
-                                            name = "$name - $serverName",
-                                            url = directUrl,
-                                            type = INFER_TYPE
-                                        ) {
-                                            this.referer = extraHeaders["Referer"] ?: iframeUrl
-                                            this.quality = Qualities.Unknown.value
-                                        }
-                                    )
-                                    foundAny = true
-                                    continue // This server worked, try next server too
-                                }
-                            }
-                        } catch (_: Exception) {}
+            coroutineScope {
+                limitedServers.map { (serverId, serverName) ->
+                    async {
+                        tryServer(
+                            serverId, serverName, linkRoute, tokenRoute, extractRoute,
+                            hyperApiHeaders, iframeUrl, subtitleCallback, callback
+                        )
                     }
-
-                    // Fallback: try loadExtractor on the third-party embed URL
-                    // CloudStream has extractors for uqload, streamhg, etc.
-                    try {
-                        loadExtractor(watchUrl, iframeUrl, subtitleCallback, callback)
-                        foundAny = true
-                    } catch (_: Exception) {}
-
-                } catch (_: Exception) {}
+                }.awaitAll()
             }
 
-            return foundAny
+        } catch (_: Exception) {}
+    }
 
-        } catch (_: Exception) {
-            return false
-        }
+    /**
+     * Try to extract video from a single hyperwatching server.
+     * Fast path: get embed URL → try loadExtractor (CloudStream may support the host)
+     * Slow path: get embed URL → token → extract for direct m3u8/mp4
+     */
+    private suspend fun tryServer(
+        serverId: String,
+        serverName: String,
+        linkRoute: String,
+        tokenRoute: String?,
+        extractRoute: String?,
+        hyperApiHeaders: Map<String, String>,
+        iframeUrl: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        try {
+            // Get the third-party embed URL from this server
+            val linkResponse = app.post(
+                linkRoute,
+                headers = hyperApiHeaders,
+                data = mapOf("server_link_id" to serverId)
+            )
+            val linkData = linkResponse.parsedSafe<HyperwatchingLinkResponse>()
+
+            if (linkData?.watchUrl.isNullOrBlank()) return
+            val watchUrl = linkData!!.watchUrl!!
+
+            // FAST PATH: Try CloudStream's built-in extractors first
+            // This handles uqload, streamhg, darkibox, lulustream, etc.
+            try {
+                loadExtractor(watchUrl, iframeUrl, subtitleCallback, callback)
+                // If loadExtractor works, we're done with this server
+                return
+            } catch (_: Exception) {}
+
+            // SLOW PATH: Try the secure extract chain for direct m3u8/mp4
+            if (!tokenRoute.isNullOrBlank() && !extractRoute.isNullOrBlank()) {
+                try {
+                    val tokenResponse = app.post(
+                        tokenRoute,
+                        headers = hyperApiHeaders,
+                        data = mapOf("url" to watchUrl)
+                    )
+                    val tokenData = tokenResponse.parsedSafe<HyperwatchingTokenResponse>()
+                    val token = tokenData?.token ?: return
+
+                    val extractResponse = app.post(
+                        extractRoute,
+                        headers = hyperApiHeaders,
+                        data = mapOf("token" to token)
+                    )
+                    val extractData = extractResponse.parsedSafe<HyperwatchingExtractResponse>()
+
+                    if (extractData?.success == true && !extractData.data?.file.isNullOrBlank()) {
+                        val directUrl = extractData.data!!.file!!
+                        val extraHeaders = extractData.data.headers ?: emptyMap()
+
+                        callback.invoke(
+                            newExtractorLink(
+                                source = serverName,
+                                name = "$name - $serverName",
+                                url = directUrl,
+                                type = INFER_TYPE
+                            ) {
+                                this.referer = extraHeaders["Referer"] ?: iframeUrl
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                    }
+                } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
     }
 
     // ==================== HELPERS ====================
