@@ -260,6 +260,17 @@ class StardimaProvider : MainAPI() {
                     }
                 } catch (_: Exception) {}
             }
+
+            // Fallback: try scraping the play page directly for iframes
+            try {
+                val doc = app.get(data, headers = headers).document
+                doc.select("iframe[src]").forEach { iframe ->
+                    val src = iframe.attr("src")
+                    if (src.isNotBlank() && src.startsWith("http") && !src.contains("about:blank")) {
+                        safeLoadExtractor(src, subtitleCallback, callback)
+                    }
+                }
+            } catch (_: Exception) {}
         } else {
             try {
                 val doc = app.get(data, headers = headers).document
@@ -275,6 +286,10 @@ class StardimaProvider : MainAPI() {
         return true
     }
 
+    /**
+     * Fetch the hyperwatching iframe page, extract servers and CSRF,
+     * then try each server's link API to get third-party embed URLs.
+     */
     private suspend fun extractAllHyperServers(
         hyperUrl: String,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -285,7 +300,10 @@ class StardimaProvider : MainAPI() {
             val pageResponse = app.get(cleanUrl, headers = headers)
             val html = pageResponse.text
 
-            // Extract CSRF token - REQUIRED for POST requests
+            // Also try CloudStream's built-in extractors on the hyperwatching URL
+            safeLoadExtractor(cleanUrl, subtitleCallback, callback)
+
+            // Extract CSRF token
             val csrf = Regex("""csrf:\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
 
             // Extract server IDs and names
@@ -295,19 +313,13 @@ class StardimaProvider : MainAPI() {
                 servers.add(Pair(match.groupValues[1], match.groupValues[2]))
             }
 
-            if (servers.isEmpty()) {
-                safeLoadExtractor(cleanUrl, subtitleCallback, callback)
-                return
-            }
+            if (servers.isEmpty()) return
 
             // Extract the link API route
             val linkRoute = Regex("""link:\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
-            if (linkRoute.isNullOrBlank()) {
-                safeLoadExtractor(cleanUrl, subtitleCallback, callback)
-                return
-            }
+            if (linkRoute.isNullOrBlank()) return
 
-            // Try all servers in parallel
+            // Try ALL servers in parallel
             coroutineScope {
                 servers.map { server ->
                     async {
@@ -330,147 +342,171 @@ class StardimaProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ) {
         try {
-            // Include CSRF token in headers - API returns 419 without it
             val postHeaders = mutableMapOf(
-                "Content-Type" to "application/json",
-                "Accept" to "application/json",
-                "User-Agent" to headers["User-Agent"]!!
+                "Accept" to "application/json, text/plain, */*",
+                "User-Agent" to headers["User-Agent"]!!,
+                "X-Requested-With" to "XMLHttpRequest"
             )
             if (!csrf.isNullOrBlank()) {
                 postHeaders["X-CSRF-TOKEN"] = csrf
             }
 
-            val linkResp = app.post(
-                linkRoute,
-                headers = postHeaders,
-                data = mapOf("server_link_id" to serverId)
-            )
-            val linkData = linkResp.parsedSafe<HyperLinkResponse>()
+            // Try JSON body first
+            var linkData: HyperLinkResponse? = null
+
+            try {
+                val resp = app.post(
+                    linkRoute,
+                    headers = postHeaders + mapOf("Content-Type" to "application/json"),
+                    data = mapOf("server_link_id" to serverId)
+                )
+                linkData = resp.parsedSafe<HyperLinkResponse>()
+            } catch (_: Exception) {}
+
+            // If JSON failed, try form-encoded
+            if (linkData?.success != true) {
+                try {
+                    val resp = app.post(
+                        linkRoute,
+                        headers = postHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
+                        data = mapOf("server_link_id" to serverId)
+                    )
+                    linkData = resp.parsedSafe<HyperLinkResponse>()
+                } catch (_: Exception) {}
+            }
 
             if (linkData?.success != true) return
             if (linkData.watchUrl.isNullOrBlank()) return
 
-            routeUrl(linkData.watchUrl, serverName, subtitleCallback, callback)
+            val watchUrl = linkData.watchUrl
+
+            // Now try EVERY possible extraction method for this URL
+            // Method 1: Custom extractor based on host
+            extractFromHost(watchUrl, serverName, subtitleCallback, callback)
+
+            // Method 2: CloudStream's built-in extractors
+            safeLoadExtractor(watchUrl, subtitleCallback, callback)
+
+            // Method 3: If strema.top, extract inner URL and try again
+            if (watchUrl.contains("strema.top")) {
+                val innerUrlEncoded = Regex("""[?&]id=(https?://[^&]+)""").find(watchUrl)?.groupValues?.get(1)
+                if (!innerUrlEncoded.isNullOrBlank()) {
+                    val innerUrl = java.net.URLDecoder.decode(innerUrlEncoded, "UTF-8")
+                    extractFromHost(innerUrl, serverName, subtitleCallback, callback)
+                    safeLoadExtractor(innerUrl, subtitleCallback, callback)
+                }
+            }
         } catch (_: Exception) {}
     }
 
-    private suspend fun routeUrl(
+    /**
+     * Route URL to custom extractors based on host, then fallback to CloudStream
+     */
+    private suspend fun extractFromHost(
         url: String, serverName: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
         when {
             url.contains("lulustream.com") || url.contains("luluvdo.com") -> {
-                extractLulustream(url, callback)
-            }
-            url.contains("strema.top") -> {
-                extractStremaTop(url, serverName, subtitleCallback, callback)
+                extractLulustream(url, serverName, callback)
             }
             url.contains("uqload") -> {
-                extractUqload(url, callback)
+                extractUqload(url, serverName, callback)
             }
             url.contains("hgplaycdn.com") || url.contains("streamhg") -> {
-                safeLoadExtractor(url, subtitleCallback, callback)
+                extractGenericEmbed(url, serverName, callback)
             }
             url.contains("darkibox.com") -> {
-                safeLoadExtractor(url, subtitleCallback, callback)
+                extractGenericEmbed(url, serverName, callback)
             }
             url.contains("krakenfiles.com") -> {
-                safeLoadExtractor(url, subtitleCallback, callback)
+                extractGenericEmbed(url, serverName, callback)
             }
             url.contains("goodstream") -> {
-                safeLoadExtractor(url, subtitleCallback, callback)
-            }
-            else -> {
-                safeLoadExtractor(url, subtitleCallback, callback)
+                extractGenericEmbed(url, serverName, callback)
             }
         }
     }
 
     /**
-     * strema.top/embed2/ is a redirect page that auto-submits a form.
-     * Follow it to get the actual embed page with the video player.
+     * Generic embed extractor - looks for any video URL (m3u8, mp4) in the page HTML
      */
-    private suspend fun extractStremaTop(
+    private suspend fun extractGenericEmbed(
         url: String, serverName: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
         try {
             val html = app.get(url, headers = headers).text
 
-            // Extract the form action URL from the redirect page
-            val formAction = Regex("""action=["'](https://strema\.top/embed/[^"']+)["']""")
-                .find(html)?.groupValues?.get(1)
-
-            if (!formAction.isNullOrBlank()) {
-                // Fetch the actual embed page
-                val embedHtml = app.get(formAction, headers = headers).text
-
-                // Look for m3u8 URL
-                val m3u8Regex = Regex("""file:\s*["'](https?://[^"']+\.m3u8[^"']*)""")
-                val m3u8Match = m3u8Regex.find(embedHtml)
-                if (m3u8Match != null) {
-                    callback.invoke(
-                        newExtractorLink(
-                            source = serverName,
-                            name = "$name - $serverName",
-                            url = m3u8Match.groupValues[1],
-                            type = INFER_TYPE
-                        ) {
-                            this.referer = formAction
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                    return
-                }
-
-                // Look for mp4 URL
-                val mp4Regex = Regex("""["'](https?://[^"']*\.mp4[^"']*)""")
-                val mp4Match = mp4Regex.find(embedHtml)
-                if (mp4Match != null) {
-                    callback.invoke(
-                        newExtractorLink(
-                            source = serverName,
-                            name = "$name - $serverName",
-                            url = mp4Match.groupValues[1],
-                            type = INFER_TYPE
-                        ) {
-                            this.referer = formAction
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                    return
-                }
-
-                // Check if embed page contains a lulustream URL
-                val innerLulu = Regex("""["'](https?://(?:lulustream|luluvdo)\.com/[^"']+)""")
-                    .find(embedHtml)
-                if (innerLulu != null) {
-                    extractLulustream(innerLulu.groupValues[1], callback)
-                    return
-                }
-
-                // Try CloudStream built-in extractors
-                safeLoadExtractor(formAction, subtitleCallback, callback)
-            } else {
-                // Fallback: extract inner URL from query parameter
-                val innerUrl = Regex("""[?&]id=(https?://[^&]+)""").find(url)?.groupValues?.get(1)
-                if (!innerUrl.isNullOrBlank()) {
-                    val decoded = java.net.URLDecoder.decode(innerUrl, "UTF-8")
-                    routeUrl(decoded, serverName, subtitleCallback, callback)
-                } else {
-                    safeLoadExtractor(url, subtitleCallback, callback)
-                }
+            // Try to find m3u8 URL
+            val m3u8Regex = Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""")
+            val m3u8Match = m3u8Regex.find(html)
+            if (m3u8Match != null) {
+                callback.invoke(
+                    newExtractorLink(
+                        source = serverName,
+                        name = "$name - $serverName",
+                        url = m3u8Match.groupValues[1],
+                        type = INFER_TYPE
+                    ) {
+                        this.referer = url
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+                return
             }
-        } catch (_: Exception) {
-            // Fallback: try to extract inner URL from query parameter
-            val innerUrl = Regex("""[?&]id=(https?://[^&]+)""").find(url)?.groupValues?.get(1)
-            if (!innerUrl.isNullOrBlank()) {
-                val decoded = java.net.URLDecoder.decode(innerUrl, "UTF-8")
-                routeUrl(decoded, serverName, subtitleCallback, callback)
+
+            // Try to find mp4 URL
+            val mp4Regex = Regex("""(https?://[^\s"'<>]+\.mp4[^\s"'<>]*)""")
+            val mp4Match = mp4Regex.find(html)
+            if (mp4Match != null) {
+                callback.invoke(
+                    newExtractorLink(
+                        source = serverName,
+                        name = "$name - $serverName",
+                        url = mp4Match.groupValues[1],
+                        type = INFER_TYPE
+                    ) {
+                        this.referer = url
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+                return
             }
-        }
+
+            // Try packed eval JS (some hosts use the same packer)
+            val packedRegex = Regex(
+                """eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.+?)',(\d+),(\d+),'(.+?)'\)""",
+                RegexOption.DOT_MATCHES_ALL
+            )
+            val packedMatch = packedRegex.find(html)
+            if (packedMatch != null) {
+                try {
+                    val decoded = decodePackedJs(
+                        packedMatch.groupValues[1],
+                        packedMatch.groupValues[2].toInt(),
+                        packedMatch.groupValues[3].toInt(),
+                        packedMatch.groupValues[4]
+                    )
+                    val videoRegex = Regex("""file:\s*["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)""")
+                    val videoMatch = videoRegex.find(decoded)
+                    if (videoMatch != null) {
+                        callback.invoke(
+                            newExtractorLink(
+                                source = serverName,
+                                name = "$name - $serverName",
+                                url = videoMatch.groupValues[1],
+                                type = INFER_TYPE
+                            ) {
+                                this.referer = url
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                    }
+                } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
     }
 
     private suspend fun safeLoadExtractor(
@@ -483,41 +519,61 @@ class StardimaProvider : MainAPI() {
 
     // ==================== LULUSTREAM EXTRACTOR ====================
 
-    private suspend fun extractLulustream(url: String, callback: (ExtractorLink) -> Unit) {
+    private suspend fun extractLulustream(url: String, serverName: String, callback: (ExtractorLink) -> Unit) {
         try {
             val response = app.get(url, headers = headers)
             val html = response.text
 
+            // Try Dean Edwards packed eval JS
             val packedRegex = Regex(
                 """eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.+?)',(\d+),(\d+),'(.+?)'\)""",
                 RegexOption.DOT_MATCHES_ALL
             )
-            val packedMatch = packedRegex.find(html) ?: return
+            val packedMatch = packedRegex.find(html)
 
-            val payload = packedMatch.groupValues[1]
-            val base = packedMatch.groupValues[2].toInt()
-            val count = packedMatch.groupValues[3].toInt()
-            val dictStr = packedMatch.groupValues[4]
+            if (packedMatch != null) {
+                try {
+                    val decoded = decodePackedJs(
+                        packedMatch.groupValues[1],
+                        packedMatch.groupValues[2].toInt(),
+                        packedMatch.groupValues[3].toInt(),
+                        packedMatch.groupValues[4]
+                    )
 
-            val decoded = decodePackedJs(payload, base, count, dictStr)
+                    val m3u8Regex = Regex("""file:\s*["'](https?://[^"']+\.m3u8[^"']*)""")
+                    val m3u8Match = m3u8Regex.find(decoded)
+                    if (m3u8Match != null) {
+                        callback.invoke(
+                            newExtractorLink(
+                                source = serverName,
+                                name = "$name - $serverName",
+                                url = m3u8Match.groupValues[1],
+                                type = INFER_TYPE
+                            ) {
+                                this.referer = url
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                        return
+                    }
+                } catch (_: Exception) {}
+            }
 
-            val m3u8Regex = Regex("""file:\s*["'](https?://[^"']+\.m3u8[^"']*)""")
-            val m3u8Match = m3u8Regex.find(decoded) ?: return
-            val m3u8Url = m3u8Match.groupValues[1]
-
-            val referer = if (url.contains("luluvdo.com")) "https://luluvdo.com/" else "https://lulustream.com/"
-
-            callback.invoke(
-                newExtractorLink(
-                    source = "Lulustream",
-                    name = "$name - Lulustream",
-                    url = m3u8Url,
-                    type = INFER_TYPE
-                ) {
-                    this.referer = referer
-                    this.quality = Qualities.Unknown.value
-                }
-            )
+            // Fallback: look for m3u8 URL directly in the HTML
+            val directM3u8 = Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""").find(html)
+            if (directM3u8 != null) {
+                callback.invoke(
+                    newExtractorLink(
+                        source = serverName,
+                        name = "$name - $serverName",
+                        url = directM3u8.groupValues[1],
+                        type = INFER_TYPE
+                    ) {
+                        this.referer = url
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+            }
         } catch (_: Exception) {}
     }
 
@@ -537,18 +593,19 @@ class StardimaProvider : MainAPI() {
 
     // ==================== UQLOAD EXTRACTOR ====================
 
-    private suspend fun extractUqload(url: String, callback: (ExtractorLink) -> Unit) {
+    private suspend fun extractUqload(url: String, serverName: String, callback: (ExtractorLink) -> Unit) {
         try {
             val html = app.get(url, headers = headers).text
 
+            // Try sources:[{file:"URL"}]
             val mp4Regex = Regex("""sources:\s*\[\{file:\s*["'](https?://[^"']+)["']""")
             val mp4Match = mp4Regex.find(html)
 
             if (mp4Match != null) {
                 callback.invoke(
                     newExtractorLink(
-                        source = "Uqload",
-                        name = "$name - Uqload",
+                        source = serverName,
+                        name = "$name - $serverName",
                         url = mp4Match.groupValues[1],
                         type = INFER_TYPE
                     ) {
@@ -559,13 +616,47 @@ class StardimaProvider : MainAPI() {
                 return
             }
 
+            // Try packed eval JS
+            val packedRegex = Regex(
+                """eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.+?)',(\d+),(\d+),'(.+?)'\)""",
+                RegexOption.DOT_MATCHES_ALL
+            )
+            val packedMatch = packedRegex.find(html)
+            if (packedMatch != null) {
+                try {
+                    val decoded = decodePackedJs(
+                        packedMatch.groupValues[1],
+                        packedMatch.groupValues[2].toInt(),
+                        packedMatch.groupValues[3].toInt(),
+                        packedMatch.groupValues[4]
+                    )
+                    val videoRegex = Regex("""file:\s*["'](https?://[^"']+)["']""")
+                    val videoMatch = videoRegex.find(decoded)
+                    if (videoMatch != null) {
+                        callback.invoke(
+                            newExtractorLink(
+                                source = serverName,
+                                name = "$name - $serverName",
+                                url = videoMatch.groupValues[1],
+                                type = INFER_TYPE
+                            ) {
+                                this.referer = url
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                        return
+                    }
+                } catch (_: Exception) {}
+            }
+
+            // Fallback: look for .mp4 URL
             val altRegex = Regex("""["'](https?://[^"']*\.mp4[^"']*)""")
             val altMatch = altRegex.find(html)
             if (altMatch != null) {
                 callback.invoke(
                     newExtractorLink(
-                        source = "Uqload",
-                        name = "$name - Uqload",
+                        source = serverName,
+                        name = "$name - $serverName",
                         url = altMatch.groupValues[1],
                         type = INFER_TYPE
                     ) {
