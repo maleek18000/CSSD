@@ -268,8 +268,6 @@ class StardimaProvider : MainAPI() {
                     }
                 } catch (_: Exception) {}
             }
-            // Note: The play page HTML has the iframe src="" (empty, populated via JS),
-            // so doc.select("iframe[src]") finds nothing useful. We rely on the API only.
         } else {
             try {
                 val doc = app.get(data, headers = headers).document
@@ -306,7 +304,6 @@ class StardimaProvider : MainAPI() {
             }
 
             if (servers.isEmpty()) {
-                // Not a hyperwatching page — try built-in extractors
                 safeLoadExtractor(cleanUrl, subtitleCallback, callback)
                 return
             }
@@ -384,14 +381,12 @@ class StardimaProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // For strema.top, decode the inner URL from the ?id= parameter
         val actualUrl = if (url.contains("strema.top")) {
             val innerUrlRaw = Regex("[?&]id=([^&]+)").find(url)?.groupValues?.get(1)
             val innerUrl = innerUrlRaw?.let { java.net.URLDecoder.decode(it, "UTF-8") }
             if (!innerUrl.isNullOrBlank() && innerUrl.startsWith("http")) {
                 innerUrl
             } else {
-                // Fallback: try to follow strema.top redirect
                 try {
                     val stremaDoc = app.get(url, headers = headers).document
                     val formAction = stremaDoc.selectFirst("form")?.attr("action")
@@ -408,13 +403,10 @@ class StardimaProvider : MainAPI() {
             url
         }
 
-        // Extract video from the embed page using our packed JS decoder.
-        // We do NOT use CloudStream's built-in loadExtractor for these hosts because:
-        // - Built-in Lulustream uses script:containsData(vplayer) which fails on packed JS
-        // - Built-in Uqload only handles .com/.co/.cx/.bz, NOT .is
-        // So we use our custom extractors as the primary method, then try built-in as fallback.
-        extractFromHost(actualUrl, serverName, subtitleCallback, callback)
-        safeLoadExtractor(actualUrl, subtitleCallback, callback)
+        val handled = extractFromHost(actualUrl, serverName, subtitleCallback, callback)
+        if (!handled) {
+            safeLoadExtractor(actualUrl, subtitleCallback, callback)
+        }
     }
 
     // ==================== HOST ROUTER ====================
@@ -423,35 +415,34 @@ class StardimaProvider : MainAPI() {
         url: String, serverName: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
-    ) {
-        when {
+    ): Boolean {
+        return when {
             url.contains("lulustream.com") || url.contains("luluvdo.com") -> {
-                extractPackedEmbed(url, serverName, callback)
+                extractPackedEmbed(url, serverName, callback); true
             }
             url.contains("uqload") -> {
-                extractPackedEmbed(url, serverName, callback)
+                extractPackedEmbed(url, serverName, callback); true
             }
             url.contains("hgplaycdn.com") || url.contains("streamhg") -> {
-                extractPackedEmbed(url, serverName, callback)
+                extractPackedEmbed(url, serverName, callback); true
             }
             url.contains("darkibox.com") -> {
-                extractPackedEmbed(url, serverName, callback)
+                extractPackedEmbed(url, serverName, callback); true
             }
             url.contains("krakenfiles.com") -> {
-                extractPackedEmbed(url, serverName, callback)
+                extractPackedEmbed(url, serverName, callback); true
             }
             url.contains("goodstream") -> {
-                extractPackedEmbed(url, serverName, callback)
+                extractPackedEmbed(url, serverName, callback); true
             }
             url.contains("earnvids") || url.contains("earnvidsapi") -> {
-                extractPackedEmbed(url, serverName, callback)
+                extractPackedEmbed(url, serverName, callback); true
             }
+            else -> false
         }
     }
 
     // ==================== PACKED EMBED EXTRACTOR ====================
-    // Universal extractor for embed pages that use Dean Edwards packed JS.
-    // Works for lulustream, uqload, hgplaycdn, darkibox, etc.
 
     private suspend fun extractPackedEmbed(
         url: String, serverName: String,
@@ -460,26 +451,89 @@ class StardimaProvider : MainAPI() {
         try {
             val html = app.get(url, headers = headers).text
 
-            // Try our packed JS decoder first (most reliable for these hosts)
-            val videoUrl = extractPackedVideoUrl(html)
-                ?: Regex("(https?://[^\\s\"'<>]+\\.m3u8[^\\s\"'<>]*)").find(html)?.groupValues?.get(1)
-                ?: Regex("(https?://[^\\s\"'<>]+\\.mp4[^\\s\"'<>]*)").find(html)?.groupValues?.get(1)
+            val decoded = decodePackedFromHtml(html)
+
+            val videoUrl = decoded?.let { extractVideoUrlFromDecoded(it) }
+                ?: Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""").find(html)?.groupValues?.get(1)
+                ?: Regex("""(https?://[^\s"'<>]+\.mp4[^\s"'<>]*)""").find(html)?.groupValues?.get(1)
 
             if (videoUrl != null) {
+                // CRITICAL: Call the view tracking URL to register this IP with the CDN.
+                decoded?.let { callViewTracking(it, url) }
+
                 val isM3u8 = videoUrl.contains(".m3u8")
-                callback.invoke(
-                    newExtractorLink(
-                        source = serverName,
-                        name = serverName,
-                        url = videoUrl,
-                        type = if (isM3u8) ExtractorLinkType.M3U8 else INFER_TYPE
-                    ) {
-                        this.referer = url
-                        this.quality = Qualities.Unknown.value
+                if (isM3u8) {
+                    try {
+                        M3u8Helper.generateM3u8(
+                            source = serverName,
+                            streamUrl = videoUrl,
+                            referer = url,
+                            headers = mapOf(
+                                "Referer" to url,
+                                "User-Agent" to headers["User-Agent"]!!
+                            ),
+                            name = serverName
+                        ).forEach { link ->
+                            callback.invoke(link)
+                        }
+                    } catch (_: Exception) {
+                        callback.invoke(
+                            newExtractorLink(
+                                source = serverName,
+                                name = serverName,
+                                url = videoUrl,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = url
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
                     }
-                )
+                } else {
+                    callback.invoke(
+                        newExtractorLink(
+                            source = serverName,
+                            name = serverName,
+                            url = videoUrl,
+                            type = INFER_TYPE
+                        ) {
+                            this.referer = url
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                }
             }
         } catch (_: Exception) {}
+    }
+
+    private suspend fun callViewTracking(decoded: String, embedUrl: String) {
+        try {
+            val viewPattern = Regex("""/dl\?op=view[^"'\s]+""")
+            val viewMatch = viewPattern.find(decoded) ?: return
+            var viewPath = viewMatch.groupValues[0]
+
+            viewPath = viewPath.trimEnd('&', '\'', '"', ',', ')')
+            viewPath = viewPath.replace("adb=", "adb=0")
+
+            val baseUrl = Regex("(https?://[^/]+)").find(embedUrl)?.groupValues?.get(1) ?: return
+            val fullViewUrl = baseUrl + viewPath
+
+            app.get(fullViewUrl, headers = headers + mapOf("Referer" to embedUrl))
+        } catch (_: Exception) {}
+    }
+
+    private fun extractVideoUrlFromDecoded(decoded: String): String? {
+        val patterns = listOf(
+            Regex("file:\\s*[\"'](https?://[^\"']+\\.m3u8[^\"']*)"),
+            Regex("file:\\s*[\"'](https?://[^\"']+)[\"']"),
+            Regex("sources:\\s*\\[\\{file:\\s*[\"'](https?://[^\"']+)[\"']"),
+            Regex("[\"']src[\"']:\\s*[\"'](https?://[^\"']+\\.m3u8[^\"']*)")
+        )
+        for (pattern in patterns) {
+            val match = pattern.find(decoded)
+            if (match != null) return match.groupValues[1]
+        }
+        return null
     }
 
     // ==================== SAFE EXTRACTOR FALLBACK ====================
@@ -494,77 +548,58 @@ class StardimaProvider : MainAPI() {
 
     // ==================== PACKED JS DECODER ====================
 
-    private fun extractPackedVideoUrl(html: String): String? {
-        val startMarker = "eval(function(p,a,c,k,e,d)"
-        val startIdx = html.indexOf(startMarker)
-        if (startIdx < 0) return null
+    private fun decodePackedFromHtml(html: String): String? {
+        try {
+            val startMarker = "eval(function(p,a,c,k,e,d)"
+            val startIdx = html.indexOf(startMarker)
+            if (startIdx < 0) return null
 
-        val scriptEnd = html.indexOf("</script>", startIdx)
-        val searchEnd = if (scriptEnd > startIdx) scriptEnd else html.length
-        val snippet = html.substring(startIdx, searchEnd)
+            val scriptEnd = html.indexOf("</script>", startIdx)
+            val searchEnd = if (scriptEnd > startIdx) scriptEnd else html.length
+            val snippet = html.substring(startIdx, searchEnd)
 
-        val bodyEndMarker = "}('"
-        val bodyEndIdx = snippet.indexOf(bodyEndMarker)
-        if (bodyEndIdx < 0) return null
+            val bodyEndMarker = "}('"
+            val bodyEndIdx = snippet.indexOf(bodyEndMarker)
+            if (bodyEndIdx < 0) return null
 
-        val afterBody = snippet.substring(bodyEndIdx + bodyEndMarker.length)
+            val afterBody = snippet.substring(bodyEndIdx + bodyEndMarker.length)
 
-        val argsPattern = Regex(",(\\d+),(\\d+),")
-        val argsMatch = argsPattern.find(afterBody) ?: return null
+            val argsPattern = Regex(",(\\d+),(\\d+),")
+            val argsMatch = argsPattern.find(afterBody) ?: return null
 
-        val payloadEnd = argsMatch.range.first
-        val payloadRaw = afterBody.substring(0, payloadEnd)
-        val base = argsMatch.groupValues[1].toIntOrNull() ?: return null
-        val count = argsMatch.groupValues[2].toIntOrNull() ?: return null
+            val payloadEnd = argsMatch.range.first
+            val payloadRaw = afterBody.substring(0, payloadEnd)
+            val base = argsMatch.groupValues[1].toIntOrNull() ?: return null
+            val count = argsMatch.groupValues[2].toIntOrNull() ?: return null
 
-        val payload = payloadRaw
-            .removeSurrounding("'")
-            .replace("\\'", "'")
-            .replace("\\\\", "\\")
+            val payload = payloadRaw
+                .removeSurrounding("'")
+                .replace("\\'", "'")
+                .replace("\\\\", "\\")
 
-        val afterCount = afterBody.substring(argsMatch.range.last + 1)
+            val afterCount = afterBody.substring(argsMatch.range.last + 1)
 
-        val dictStart = afterCount.indexOf("'")
-        if (dictStart < 0) return null
+            val dictStart = afterCount.indexOf("'")
+            if (dictStart < 0) return null
 
-        val afterDictStart = afterCount.substring(dictStart + 1)
+            val afterDictStart = afterCount.substring(dictStart + 1)
 
-        val splitMarker = "'.split('"
-        val dictEnd = afterDictStart.indexOf(splitMarker)
-        val dictStr = if (dictEnd >= 0) {
-            afterDictStart.substring(0, dictEnd)
-        } else {
-            val standardEnd = afterDictStart.indexOf("')")
-            if (standardEnd < 0) return null
-            afterDictStart.substring(0, standardEnd)
-        }
-
-        val cleanDict = dictStr
-            .replace("\\'", "'")
-            .replace("\\\\", "\\")
-
-        return tryDecodePacked(payload, base, count, cleanDict)
-    }
-
-    private fun tryDecodePacked(payload: String, base: Int, count: Int, dictStr: String): String? {
-        return try {
-            val decoded = decodePackedJs(payload, base, count, dictStr)
-
-            val p1 = Regex("file:\\s*[\"'](https?://[^\"']+\\.m3u8[^\"']*)")
-            val p2 = Regex("file:\\s*[\"'](https?://[^\"']+)[\"']")
-            val p3 = Regex("sources:\\s*\\[\\{file:\\s*[\"'](https?://[^\"']+)[\"']")
-            val p4 = Regex("[\"']src[\"']:\\s*[\"'](https?://[^\"']+\\.m3u8[^\"']*)")
-
-            val videoPatterns = listOf(p1, p2, p3, p4)
-
-            for (pattern in videoPatterns) {
-                val match = pattern.find(decoded)
-                if (match != null) {
-                    return match.groupValues[1]
-                }
+            val splitMarker = "'.split('"
+            val dictEnd = afterDictStart.indexOf(splitMarker)
+            val dictStr = if (dictEnd >= 0) {
+                afterDictStart.substring(0, dictEnd)
+            } else {
+                val standardEnd = afterDictStart.indexOf("')")
+                if (standardEnd < 0) return null
+                afterDictStart.substring(0, standardEnd)
             }
-            null
-        } catch (_: Exception) { null }
+
+            val cleanDict = dictStr
+                .replace("\\'", "'")
+                .replace("\\\\", "\\")
+
+            return decodePackedJs(payload, base, count, cleanDict)
+        } catch (_: Exception) { return null }
     }
 
     private fun decodePackedJs(payload: String, base: Int, count: Int, dictStr: String): String {
