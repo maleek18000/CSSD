@@ -394,6 +394,26 @@ class StardimaProvider : MainAPI() {
                     val innerUrl = java.net.URLDecoder.decode(innerUrlEncoded, "UTF-8")
                     extractFromHost(innerUrl, serverName, subtitleCallback, callback)
                     safeLoadExtractor(innerUrl, subtitleCallback, callback)
+                } else {
+                    // Fallback: fetch strema.top page and look for redirect/embed URL
+                    try {
+                        val stremaDoc = app.get(watchUrl, headers = headers).document
+                        // strema.top uses a form auto-submit with the actual URL
+                        val formAction = stremaDoc.selectFirst("form")?.attr("action")
+                        if (!formAction.isNullOrBlank()) {
+                            val redirectUrl = if (formAction.startsWith("http")) formAction else "https://strema.top$formAction"
+                            extractFromHost(redirectUrl, serverName, subtitleCallback, callback)
+                            safeLoadExtractor(redirectUrl, subtitleCallback, callback)
+                        }
+                        // Also check for any iframe on the page
+                        stremaDoc.select("iframe[src]").forEach { iframe ->
+                            val src = iframe.attr("src")
+                            if (src.isNotBlank() && src.startsWith("http")) {
+                                extractFromHost(src, serverName, subtitleCallback, callback)
+                                safeLoadExtractor(src, subtitleCallback, callback)
+                            }
+                        }
+                    } catch (_: Exception) {}
                 }
             }
         } catch (_: Exception) {}
@@ -426,6 +446,9 @@ class StardimaProvider : MainAPI() {
             url.contains("goodstream") -> {
                 extractGenericEmbed(url, serverName, callback)
             }
+            url.contains("earnvids") || url.contains("earnvidsapi") -> {
+                extractGenericEmbed(url, serverName, callback)
+            }
         }
     }
 
@@ -439,7 +462,24 @@ class StardimaProvider : MainAPI() {
         try {
             val html = app.get(url, headers = headers).text
 
-            // Try to find m3u8 URL
+            // Try packed JS first (most reliable when present)
+            val packedUrl = extractPackedVideoUrl(html)
+            if (packedUrl != null) {
+                callback.invoke(
+                    newExtractorLink(
+                        source = serverName,
+                        name = "$name - $serverName",
+                        url = packedUrl,
+                        type = INFER_TYPE
+                    ) {
+                        this.referer = url
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+                return
+            }
+
+            // Try to find m3u8 URL directly
             val m3u8Regex = Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""")
             val m3u8Match = m3u8Regex.find(html)
             if (m3u8Match != null) {
@@ -472,39 +512,6 @@ class StardimaProvider : MainAPI() {
                         this.quality = Qualities.Unknown.value
                     }
                 )
-                return
-            }
-
-            // Try packed eval JS (some hosts use the same packer)
-            val packedRegex = Regex(
-                """eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.+?)',(\d+),(\d+),'(.+?)'\)""",
-                RegexOption.DOT_MATCHES_ALL
-            )
-            val packedMatch = packedRegex.find(html)
-            if (packedMatch != null) {
-                try {
-                    val decoded = decodePackedJs(
-                        packedMatch.groupValues[1],
-                        packedMatch.groupValues[2].toInt(),
-                        packedMatch.groupValues[3].toInt(),
-                        packedMatch.groupValues[4]
-                    )
-                    val videoRegex = Regex("""file:\s*["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)""")
-                    val videoMatch = videoRegex.find(decoded)
-                    if (videoMatch != null) {
-                        callback.invoke(
-                            newExtractorLink(
-                                source = serverName,
-                                name = "$name - $serverName",
-                                url = videoMatch.groupValues[1],
-                                type = INFER_TYPE
-                            ) {
-                                this.referer = url
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                    }
-                } catch (_: Exception) {}
             }
         } catch (_: Exception) {}
     }
@@ -524,39 +531,21 @@ class StardimaProvider : MainAPI() {
             val response = app.get(url, headers = headers)
             val html = response.text
 
-            // Try Dean Edwards packed eval JS
-            val packedRegex = Regex(
-                """eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.+?)',(\d+),(\d+),'(.+?)'\)""",
-                RegexOption.DOT_MATCHES_ALL
-            )
-            val packedMatch = packedRegex.find(html)
-
-            if (packedMatch != null) {
-                try {
-                    val decoded = decodePackedJs(
-                        packedMatch.groupValues[1],
-                        packedMatch.groupValues[2].toInt(),
-                        packedMatch.groupValues[3].toInt(),
-                        packedMatch.groupValues[4]
-                    )
-
-                    val m3u8Regex = Regex("""file:\s*["'](https?://[^"']+\.m3u8[^"']*)""")
-                    val m3u8Match = m3u8Regex.find(decoded)
-                    if (m3u8Match != null) {
-                        callback.invoke(
-                            newExtractorLink(
-                                source = serverName,
-                                name = "$name - $serverName",
-                                url = m3u8Match.groupValues[1],
-                                type = INFER_TYPE
-                            ) {
-                                this.referer = url
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                        return
+            // Try packed JS extraction (handles both standard and .split('|') variants)
+            val packedUrl = extractPackedVideoUrl(html)
+            if (packedUrl != null) {
+                callback.invoke(
+                    newExtractorLink(
+                        source = serverName,
+                        name = "$name - $serverName",
+                        url = packedUrl,
+                        type = INFER_TYPE
+                    ) {
+                        this.referer = url
+                        this.quality = Qualities.Unknown.value
                     }
-                } catch (_: Exception) {}
+                )
+                return
             }
 
             // Fallback: look for m3u8 URL directly in the HTML
@@ -575,6 +564,63 @@ class StardimaProvider : MainAPI() {
                 )
             }
         } catch (_: Exception) {}
+    }
+
+    /**
+     * Shared helper: try to find and decode packed JS in HTML, returning a video URL.
+     * Handles both standard Dean Edwards format and the .split('|') variant used by luluvdo.
+     */
+    private fun extractPackedVideoUrl(html: String): String? {
+        // Regex patterns for both packed JS formats:
+        // 1) Variant with .split('|') — used by luluvdo.com/lulustream.com
+        // 2) Standard Dean Edwards format
+        // Both handle escaped quotes (\') in the payload/dict via ((?:[^'\\]|\\.)*)
+        val packedPatterns = listOf(
+            Regex(
+                """eval\(function\(p,a,c,k,e,d\)\{.*?\}\('((?:[^'\\]|\\.)*)',(\d+),(\d+),'((?:[^'\\]|\\.)*)'\.split\('[^']*'\)\)""",
+                RegexOption.DOT_MATCHES_ALL
+            ),
+            Regex(
+                """eval\(function\(p,a,c,k,e,d\)\{.*?\}\('((?:[^'\\]|\\.)*)',(\d+),(\d+),'((?:[^'\\]|\\.)*)'\)""",
+                RegexOption.DOT_MATCHES_ALL
+            )
+        )
+
+        for (pattern in packedPatterns) {
+            val match = pattern.find(html) ?: continue
+            try {
+                val payload = match.groupValues[1]
+                    .replace("\\'", "'")  // un-escape single quotes
+                    .replace("\\\\", "\\")  // un-escape backslashes
+                val base = match.groupValues[2].toInt()
+                val count = match.groupValues[3].toInt()
+                val dictStr = match.groupValues[4]
+                    .replace("\\'", "'")
+                    .replace("\\\\", "\\")
+
+                val decoded = decodePackedJs(payload, base, count, dictStr)
+
+                // Try multiple video URL patterns in the decoded content
+                val videoPatterns = listOf(
+                    // file:"URL.m3u8" or file:'URL.m3u8'
+                    Regex("""file:\s*["'](https?://[^"']+\.m3u8[^"']*)"""),
+                    // file:"URL" (any URL from file property — covers .master, .mp4, etc.)
+                    Regex("""file:\s*["'](https?://[^"']+)["']"""),
+                    // sources:[{file:"URL"}]
+                    Regex("""sources:\s*\[\{file:\s*["'](https?://[^"']+)["']"""),
+                    // "src":"URL"
+                    Regex("""["']src["']:\s*["'](https?://[^"']+\.m3u8[^"']*)""")
+                )
+
+                for (videoPattern in videoPatterns) {
+                    val videoMatch = videoPattern.find(decoded)
+                    if (videoMatch != null) {
+                        return videoMatch.groupValues[1]
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        return null
     }
 
     private fun decodePackedJs(payload: String, base: Int, count: Int, dictStr: String): String {
@@ -616,37 +662,21 @@ class StardimaProvider : MainAPI() {
                 return
             }
 
-            // Try packed eval JS
-            val packedRegex = Regex(
-                """eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.+?)',(\d+),(\d+),'(.+?)'\)""",
-                RegexOption.DOT_MATCHES_ALL
-            )
-            val packedMatch = packedRegex.find(html)
-            if (packedMatch != null) {
-                try {
-                    val decoded = decodePackedJs(
-                        packedMatch.groupValues[1],
-                        packedMatch.groupValues[2].toInt(),
-                        packedMatch.groupValues[3].toInt(),
-                        packedMatch.groupValues[4]
-                    )
-                    val videoRegex = Regex("""file:\s*["'](https?://[^"']+)["']""")
-                    val videoMatch = videoRegex.find(decoded)
-                    if (videoMatch != null) {
-                        callback.invoke(
-                            newExtractorLink(
-                                source = serverName,
-                                name = "$name - $serverName",
-                                url = videoMatch.groupValues[1],
-                                type = INFER_TYPE
-                            ) {
-                                this.referer = url
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                        return
+            // Try packed JS extraction (handles both formats)
+            val packedUrl = extractPackedVideoUrl(html)
+            if (packedUrl != null) {
+                callback.invoke(
+                    newExtractorLink(
+                        source = serverName,
+                        name = "$name - $serverName",
+                        url = packedUrl,
+                        type = INFER_TYPE
+                    ) {
+                        this.referer = url
+                        this.quality = Qualities.Unknown.value
                     }
-                } catch (_: Exception) {}
+                )
+                return
             }
 
             // Fallback: look for .mp4 URL
