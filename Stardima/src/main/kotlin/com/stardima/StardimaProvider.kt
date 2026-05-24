@@ -296,6 +296,10 @@ class StardimaProvider : MainAPI() {
 
     // ==================== HYPERWATCHING EXTRACTOR ====================
 
+    /**
+     * Fetch the hyperwatching iframe page, extract servers and CSRF,
+     * then try each server's link API to get third-party embed URLs.
+     */
     private suspend fun extractAllHyperServers(
         hyperUrl: String,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -309,7 +313,7 @@ class StardimaProvider : MainAPI() {
             // Extract CSRF token
             val csrf = Regex("csrf:\\s*[\"']([^\"']+)[\"']").find(html)?.groupValues?.get(1)
 
-            // Extract server IDs and names (works across newlines since \s includes \n)
+            // Extract server IDs and names
             val servers = mutableListOf<Pair<String, String>>()
             val serverRegex = Regex("id:\\s*[\"'](\\d+)[\"'],\\s*name:\\s*[\"']([^\"']+)[\"']")
             serverRegex.findAll(html).forEach { match ->
@@ -360,6 +364,7 @@ class StardimaProvider : MainAPI() {
                 postHeaders["X-CSRF-TOKEN"] = csrf
             }
 
+            // Try JSON body first
             var linkData: HyperLinkResponse? = null
 
             try {
@@ -371,6 +376,7 @@ class StardimaProvider : MainAPI() {
                 linkData = resp.parsedSafe<HyperLinkResponse>()
             } catch (_: Exception) {}
 
+            // If JSON failed, try form-encoded
             if (linkData?.success != true) {
                 try {
                     val resp = app.post(
@@ -385,12 +391,18 @@ class StardimaProvider : MainAPI() {
             if (linkData?.success != true) return
             if (linkData.watchUrl.isNullOrBlank()) return
 
-            routeAndExtract(linkData.watchUrl, serverName, subtitleCallback, callback)
+            val watchUrl = linkData.watchUrl
+
+            // Route the URL to the right extractor
+            routeAndExtract(watchUrl, serverName, subtitleCallback, callback)
         } catch (_: Exception) {}
     }
 
     // ==================== URL ROUTER ====================
 
+    /**
+     * Route a watch URL to the correct extractor, handling wrappers like strema.top
+     */
     private suspend fun routeAndExtract(
         url: String, serverName: String,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -398,11 +410,9 @@ class StardimaProvider : MainAPI() {
     ) {
         // If strema.top wrapper, extract the inner URL first
         if (url.contains("strema.top")) {
-            // The id= parameter is URL-encoded (e.g. https%3A%2F%2F not https://)
-            // Extract everything after id= then URL-decode it
-            val innerUrlRaw = Regex("[?&]id=([^&]+)").find(url)?.groupValues?.get(1)
-            val innerUrl = innerUrlRaw?.let { java.net.URLDecoder.decode(it, "UTF-8") }
-            if (!innerUrl.isNullOrBlank() && innerUrl.startsWith("http")) {
+            val innerUrlEncoded = Regex("[?&]id=(https?://[^&]+)").find(url)?.groupValues?.get(1)
+            if (!innerUrlEncoded.isNullOrBlank()) {
+                val innerUrl = java.net.URLDecoder.decode(innerUrlEncoded, "UTF-8")
                 extractFromHost(innerUrl, serverName, subtitleCallback, callback)
                 safeLoadExtractor(innerUrl, subtitleCallback, callback)
             } else {
@@ -433,6 +443,9 @@ class StardimaProvider : MainAPI() {
 
     // ==================== HOST ROUTER ====================
 
+    /**
+     * Route URL to custom extractors based on host
+     */
     private suspend fun extractFromHost(
         url: String, serverName: String,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -465,6 +478,9 @@ class StardimaProvider : MainAPI() {
 
     // ==================== GENERIC EMBED EXTRACTOR ====================
 
+    /**
+     * Generic embed extractor - looks for any video URL (m3u8, mp4) in the page HTML
+     */
     private suspend fun extractGenericEmbed(
         url: String, serverName: String,
         callback: (ExtractorLink) -> Unit
@@ -573,21 +589,31 @@ class StardimaProvider : MainAPI() {
 
     // ==================== PACKED JS DECODER ====================
 
+    /**
+     * Shared helper: try to find and decode packed JS in HTML, returning a video URL.
+     * Uses step-by-step extraction instead of one giant regex, which fails on long payloads.
+     * Handles both standard Dean Edwards format and the .split('|') variant.
+     */
     private fun extractPackedVideoUrl(html: String): String? {
+        // Find the start of packed JS
         val startMarker = "eval(function(p,a,c,k,e,d)"
         val startIdx = html.indexOf(startMarker)
         if (startIdx < 0) return null
 
+        // Find the script block end
         val scriptEnd = html.indexOf("</script>", startIdx)
         val searchEnd = if (scriptEnd > startIdx) scriptEnd else html.length
         val snippet = html.substring(startIdx, searchEnd)
 
+        // Find the function body closing: }('
         val bodyEndMarker = "}('"
         val bodyEndIdx = snippet.indexOf(bodyEndMarker)
         if (bodyEndIdx < 0) return null
 
         val afterBody = snippet.substring(bodyEndIdx + bodyEndMarker.length)
 
+        // Extract: PAYLOAD',BASE,COUNT,'DICT'.split('|')))
+        // Strategy: find the numbers after the payload
         val argsPattern = Regex(",(\\d+),(\\d+),")
         val argsMatch = argsPattern.find(afterBody) ?: return null
 
@@ -596,23 +622,28 @@ class StardimaProvider : MainAPI() {
         val base = argsMatch.groupValues[1].toIntOrNull() ?: return null
         val count = argsMatch.groupValues[2].toIntOrNull() ?: return null
 
+        // Extract payload string (strip surrounding quotes if present)
         val payload = payloadRaw
             .removeSurrounding("'")
             .replace("\\'", "'")
             .replace("\\\\", "\\")
 
+        // Now extract the dict string after the count number
         val afterCount = afterBody.substring(argsMatch.range.last + 1)
 
+        // Dict is in single quotes: 'DICT' followed by .split('|') or )
         val dictStart = afterCount.indexOf("'")
         if (dictStart < 0) return null
 
         val afterDictStart = afterCount.substring(dictStart + 1)
 
+        // Find closing quote - look for .split pattern first (more common)
         val splitMarker = "'.split('"
         val dictEnd = afterDictStart.indexOf(splitMarker)
         val dictStr = if (dictEnd >= 0) {
             afterDictStart.substring(0, dictEnd)
         } else {
+            // Try standard Dean Edwards without .split: ')
             val standardEnd = afterDictStart.indexOf("')")
             if (standardEnd < 0) return null
             afterDictStart.substring(0, standardEnd)
@@ -629,6 +660,8 @@ class StardimaProvider : MainAPI() {
         return try {
             val decoded = decodePackedJs(payload, base, count, dictStr)
 
+            // Try multiple video URL patterns in the decoded content
+            // Using regular strings with escaping to avoid copy-paste encoding issues
             val p1 = Regex("file:\\s*[\"'](https?://[^\"']+\\.m3u8[^\"']*)")
             val p2 = Regex("file:\\s*[\"'](https?://[^\"']+)[\"']")
             val p3 = Regex("sources:\\s*\\[\\{file:\\s*[\"'](https?://[^\"']+)[\"']")
@@ -666,6 +699,7 @@ class StardimaProvider : MainAPI() {
         try {
             val html = app.get(url, headers = headers).text
 
+            // Pattern: sources:[{file:"URL"}]  or  sources:[{file:'URL'}
             val mp4Match = Regex("sources:\\s*\\[\\{file:\\s*[\"'](https?://[^\"']+)[\"']").find(html)
 
             if (mp4Match != null) {
