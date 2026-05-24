@@ -268,17 +268,8 @@ class StardimaProvider : MainAPI() {
                     }
                 } catch (_: Exception) {}
             }
-
-            // Also check the play page HTML for iframes (may contain additional sources)
-            try {
-                val doc = app.get(data, headers = headers).document
-                doc.select("iframe[src]").forEach { iframe ->
-                    val src = iframe.attr("src")
-                    if (src.isNotBlank() && src.startsWith("http") && !src.contains("about:blank")) {
-                        extractAllHyperServers(src, subtitleCallback, callback)
-                    }
-                }
-            } catch (_: Exception) {}
+            // Note: The play page HTML has the iframe src="" (empty, populated via JS),
+            // so doc.select("iframe[src]") finds nothing useful. We rely on the API only.
         } else {
             try {
                 val doc = app.get(data, headers = headers).document
@@ -315,6 +306,7 @@ class StardimaProvider : MainAPI() {
             }
 
             if (servers.isEmpty()) {
+                // Not a hyperwatching page — try built-in extractors
                 safeLoadExtractor(cleanUrl, subtitleCallback, callback)
                 return
             }
@@ -416,24 +408,16 @@ class StardimaProvider : MainAPI() {
             url
         }
 
-        // For hosts CloudStream already supports (lulustream, uqload),
-        // ONLY use the built-in loadExtractor — don't double-extract.
-        val knownHost = actualUrl.contains("lulustream.com")
-                || actualUrl.contains("luluvdo.com")
-                || actualUrl.contains("uqload")
-
-        if (knownHost) {
-            safeLoadExtractor(actualUrl, subtitleCallback, callback)
-        } else {
-            // For unknown hosts, try custom extraction then built-in as fallback
-            extractFromHost(actualUrl, serverName, subtitleCallback, callback)
-            safeLoadExtractor(actualUrl, subtitleCallback, callback)
-        }
+        // Extract video from the embed page using our packed JS decoder.
+        // We do NOT use CloudStream's built-in loadExtractor for these hosts because:
+        // - Built-in Lulustream uses script:containsData(vplayer) which fails on packed JS
+        // - Built-in Uqload only handles .com/.co/.cx/.bz, NOT .is
+        // So we use our custom extractors as the primary method, then try built-in as fallback.
+        extractFromHost(actualUrl, serverName, subtitleCallback, callback)
+        safeLoadExtractor(actualUrl, subtitleCallback, callback)
     }
 
     // ==================== HOST ROUTER ====================
-    // Only handles hosts that CloudStream does NOT have built-in extractors for.
-    // Lulustream and Uqload are handled by CloudStream's built-in loadExtractor.
 
     private suspend fun extractFromHost(
         url: String, serverName: String,
@@ -441,65 +425,59 @@ class StardimaProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ) {
         when {
+            url.contains("lulustream.com") || url.contains("luluvdo.com") -> {
+                extractPackedEmbed(url, serverName, callback)
+            }
+            url.contains("uqload") -> {
+                extractPackedEmbed(url, serverName, callback)
+            }
             url.contains("hgplaycdn.com") || url.contains("streamhg") -> {
-                extractGenericEmbed(url, serverName, callback)
+                extractPackedEmbed(url, serverName, callback)
             }
             url.contains("darkibox.com") -> {
-                extractGenericEmbed(url, serverName, callback)
+                extractPackedEmbed(url, serverName, callback)
             }
             url.contains("krakenfiles.com") -> {
-                extractGenericEmbed(url, serverName, callback)
+                extractPackedEmbed(url, serverName, callback)
             }
             url.contains("goodstream") -> {
-                extractGenericEmbed(url, serverName, callback)
+                extractPackedEmbed(url, serverName, callback)
             }
             url.contains("earnvids") || url.contains("earnvidsapi") -> {
-                extractGenericEmbed(url, serverName, callback)
+                extractPackedEmbed(url, serverName, callback)
             }
         }
     }
 
-    // ==================== BUILD EXTRACTOR LINK ====================
+    // ==================== PACKED EMBED EXTRACTOR ====================
+    // Universal extractor for embed pages that use Dean Edwards packed JS.
+    // Works for lulustream, uqload, hgplaycdn, darkibox, etc.
 
-    /**
-     * Build an ExtractorLink with proper type and referer.
-     * Do NOT set Origin or extra headers — CloudStream's built-in extractors
-     * use empty headers and they work. Extra headers can cause CDN rejection.
-     */
-    private suspend fun buildExtractorLink(
-        source: String,
-        name: String,
-        videoUrl: String,
-        pageUrl: String
-    ): ExtractorLink {
-        val isM3u8 = videoUrl.contains(".m3u8")
-
-        return newExtractorLink(
-            source = source,
-            name = name,
-            url = videoUrl,
-            type = if (isM3u8) ExtractorLinkType.M3U8 else INFER_TYPE
-        ) {
-            this.referer = pageUrl
-            this.quality = Qualities.Unknown.value
-        }
-    }
-
-    // ==================== GENERIC EMBED EXTRACTOR ====================
-
-    private suspend fun extractGenericEmbed(
+    private suspend fun extractPackedEmbed(
         url: String, serverName: String,
         callback: (ExtractorLink) -> Unit
     ) {
         try {
             val html = app.get(url, headers = headers).text
 
+            // Try our packed JS decoder first (most reliable for these hosts)
             val videoUrl = extractPackedVideoUrl(html)
                 ?: Regex("(https?://[^\\s\"'<>]+\\.m3u8[^\\s\"'<>]*)").find(html)?.groupValues?.get(1)
                 ?: Regex("(https?://[^\\s\"'<>]+\\.mp4[^\\s\"'<>]*)").find(html)?.groupValues?.get(1)
 
             if (videoUrl != null) {
-                callback.invoke(buildExtractorLink(serverName, "$name - $serverName", videoUrl, url))
+                val isM3u8 = videoUrl.contains(".m3u8")
+                callback.invoke(
+                    newExtractorLink(
+                        source = serverName,
+                        name = serverName,
+                        url = videoUrl,
+                        type = if (isM3u8) ExtractorLinkType.M3U8 else INFER_TYPE
+                    ) {
+                        this.referer = url
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
             }
         } catch (_: Exception) {}
     }
@@ -513,12 +491,6 @@ class StardimaProvider : MainAPI() {
     ) {
         try { loadExtractor(url, url, subtitleCallback, callback) } catch (_: Exception) {}
     }
-
-    // ==================== LULUSTREAM EXTRACTOR ====================
-    // REMOVED — CloudStream has built-in extractors for lulustream.com / luluvdo.com
-    // that use the proper /dl API endpoint + JwPlayerHelper.
-    // Our custom packed JS decoder was conflicting with them.
-    // Now handled by safeLoadExtractor() -> loadExtractor() in routeAndExtract().
 
     // ==================== PACKED JS DECODER ====================
 
@@ -608,11 +580,6 @@ class StardimaProvider : MainAPI() {
         }
         return result
     }
-
-    // ==================== UQLOAD EXTRACTOR ====================
-    // REMOVED — CloudStream has built-in extractors for uqload.com / uqload.co / uqload.cx / uqload.bz
-    // that properly handle the sources regex and set referer correctly.
-    // Now handled by safeLoadExtractor() -> loadExtractor() in routeAndExtract().
 
     // ==================== HELPERS ====================
 
