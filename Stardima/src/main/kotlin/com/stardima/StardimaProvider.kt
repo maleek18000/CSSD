@@ -88,40 +88,36 @@ class StardimaProvider : MainAPI() {
 
     // ==================== MAIN PAGE ====================
 
+    override val mainPage = mainPageOf(
+        "$mainUrl/mosalsalat" to "مسلسلات",
+        "$mainUrl/aflam" to "أفلام",
+        "$mainUrl/mosalsalat?category=anmy" to "أنمي",
+        "$mainUrl/mosalsalat?category=krton" to "كرتون",
+        "$mainUrl/mosalsalat?category=krton-ntork" to "كرتون نتورك",
+        "$mainUrl/mosalsalat?category=sbyston" to "سبيستون",
+        "$mainUrl/mosalsalat?status=continu" to "مسلسلات مستمرة",
+        "$mainUrl/aflam?category=aflam-konan" to "أفلام كونان",
+        "$mainUrl/aflam?language=dub" to "أفلام مدبلجة",
+        "$mainUrl/mosalsalat?language=dub" to "مسلسلات مدبلجة",
+        "$mainUrl/aflam?category=aflam-barby" to "أفلام باربي",
+        "$mainUrl/mosalsalat?category=abtal-alakshn" to "أبطال الأكشن",
+        "$mainUrl/mosalsalat?category=nynga" to "نينجا"
+    )
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val doc = app.get(mainUrl, headers = headers).document
-        val sections = mutableListOf<HomePageList>()
+        val separator = if (request.data.contains("?")) "&" else "?"
+        val url = "${request.data}${separator}page=$page"
+        val response = app.get(url, headers = apiHeaders)
+        val result = response.parsedSafe<StardimaSearchResponse>()
+            ?: return newHomePageResponse(emptyList(), false)
 
-        val headings = doc.select("h2.text-white")
-        for (heading in headings) {
-            val sectionTitle = heading.text().trim()
-            if (sectionTitle.isBlank()) continue
+        val items = result.videos?.mapNotNull { it.toSearchResult() } ?: emptyList()
+        val hasNextPage = (result.pagination?.currentPage ?: 1) < (result.pagination?.lastPage ?: 1)
 
-            val embla = heading.parent()?.parent()?.selectFirst("div.embla")
-                ?: heading.parent()?.parent()?.nextElementSiblings()?.select("div.embla")?.first()
-                ?: continue
-
-            val items = embla.select("div.embla__slide").mapNotNull { slide ->
-                slide.toSearchResult()
-            }
-            if (items.isNotEmpty()) {
-                sections.add(HomePageList(sectionTitle, items))
-            }
-        }
-
-        if (sections.isEmpty()) {
-            doc.select("div.embla").forEach { carousel ->
-                val title = carousel.parent()?.selectFirst("h2")?.text()?.trim() ?: "الرئيسية"
-                val items = carousel.select("div.embla__slide").mapNotNull { slide ->
-                    slide.toSearchResult()
-                }
-                if (items.isNotEmpty()) {
-                    sections.add(HomePageList(title, items))
-                }
-            }
-        }
-
-        return newHomePageResponse(sections)
+        return newHomePageResponse(
+            listOf(HomePageList(request.name, items)),
+            hasNext = hasNextPage
+        )
     }
 
     // ==================== SEARCH ====================
@@ -130,7 +126,6 @@ class StardimaProvider : MainAPI() {
         val encodedQuery = java.net.URLEncoder.encode(query, "UTF-8")
         val allResults = mutableListOf<SearchResponse>()
 
-        // Fetch page 1 first to get pagination info
         val firstResponse = app.get(
             "$mainUrl/search?query=$encodedQuery&page=1",
             headers = apiHeaders
@@ -141,7 +136,6 @@ class StardimaProvider : MainAPI() {
             allResults.addAll(videos.mapNotNull { it.toSearchResult() })
         }
 
-        // Check if there are more pages and fetch them
         val lastPage = firstResult.pagination?.lastPage ?: 1
         if (lastPage > 1) {
             for (page in 2..lastPage) {
