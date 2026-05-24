@@ -127,26 +127,55 @@ class StardimaProvider : MainAPI() {
     // ==================== SEARCH ====================
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val response = app.get(
-            "$mainUrl/search?query=${java.net.URLEncoder.encode(query, "UTF-8")}",
+        val encodedQuery = java.net.URLEncoder.encode(query, "UTF-8")
+        val allResults = mutableListOf<SearchResponse>()
+
+        // Fetch page 1 first to get pagination info
+        val firstResponse = app.get(
+            "$mainUrl/search?query=$encodedQuery&page=1",
             headers = apiHeaders
         )
-        val result = response.parsedSafe<StardimaSearchResponse>() ?: return emptyList()
+        val firstResult = firstResponse.parsedSafe<StardimaSearchResponse>() ?: return emptyList()
 
-        return result.videos?.mapNotNull { video ->
-            val url = video.url ?: return@mapNotNull null
-            val fullUrl = if (url.startsWith("http")) url else "$mainUrl$url"
-            val title = video.title ?: return@mapNotNull null
-            val posterUrl = video.posterUrl?.let { p ->
-                if (p.startsWith("http")) p else "$mainUrl/storage/$p"
-            }
+        firstResult.videos?.let { videos ->
+            allResults.addAll(videos.mapNotNull { it.toSearchResult() })
+        }
 
-            if (video.isSeries == true) {
-                newTvSeriesSearchResponse(title, fullUrl) { this.posterUrl = posterUrl }
-            } else {
-                newMovieSearchResponse(title, fullUrl) { this.posterUrl = posterUrl }
+        // Check if there are more pages and fetch them
+        val lastPage = firstResult.pagination?.lastPage ?: 1
+        if (lastPage > 1) {
+            for (page in 2..lastPage) {
+                try {
+                    val pageResponse = app.get(
+                        "$mainUrl/search?query=$encodedQuery&page=$page",
+                        headers = apiHeaders
+                    )
+                    val pageResult = pageResponse.parsedSafe<StardimaSearchResponse>()
+                    pageResult?.videos?.let { videos ->
+                        val mapped = videos.mapNotNull { it.toSearchResult() }
+                        if (mapped.isEmpty()) break
+                        allResults.addAll(mapped)
+                    } ?: break
+                } catch (_: Exception) { break }
             }
-        } ?: emptyList()
+        }
+
+        return allResults
+    }
+
+    private fun StardimaSearchVideo.toSearchResult(): SearchResponse? {
+        val url = this.url ?: return null
+        val fullUrl = if (url.startsWith("http")) url else "$mainUrl$url"
+        val title = this.title ?: return null
+        val posterUrl = posterUrl?.let { p ->
+            if (p.startsWith("http")) p else "$mainUrl/storage/$p"
+        }
+
+        return if (isSeries == true) {
+            newTvSeriesSearchResponse(title, fullUrl) { this.posterUrl = posterUrl }
+        } else {
+            newMovieSearchResponse(title, fullUrl) { this.posterUrl = posterUrl }
+        }
     }
 
     // ==================== LOAD ====================
@@ -458,7 +487,6 @@ class StardimaProvider : MainAPI() {
                 ?: Regex("""(https?://[^\s"'<>]+\.mp4[^\s"'<>]*)""").find(html)?.groupValues?.get(1)
 
             if (videoUrl != null) {
-                // CRITICAL: Call the view tracking URL to register this IP with the CDN.
                 decoded?.let { callViewTracking(it, url) }
 
                 val isM3u8 = videoUrl.contains(".m3u8")
