@@ -145,7 +145,7 @@ class Anime3rb(val context: Context) : MainAPI() {
                         (function() {
                             const html = document.documentElement.innerHTML;
                             if (html.includes('challenge-platform') || html.includes('cf-turnstile') || document.getElementById('cf-wrapper')) return 'CAPTCHA';
-                            if (document.querySelector('.video-card, .main-content')) return 'SUCCESS::' + html;
+                            if (document.querySelector('.video-card, .main-content, .title-card')) return 'SUCCESS::' + html;
                             return 'POLLING';
                         })();
                         """
@@ -184,6 +184,12 @@ class Anime3rb(val context: Context) : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
+        val isAnimeList = request.data.contains("/titles/list")
+
+        if (isAnimeList) {
+            return getAnimeListPage(page, request)
+        }
+
         val doc = getDocumentSmart(request.data) ?: return null
         val homeSets = mutableListOf<HomePageList>()
         try {
@@ -206,7 +212,88 @@ class Anime3rb(val context: Context) : MainAPI() {
         return newHomePageResponse(homeSets)
     }
 
-    override val mainPage = mainPageOf("$mainUrl/" to "الرئيسية")
+    private suspend fun getAnimeListPage(page: Int, request: MainPageRequest): HomePageResponse? {
+        val url = if (page > 1) "${request.data}?page=$page" else request.data
+        val doc = getDocumentSmart(url) ?: return null
+        val homeSets = mutableListOf<HomePageList>()
+        try {
+            // Primary: select only the image+title link from each title-card (not the details link)
+            // to avoid duplicate entries for the same anime
+            val animeItems = doc.select(".title-card > a[href*=/titles/]:first-child")
+                .mapNotNull { toAnimeListSearchResult(it) }
+
+            // Fallback: try alternative selectors if the primary ones don't match
+            val finalItems = if (animeItems.isEmpty()) {
+                doc.select("a[href*=/titles/]").filter { el ->
+                    el.selectFirst("img") != null && el.selectFirst("h2, h3, h4") != null
+                }.mapNotNull { toAnimeListSearchResult(it) }
+                    .distinctBy { it.url } // Deduplicate by URL
+            } else {
+                animeItems.distinctBy { it.url } // Deduplicate by URL
+            }
+
+            if (finalItems.isNotEmpty()) {
+                homeSets.add(HomePageList("قائمة الانمي", finalItems))
+            }
+
+            // Check for next page: look for pagination controls
+            // Livewire uses wire:click on buttons, but also check standard links
+            val hasNextPage = doc.select("button[wire\\:click*=nextPage], a[href*=page=${page + 1}]").isNotEmpty()
+                || doc.select(".pagination a[href*=page=${page + 1}], nav a[href*=page=${page + 1}]").isNotEmpty()
+                || doc.select("button[wire\\:click*=gotoPage]").any {
+                    it.attr("wire:click").contains("($page")
+                }
+                || doc.select("span:matches(\\d+) + button, li + li button").isNotEmpty()
+
+            return newHomePageResponse(homeSets, hasNextPage)
+        } catch (e: Exception) {
+            Log.e(TAG, "AnimeList Error: ${e.message}")
+        }
+        return newHomePageResponse(homeSets)
+    }
+
+    private fun toAnimeListSearchResult(element: Element): SearchResponse? {
+        return try {
+            val href = toAbsoluteUrl(element.attr("href"))
+
+            // Try multiple selectors for the title
+            val rawTitle = element.selectFirst("h2.title-name")?.text()
+                ?: element.selectFirst("h2")?.text()
+                ?: element.selectFirst("h3")?.text()
+                ?: element.selectFirst("h4")?.text()
+                ?: return null
+            val title = cleanTitleText(rawTitle)
+
+            val posterUrl = element.selectFirst("img")?.attr("src") ?: ""
+
+            // Try to extract episode count from badges
+            val epText = element.select(".badge").map { it.text() }.find {
+                it.contains("حلقة") || it.matches(Regex(".*\\d+.*حلقات.*"))
+            }
+            val episodeNum = epText?.filter { it.isDigit() }?.toIntOrNull()
+
+            // Determine type from badges or title
+            val typeText = element.select(".badge").map { it.text() }.joinToString(" ")
+            val tvType = when {
+                typeText.contains("Movie", ignoreCase = true) || typeText.contains("فيلم") -> TvType.AnimeMovie
+                typeText.contains("OVA", ignoreCase = true) -> TvType.OVA
+                else -> TvType.Anime
+            }
+
+            newAnimeSearchResponse(title, href, tvType) {
+                this.posterUrl = posterUrl
+                if (episodeNum != null) addDubStatus(false, episodeNum)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "toAnimeListSearchResult Error: ${e.message}")
+            null
+        }
+    }
+
+    override val mainPage = mainPageOf(
+        "$mainUrl/" to "الرئيسية",
+        "$mainUrl/titles/list" to "قائمة الانمي"
+    )
 
     private fun toSearchResult(element: Element): SearchResponse? {
         return try {
