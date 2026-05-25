@@ -184,12 +184,17 @@ class Anime3rb(val context: Context) : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        val isAnimeList = request.data.contains("/titles/list")
+        val isHomepage = request.data == "$mainUrl/"
 
-        if (isAnimeList) {
-            return getAnimeListPage(page, request)
+        if (isHomepage) {
+            return getHomePage(page, request)
         }
 
+        // All other categories (anime list, genres, filters, etc.) use the list page handler
+        return getAnimeListPage(page, request)
+    }
+
+    private suspend fun getHomePage(page: Int, request: MainPageRequest): HomePageResponse? {
         val doc = getDocumentSmart(request.data) ?: return null
         val homeSets = mutableListOf<HomePageList>()
         try {
@@ -213,7 +218,11 @@ class Anime3rb(val context: Context) : MainAPI() {
     }
 
     private suspend fun getAnimeListPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        val url = if (page > 1) "${request.data}?page=$page" else request.data
+        val baseUrl = request.data
+
+        // Build paginated URL correctly for all filter types
+        val url = buildPaginatedUrl(baseUrl, page)
+
         val doc = getDocumentSmart(url) ?: return null
         val homeSets = mutableListOf<HomePageList>()
         try {
@@ -233,7 +242,7 @@ class Anime3rb(val context: Context) : MainAPI() {
             }
 
             if (finalItems.isNotEmpty()) {
-                homeSets.add(HomePageList("قائمة الانمي", finalItems))
+                homeSets.add(HomePageList(request.name, finalItems))
             }
 
             // Check for next page: look for pagination controls
@@ -250,6 +259,17 @@ class Anime3rb(val context: Context) : MainAPI() {
             Log.e(TAG, "AnimeList Error: ${e.message}")
         }
         return newHomePageResponse(homeSets)
+    }
+
+    private fun buildPaginatedUrl(baseUrl: String, page: Int): String {
+        if (page <= 1) return baseUrl
+
+        // Handle URLs that already have query parameters (e.g. ?year=2024, ?season=spring&year=2025)
+        return if (baseUrl.contains("?")) {
+            "$baseUrl&page=$page"
+        } else {
+            "$baseUrl?page=$page"
+        }
     }
 
     private fun toAnimeListSearchResult(element: Element): SearchResponse? {
@@ -292,7 +312,88 @@ class Anime3rb(val context: Context) : MainAPI() {
 
     override val mainPage = mainPageOf(
         "$mainUrl/" to "الرئيسية",
-        "$mainUrl/titles/list" to "قائمة الانمي"
+
+        // --- تصنيف حسب النوع (By Type) ---
+        "$mainUrl/titles/list" to "قائمة الانمي",
+        "$mainUrl/titles/list/tv" to "مسلسلات",
+        "$mainUrl/titles/list/movie" to "أفلام",
+        "$mainUrl/titles/list/ova" to "أوفا",
+        "$mainUrl/titles/list/ona" to "أونا",
+        "$mainUrl/titles/list/special" to "حلقات خاصة",
+        "$mainUrl/titles/list/tv-special" to "حلقات تلفزيونية خاصة",
+
+        // --- تصنيف حسب التصنيف (By Genre) ---
+        "$mainUrl/genre/action" to "أكشن",
+        "$mainUrl/genre/adventure" to "مغامرة",
+        "$mainUrl/genre/comedy" to "كوميدي",
+        "$mainUrl/genre/drama" to "دراما",
+        "$mainUrl/genre/fantasy" to "خيال",
+        "$mainUrl/genre/horror" to "رعب",
+        "$mainUrl/genre/mystery" to "غموض",
+        "$mainUrl/genre/romance" to "رومانسي",
+        "$mainUrl/genre/sci-fi" to "خيال علمي",
+        "$mainUrl/genre/supernatural" to "خارق للطبيعة",
+        "$mainUrl/genre/thriller" to "إثارة",
+        "$mainUrl/genre/suspense" to "تشويق",
+        "$mainUrl/genre/psychological" to "نفسي",
+        "$mainUrl/genre/seinen" to "سينين",
+        "$mainUrl/genre/shounen" to "شونين",
+        "$mainUrl/genre/shoujo" to "شوجو",
+        "$mainUrl/genre/isekai" to "إيسيكاي",
+        "$mainUrl/genre/slice-of-life" to "شريحة من الحياة",
+        "$mainUrl/genre/mecha" to "ميكا",
+        "$mainUrl/genre/sports" to "رياضي",
+        "$mainUrl/genre/military" to "عسكري",
+        "$mainUrl/genre/historical" to "تاريخي",
+        "$mainUrl/genre/harem" to "حريم",
+        "$mainUrl/genre/ecchi" to "إيتشي",
+        "$mainUrl/genre/music" to "موسيقى",
+        "$mainUrl/genre/martial-arts" to "قتالي",
+        "$mainUrl/genre/super-power" to "قوى خارقة",
+        "$mainUrl/genre/mythology" to "أساطير",
+        "$mainUrl/genre/school" to "مدرسي",
+        "$mainUrl/genre/space" to "فضاء",
+        "$mainUrl/genre/vampire" to "مصاصي دماء",
+        "$mainUrl/genre/samurai" to "ساموراي",
+        "$mainUrl/genre/parody" to "ساخر",
+        "$mainUrl/genre/detective" to "بوليسي",
+        "$mainUrl/genre/gore" to "دموي",
+        "$mainUrl/genre/survival" to "نجاة",
+        "$mainUrl/genre/time-travel" to "سفر عبر الزمن",
+        "$mainUrl/genre/reincarnation" to "تناسخ",
+        "$mainUrl/genre/kids" to "للأطفال",
+
+        // --- تصنيف حسب سنة الإصدار (By Year) ---
+        "$mainUrl/titles/list?year=2025" to "أنميات 2025",
+        "$mainUrl/titles/list?year=2024" to "أنميات 2024",
+        "$mainUrl/titles/list?year=2023" to "أنميات 2023",
+        "$mainUrl/titles/list?year=2022" to "أنميات 2022",
+        "$mainUrl/titles/list?year=2021" to "أنميات 2021",
+        "$mainUrl/titles/list?year=2020" to "أنميات 2020",
+        "$mainUrl/titles/list?year=2019" to "أنميات 2019",
+        "$mainUrl/titles/list?year=2018" to "أنميات 2018",
+        "$mainUrl/titles/list?year=2017" to "أنميات 2017",
+        "$mainUrl/titles/list?year=2016" to "أنميات 2016",
+        "$mainUrl/titles/list?year=2015" to "أنميات 2015",
+
+        // --- تصنيف حسب الموسم (By Season) ---
+        "$mainUrl/titles/list?season=winter&year=2025" to "شتاء 2025",
+        "$mainUrl/titles/list?season=spring&year=2025" to "ربيع 2025",
+        "$mainUrl/titles/list?season=summer&year=2025" to "صيف 2025",
+        "$mainUrl/titles/list?season=fall&year=2025" to "خريف 2025",
+        "$mainUrl/titles/list?season=winter&year=2024" to "شتاء 2024",
+        "$mainUrl/titles/list?season=spring&year=2024" to "ربيع 2024",
+        "$mainUrl/titles/list?season=summer&year=2024" to "صيف 2024",
+        "$mainUrl/titles/list?season=fall&year=2024" to "خريف 2024",
+
+        // --- تصنيف حسب الحالة (By Status) ---
+        "$mainUrl/titles/list?status[]=airing" to "قيد البث",
+        "$mainUrl/titles/list?status[]=ended" to "منتهي",
+
+        // --- الأعلى تقييماً (Top Rated) ---
+        "$mainUrl/titles/list?sort_by=rate&sort_dir=desc" to "الأعلى تقييماً",
+        "$mainUrl/titles/list?sort_by=release_date&sort_dir=desc" to "الأحدث إصداراً",
+        "$mainUrl/titles/list?sort_by=name&sort_dir=asc" to "أبجدي"
     )
 
     private fun toSearchResult(element: Element): SearchResponse? {
