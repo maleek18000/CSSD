@@ -219,46 +219,122 @@ class Anime3rb(val context: Context) : MainAPI() {
 
     private suspend fun getAnimeListPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val baseUrl = request.data
+        val doc: Document?
 
-        // Build paginated URL correctly for all filter types
-        val url = buildPaginatedUrl(baseUrl, page)
+        // For page 1, load the page normally via WebView
+        // For page > 1, try the Livewire API first (more reliable than ?page=N)
+        if (page == 1) {
+            doc = getDocumentSmart(baseUrl)
+        } else {
+            doc = getAnimeListPageViaLivewire(baseUrl, page)
+                // Fallback to URL-based pagination if Livewire fails
+                ?: getDocumentSmart(buildPaginatedUrl(baseUrl, page))
+        }
 
-        val doc = getDocumentSmart(url) ?: return null
+        if (doc == null) return null
+
         val homeSets = mutableListOf<HomePageList>()
         try {
-            // Primary: select only the image+title link from each title-card (not the details link)
-            // to avoid duplicate entries for the same anime
-            val animeItems = doc.select(".title-card > a[href*=/titles/]:first-child")
-                .mapNotNull { toAnimeListSearchResult(it) }
-
-            // Fallback: try alternative selectors if the primary ones don't match
-            val finalItems = if (animeItems.isEmpty()) {
-                doc.select("a[href*=/titles/]").filter { el ->
-                    el.selectFirst("img") != null && el.selectFirst("h2, h3, h4") != null
-                }.mapNotNull { toAnimeListSearchResult(it) }
-                    .distinctBy { it.url } // Deduplicate by URL
-            } else {
-                animeItems.distinctBy { it.url } // Deduplicate by URL
-            }
+            val finalItems = parseAnimeListItems(doc)
 
             if (finalItems.isNotEmpty()) {
                 homeSets.add(HomePageList(request.name, finalItems))
             }
 
-            // Check for next page: look for pagination controls
-            // Livewire uses wire:click on buttons, but also check standard links
-            val hasNextPage = doc.select("button[wire\\:click*=nextPage], a[href*=page=${page + 1}]").isNotEmpty()
-                || doc.select(".pagination a[href*=page=${page + 1}], nav a[href*=page=${page + 1}]").isNotEmpty()
-                || doc.select("button[wire\\:click*=gotoPage]").any {
-                    it.attr("wire:click").contains("($page")
-                }
-                || doc.select("span:matches(\\d+) + button, li + li button").isNotEmpty()
+            // Simple and reliable: if we got items, assume there might be more pages.
+            // If we got 0 items, we've gone past the last page.
+            // The site shows ~20 items per page, so if we got items, hasNextPage = true.
+            val hasNextPage = finalItems.isNotEmpty()
 
             return newHomePageResponse(homeSets, hasNextPage)
         } catch (e: Exception) {
             Log.e(TAG, "AnimeList Error: ${e.message}")
         }
         return newHomePageResponse(homeSets)
+    }
+
+    private fun parseAnimeListItems(doc: Document): List<SearchResponse> {
+        // Primary: select only the image+title link from each title-card (not the details link)
+        val animeItems = doc.select(".title-card > a[href*=/titles/]:first-child")
+            .mapNotNull { toAnimeListSearchResult(it) }
+
+        // Fallback: try alternative selectors if the primary ones don't match
+        return if (animeItems.isEmpty()) {
+            doc.select("a[href*=/titles/]").filter { el ->
+                el.selectFirst("img") != null && el.selectFirst("h2, h3, h4") != null
+            }.mapNotNull { toAnimeListSearchResult(it) }
+                .distinctBy { it.url }
+        } else {
+            animeItems.distinctBy { it.url }
+        }
+    }
+
+    /**
+     * Navigate to a specific page using the Livewire API.
+     * This is more reliable than ?page=N because the site uses Livewire
+     * for client-side pagination and the query param may not be respected.
+     */
+    private suspend fun getAnimeListPageViaLivewire(baseUrl: String, targetPage: Int): Document? {
+        return try {
+            // First, load the base page to get CSRF token and Livewire snapshot
+            val firstPageDoc = getDocumentSmart(baseUrl) ?: return null
+
+            val scriptTag = firstPageDoc.selectFirst("script[src*=livewire.min.js]")
+            val csrfToken = scriptTag?.attr("data-csrf") ?: return null
+
+            // Find the Livewire component for the titles list
+            val listComponent = firstPageDoc.select("[wire\\:id]").firstOrNull {
+                it.attr("wire:snapshot").contains("index-titles") ||
+                it.attr("wire:snapshot").contains("type_slug") ||
+                it.attr("wire:snapshot").contains("paginators")
+            } ?: firstPageDoc.select("[wire\\:id]").firstOrNull() ?: return null
+
+            val snapshotRaw = listComponent.attr("wire:snapshot")
+            val snapshotStr = org.jsoup.parser.Parser.unescapeEntities(snapshotRaw, true)
+            val wireId = listComponent.attr("wire:id")
+
+            val headers = mapOf(
+                "User-Agent" to USER_AGENT,
+                "Accept" to "*/*",
+                "Content-Type" to "application/json",
+                "Origin" to mainUrl,
+                "Referer" to baseUrl,
+                "Cookie" to savedCookies,
+                "X-Livewire" to ""
+            )
+
+            val payload = mapOf(
+                "_token" to csrfToken,
+                "components" to listOf(
+                    mapOf(
+                        "snapshot" to snapshotStr,
+                        "updates" to emptyMap<String, Any>(),
+                        "calls" to listOf(
+                            mapOf(
+                                "method" to "gotoPage",
+                                "params" to listOf(targetPage.toString(), "page"),
+                                "path" to ""
+                            )
+                        )
+                    )
+                )
+            )
+
+            val response = app.post("$mainUrl/livewire/update", headers = headers, json = payload)
+            if (response.code != 200) return null
+
+            val responseJson = AppUtils.parseJson<Map<String, Any>>(response.text)
+            val components = responseJson["components"] as? List<Map<String, Any>> ?: return null
+            val effects = components.firstOrNull()?.get("effects") as? Map<String, Any> ?: return null
+
+            // The response can contain HTML in "html" or dirty components in "dirty"
+            val htmlContent = effects["html"] as? String ?: return null
+
+            Jsoup.parse(htmlContent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Livewire Pagination Error: ${e.message}")
+            null
+        }
     }
 
     private fun buildPaginatedUrl(baseUrl: String, page: Int): String {
