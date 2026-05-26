@@ -651,14 +651,20 @@ class Arabp : MainAPI() {
 
     // ==================== LOAD LINKS ====================
     //
-    // Two data formats handled:
+    // Three data formats handled:
     //
-    // 1. Pre-resolved (ts://...):
+    // 1. Pre-resolved single file (ts://...):
     //    Format: ts://STREAM_URL|FILENAME
     //    The torrent was already uploaded to TorrServe in load().
-    //    We just create the ExtractorLink directly.
+    //    We create one ExtractorLink directly.
     //
-    // 2. Legacy (pipe-delimited):
+    // 2. Pre-resolved folder (tsfolder://...):
+    //    Format: tsfolder://FOLDER_NAME|FILE_COUNT|ts://URL1|FILE1;;ts://URL2|FILE2;;...
+    //    The torrent was already uploaded to TorrServe in load().
+    //    We create one ExtractorLink per video file in this folder (show).
+    //    This is used for multi-show torrents where each show is a separate Episode.
+    //
+    // 3. Legacy (pipe-delimited):
     //    Format: torrentId|detailUrl|downloadUrl|magnetUrl|isFree|isExternal
     //    The full download/upload cycle runs here.
     //    Used as fallback when pre-resolve failed.
@@ -669,7 +675,44 @@ class Arabp : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // === PRE-RESOLVED STREAM: direct link from load() ===
+        // === PRE-RESOLVED FOLDER: show with multiple episodes ===
+        if (data.startsWith("tsfolder://")) {
+            val afterPrefix = data.substringAfter("tsfolder://")
+            // Format: FOLDER_NAME|FILE_COUNT|ts://URL1|FILE1;;ts://URL2|FILE2;;...
+            val firstPipe = afterPrefix.indexOf('|')
+            if (firstPipe < 0) return false
+            val folderName = afterPrefix.substring(0, firstPipe)
+
+            val afterFolder = afterPrefix.substring(firstPipe + 1)
+            val secondPipe = afterFolder.indexOf('|')
+            if (secondPipe < 0) return false
+            val fileCountStr = afterFolder.substring(0, secondPipe)
+            val filesPart = afterFolder.substring(secondPipe + 1)
+
+            // Parse each ts:// entry separated by ;;
+            val fileEntries = filesPart.split(";;")
+            Log.d(TAG, "loadLinks: folder '$folderName' with $fileCountStr files, parsed ${fileEntries.size} entries")
+
+            for (entry in fileEntries) {
+                if (!entry.startsWith("ts://")) continue
+                val afterTs = entry.substringAfter("ts://")
+                val pipeIdx = afterTs.indexOf('|')
+                val streamUrl = if (pipeIdx >= 0) afterTs.substring(0, pipeIdx) else afterTs
+                val fileName = if (pipeIdx >= 0) afterTs.substring(pipeIdx + 1) else "Video"
+
+                callback(
+                    newExtractorLink(
+                        source = this.name,
+                        name = fileName,
+                        url = streamUrl,
+                        type = ExtractorLinkType.VIDEO
+                    )
+                )
+            }
+            return fileEntries.isNotEmpty()
+        }
+
+        // === PRE-RESOLVED STREAM: single direct link from load() ===
         if (data.startsWith("ts://")) {
             val afterPrefix = data.substringAfter("ts://")
             val pipeIndex = afterPrefix.indexOf('|')
