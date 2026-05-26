@@ -7,10 +7,16 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.SubtitleFile
 import okhttp3.FormBody
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.jsoup.nodes.Element
+import java.net.CookieManager
+import java.net.CookiePolicy
+import java.net.HttpCookie
+import java.net.URI
 import java.net.URLEncoder
 import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
 
 class Arabp : MainAPI() {
     override var mainUrl = "https://www.arabp2p.net"
@@ -21,7 +27,6 @@ class Arabp : MainAPI() {
 
     companion object {
         private const val TAG = "Arabp_Log"
-        // Login credentials — change these if needed
         private const val LOGIN_USERNAME = "armano"
         private const val LOGIN_PASSWORD = "ARmano01**"
         private val DIGITS = Regex("\\d+")
@@ -33,9 +38,131 @@ class Arabp : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
-    // In-memory cookie cache
+    // ==================== SESSION / COOKIE MANAGEMENT ====================
+
+    // Use java.net.CookieManager to properly handle PHPSESSID
+    private val cookieManager = CookieManager().apply {
+        setCookiePolicy(CookiePolicy.ACCEPT_ALL)
+    }
+
+    // Dedicated OkHttpClient with cookie jar for authenticated requests
+    private val authClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .cookieJar(object : okhttp3.CookieJar {
+                override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) {
+                    for (cookie in cookies) {
+                        val uri = URI(url.toString())
+                        val httpCookie = HttpCookie(cookie.name, cookie.value)
+                        httpCookie.domain = cookie.domain
+                        httpCookie.path = cookie.path ?: "/"
+                        httpCookie.secure = cookie.secure
+                        if (cookie.expiresAt != Long.MAX_VALUE) {
+                            httpCookie.maxAge = (cookie.expiresAt - System.currentTimeMillis()) / 1000
+                        }
+                        cookieManager.cookieStore.add(uri, httpCookie)
+                    }
+                }
+
+                override fun loadForRequest(url: okhttp3.HttpUrl): List<okhttp3.Cookie> {
+                    val uri = URI(url.toString())
+                    return cookieManager.cookieStore.get(uri).map { hc ->
+                        val builder = okhttp3.Cookie.Builder()
+                            .name(hc.name)
+                            .value(hc.value)
+                            .domain(hc.domain ?: url.host)
+                            .path(hc.path ?: "/")
+                        if (hc.secure) builder.secure()
+                        if (hc.isHttpOnly) builder.httpOnly()
+                        builder.build()
+                    }
+                }
+            })
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .build()
+    }
+
+    private fun getSessionCookies(): String {
+        val uri = URI(mainUrl)
+        return cookieManager.cookieStore.get(uri)
+            .joinToString("; ") { "${it.name}=${it.value}" }
+    }
+
+    private fun getAuthHeaders(referer: String? = null): Map<String, String> {
+        val headers = mutableMapOf(
+            "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+        )
+        val cookies = getSessionCookies()
+        if (cookies.isNotBlank()) {
+            headers["Cookie"] = cookies
+        }
+        if (referer != null) {
+            headers["Referer"] = referer
+        }
+        return headers
+    }
+
+    // ==================== LOGIN ====================
+
     @Volatile
-    private var cachedCookies: String? = null
+    private var isLoggedIn = false
+
+    private suspend fun ensureLogin(): Boolean {
+        if (isLoggedIn) {
+            return true
+        }
+
+        return try {
+            // Step 1: GET the login page first to establish PHPSESSID
+            val initRequest = Request.Builder()
+                .url("$mainUrl/index.php?page=login")
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+                .build()
+            authClient.newCall(initRequest).execute().use { response ->
+                // This sets PHPSESSID in the cookie manager
+                Log.d(TAG, "Init login page: ${response.code}")
+            }
+
+            // Step 2: POST login credentials
+            val formBody = FormBody.Builder()
+                .add("uid", LOGIN_USERNAME)
+                .add("pwd", LOGIN_PASSWORD)
+                .build()
+
+            val loginRequest = Request.Builder()
+                .url("$mainUrl/index.php?page=login&returnto=index.php")
+                .post(formBody)
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+                .header("Referer", "$mainUrl/index.php?page=login")
+                .build()
+
+            authClient.newCall(loginRequest).execute().use { response ->
+                val body = response.body?.string() ?: ""
+                Log.d(TAG, "Login response code: ${response.code}, body length: ${body.length}")
+
+                // Check for login success: look for logout link
+                val loginSuccess = body.contains("logout.php") ||
+                        body.contains("page=logout") ||
+                        !body.contains("name=\"uid\"") ||
+                        body.contains("مرحبا") || // "Welcome" in Arabic
+                        body.contains(LOGIN_USERNAME)
+
+                if (loginSuccess) {
+                    isLoggedIn = true
+                    Log.d(TAG, "Login SUCCESS! Cookies: ${getSessionCookies()}")
+                } else {
+                    Log.e(TAG, "Login FAILED. Response snippet: ${body.take(500)}")
+                }
+
+                loginSuccess
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Login Error: ${e.message}")
+            false
+        }
+    }
 
     private fun toAbsoluteUrl(url: String): String {
         return when {
@@ -43,92 +170,6 @@ class Arabp : MainAPI() {
             url.startsWith("//") -> "https:$url"
             url.startsWith("/") -> "$mainUrl$url"
             else -> "$mainUrl/$url"
-        }
-    }
-
-    // ==================== LOGIN ====================
-
-    private suspend fun ensureLogin(): String? {
-        // Try cached cookies first
-        val cached = cachedCookies
-        if (!cached.isNullOrBlank()) {
-            try {
-                val testResp = app.get(
-                    "$mainUrl/index.php?page=torrents",
-                    headers = mapOf("Cookie" to cached)
-                )
-                if (testResp.code == 200 && !testResp.text.contains("name=\"uid\"")) {
-                    return cached
-                }
-            } catch (_: Exception) {
-            }
-            // Cookies expired
-            cachedCookies = null
-        }
-
-        return try {
-            // Perform login via POST
-            val loginResp = app.post(
-                "$mainUrl/index.php?page=login",
-                data = mapOf("uid" to LOGIN_USERNAME, "pwd" to LOGIN_PASSWORD),
-                allowRedirects = true
-            )
-
-            // Extract cookies from response headers
-            val cookies = StringBuilder()
-            loginResp.headers.forEach { (key, value) ->
-                if (key.equals("set-cookie", ignoreCase = true)) {
-                    if (cookies.isNotEmpty()) cookies.append("; ")
-                    cookies.append(value.substringBefore(";"))
-                }
-            }
-
-            if (cookies.isNotBlank()) {
-                cachedCookies = cookies.toString()
-                return cachedCookies
-            }
-
-            // Fallback: use OkHttp directly for better cookie handling
-            loginWithOkHttp()
-        } catch (e: Exception) {
-            Log.e(TAG, "Login Error: ${e.message}")
-            null
-        }
-    }
-
-    /**
-     * Fallback login using OkHttp directly for proper cookie capture
-     */
-    private fun loginWithOkHttp(): String? {
-        return try {
-            val client = app.baseClient
-            val formBody = FormBody.Builder()
-                .add("uid", LOGIN_USERNAME)
-                .add("pwd", LOGIN_PASSWORD)
-                .build()
-
-            val request = Request.Builder()
-                .url("$mainUrl/index.php?page=login")
-                .post(formBody)
-                .header(
-                    "User-Agent",
-                    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-                )
-                .build()
-
-            val response = client.newCall(request).execute()
-            val cookieHeaders = response.headers("Set-Cookie")
-
-            if (cookieHeaders.isNotEmpty()) {
-                val cookies = cookieHeaders.joinToString("; ") { it.substringBefore(";") }
-                cachedCookies = cookies
-                cookies
-            } else {
-                null
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "OkHttp Login Error: ${e.message}")
-            null
         }
     }
 
@@ -227,31 +268,27 @@ class Arabp : MainAPI() {
                 ?: doc.selectFirst("img.listing_poster")?.attr("src")
                 ?: ""
 
-            // Extract description from the anime listing page
             val desc = ""
 
             // Extract torrent entries from the listing table
             val rows = doc.select("table#listing_table tr")
             val episodes = rows.mapNotNull { row ->
+                // Look for torrent detail link
                 val nameLink = row.selectFirst("a[href*=torrent-details]")
                     ?: return@mapNotNull null
 
                 val epName = cleanTitleText(nameLink.text())
-                val epHref = toAbsoluteUrl(nameLink.attr("href"))
+                val detailHref = nameLink.attr("href")
 
-                // Extract download ID from the download link
+                // Extract the torrent ID from the detail link
+                val torrentId = DIGITS.find(detailHref.substringAfter("id="))?.value ?: return@mapNotNull null
+
+                // Extract the FULL download URL including the &f= parameter
                 val downloadLink = row.selectFirst("a[href*=download.php]")
-                val downloadId = downloadLink?.attr("href")
-                    ?.let { DIGITS.find(it)?.value }
-                    ?: nameLink.attr("href")
-                        .let { DIGITS.find(it.substringAfter("id="))?.value }
+                val downloadHref = downloadLink?.attr("href") ?: ""
 
-                // Build episode data as: torrent_id|detail_url
-                val epData = if (downloadId != null) {
-                    "$downloadId|$epHref"
-                } else {
-                    "0|$epHref"
-                }
+                // Build episode data: torrent_id|detail_url|download_url
+                val epData = "$torrentId|${toAbsoluteUrl(detailHref)}|${toAbsoluteUrl(downloadHref)}"
 
                 // Extract additional info from the row
                 val tds = row.select("td")
@@ -271,7 +308,7 @@ class Arabp : MainAPI() {
             }
 
             if (episodes.isEmpty()) {
-                newMovieLoadResponse(title, fullUrl, TvType.Anime, "0|$fullUrl") {
+                newMovieLoadResponse(title, fullUrl, TvType.Anime, "0|$fullUrl|") {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
                     this.posterHeaders = imageHeaders
                     this.plot = desc
@@ -297,111 +334,192 @@ class Arabp : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Data format: "torrentId|detailUrl"
-        val parts = data.split("|", limit = 2)
+        // Data format: "torrentId|detailUrl|downloadUrl"
+        val parts = data.split("|", limit = 3)
         val torrentId = parts.getOrNull(0) ?: "0"
-        val detailUrl = parts.getOrNull(1) ?: data
+        val detailUrl = parts.getOrNull(1) ?: ""
+        val downloadUrl = parts.getOrNull(2) ?: ""
+
+        Log.d(TAG, "loadLinks called: id=$torrentId, detail=$detailUrl, download=$downloadUrl")
 
         return try {
-            // Login to get cookies
-            val cookies = ensureLogin()
-            if (cookies.isNullOrBlank()) {
-                Log.w(TAG, "Cannot load links: not logged in. Check credentials in source code.")
+            // Login first
+            if (!ensureLogin()) {
+                Log.e(TAG, "Cannot load links: login failed")
                 return false
             }
 
-            val headers = mapOf(
-                "Cookie" to cookies,
-                "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-                "Referer" to toAbsoluteUrl(detailUrl)
-            )
+            val headers = getAuthHeaders(referer = detailUrl)
+            var foundLink = false
 
-            // Step 1: Try to download the .torrent file and extract magnet
-            if (torrentId != "0") {
-                val torrentUrl = "$mainUrl/download.php?id=$torrentId"
+            // Strategy 1: Try downloading .torrent file directly and extract magnet
+            if (downloadUrl.isNotBlank()) {
                 try {
-                    val torrentResp = app.get(torrentUrl, headers = headers, allowRedirects = true)
-                    val torrentBytes = torrentResp.body?.bytes()
-
-                    if (torrentBytes != null && torrentBytes.size > 10 && torrentBytes[0] == 'd'.code.toByte()) {
-                        // Valid bittorrent file (starts with 'd' for dictionary)
-                        val magnet = extractMagnetFromTorrent(torrentBytes)
-                        if (magnet != null) {
-                            callback(
-                                newExtractorLink(
-                                    source = this.name,
-                                    name = "${this.name} Magnet",
-                                    url = magnet,
-                                    type = ExtractorLinkType.MAGNET
-                                )
-                            )
-                            return true
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to download .torrent: ${e.message}")
-                }
-            }
-
-            // Step 2: Fallback - check torrent detail page for magnet/download links
-            try {
-                val doc = app.get(toAbsoluteUrl(detailUrl), headers = headers).document
-
-                // Check for magnet links
-                val magnetLinks = doc.select("a[href^=magnet:]")
-                if (magnetLinks.isNotEmpty()) {
-                    magnetLinks.forEach { magnetEl ->
-                        val magnetUrl = magnetEl.attr("href")
+                    val magnet = downloadTorrentAndExtractMagnet(downloadUrl)
+                    if (magnet != null) {
                         callback(
                             newExtractorLink(
                                 source = this.name,
                                 name = "${this.name} Magnet",
-                                url = magnetUrl,
+                                url = magnet,
                                 type = ExtractorLinkType.MAGNET
                             )
                         )
+                        foundLink = true
                     }
-                    return true
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to download .torrent from downloadUrl: ${e.message}")
                 }
+            }
 
-                // Check for download link on the detail page
-                val dlLink = doc.selectFirst("a[href*=download.php]")
-                if (dlLink != null) {
-                    val dlUrl = toAbsoluteUrl(dlLink.attr("href"))
-                    val torrentResp = app.get(dlUrl, headers = headers, allowRedirects = true)
-                    val torrentBytes = torrentResp.body?.bytes()
+            // Strategy 2: Try constructing download URL if we have the torrent ID
+            if (!foundLink && torrentId != "0") {
+                try {
+                    val constructedUrl = "$mainUrl/download.php?id=$torrentId"
+                    val magnet = downloadTorrentAndExtractMagnet(constructedUrl)
+                    if (magnet != null) {
+                        callback(
+                            newExtractorLink(
+                                source = this.name,
+                                name = "${this.name} Magnet",
+                                url = magnet,
+                                type = ExtractorLinkType.MAGNET
+                            )
+                        )
+                        foundLink = true
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to download .torrent by ID: ${e.message}")
+                }
+            }
 
-                    if (torrentBytes != null && torrentBytes.size > 10 && torrentBytes[0] == 'd'.code.toByte()) {
-                        val magnet = extractMagnetFromTorrent(torrentBytes)
-                        if (magnet != null) {
+            // Strategy 3: Fetch the torrent detail page and look for magnet/download links
+            if (!foundLink && detailUrl.isNotBlank()) {
+                try {
+                    val request = Request.Builder()
+                        .url(toAbsoluteUrl(detailUrl))
+                        .headers(headers.toOkHttpHeaders())
+                        .build()
+
+                    authClient.newCall(request).execute().use { response ->
+                        val body = response.body?.string() ?: ""
+                        val detailDoc = org.jsoup.Jsoup.parse(body, toAbsoluteUrl(detailUrl))
+
+                        // Check for magnet links on the page
+                        val magnetLinks = detailDoc.select("a[href^=magnet:]")
+                        for (magnetEl in magnetLinks) {
+                            val magnetUrl = magnetEl.attr("href")
                             callback(
                                 newExtractorLink(
                                     source = this.name,
                                     name = "${this.name} Magnet",
-                                    url = magnet,
+                                    url = magnetUrl,
                                     type = ExtractorLinkType.MAGNET
                                 )
                             )
-                            return true
+                            foundLink = true
+                        }
+
+                        // Check for download link on detail page
+                        if (!foundLink) {
+                            val dlLink = detailDoc.selectFirst("a[href*=download.php]")
+                            if (dlLink != null) {
+                                val dlHref = toAbsoluteUrl(dlLink.attr("href"))
+                                val magnet = downloadTorrentAndExtractMagnet(dlHref)
+                                if (magnet != null) {
+                                    callback(
+                                        newExtractorLink(
+                                            source = this.name,
+                                            name = "${this.name} Magnet",
+                                            url = magnet,
+                                            type = ExtractorLinkType.MAGNET
+                                        )
+                                    )
+                                    foundLink = true
+                                }
+                            }
+                        }
+
+                        // Also check the title link (it's often a download link on detail pages)
+                        if (!foundLink) {
+                            val titleLink = detailDoc.selectFirst("td#Title h1 a[href*=download.php]")
+                            if (titleLink != null) {
+                                val dlHref = toAbsoluteUrl(titleLink.attr("href"))
+                                val magnet = downloadTorrentAndExtractMagnet(dlHref)
+                                if (magnet != null) {
+                                    callback(
+                                        newExtractorLink(
+                                            source = this.name,
+                                            name = "${this.name} Magnet",
+                                            url = magnet,
+                                            type = ExtractorLinkType.MAGNET
+                                        )
+                                    )
+                                    foundLink = true
+                                }
+                            }
                         }
                     }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to fetch torrent detail page: ${e.message}")
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to fetch torrent detail page: ${e.message}")
             }
 
-            false
+            if (!foundLink) {
+                Log.w(TAG, "No links found for torrent id=$torrentId")
+            }
+
+            foundLink
         } catch (e: Exception) {
             Log.e(TAG, "loadLinks Error: ${e.message}")
             false
         }
     }
 
+    /**
+     * Download a .torrent file using the authenticated client and extract a magnet URI
+     */
+    private fun downloadTorrentAndExtractMagnet(url: String): String? {
+        return try {
+            val request = Request.Builder()
+                .url(toAbsoluteUrl(url))
+                .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
+                .build()
+
+            authClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    Log.w(TAG, "Download .torrent failed: HTTP ${response.code}")
+                    return null
+                }
+
+                val torrentBytes = response.body?.bytes() ?: return null
+                Log.d(TAG, "Downloaded .torrent: ${torrentBytes.size} bytes, first byte: ${if (torrentBytes.isNotEmpty()) torrentBytes[0] else 'N'}")
+
+                // Valid bittorrent file starts with 'd' (dictionary)
+                if (torrentBytes.size > 10 && torrentBytes[0] == 'd'.code.toByte()) {
+                    extractMagnetFromTorrent(torrentBytes)
+                } else {
+                    Log.w(TAG, "Not a valid .torrent file. First 20 bytes: ${torrentBytes.take(20).map { it.toInt().toChar() }.joinToString("")}")
+                    null
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "downloadTorrentAndExtractMagnet Error: ${e.message}")
+            null
+        }
+    }
+
+    // Helper to convert Map<String, String> to OkHttp Headers
+    private fun Map<String, String>.toOkHttpHeaders(): okhttp3.Headers {
+        val builder = okhttp3.Headers.Builder()
+        this.forEach { (key, value) -> builder.add(key, value) }
+        return builder.build()
+    }
+
     // ==================== TORRENT → MAGNET EXTRACTION ====================
 
     /**
      * Parse a .torrent file and extract the magnet URI from its info dictionary.
-     * The magnet link is constructed using: info_hash + name + trackers
      */
     private fun extractMagnetFromTorrent(data: ByteArray): String? {
         return try {
@@ -454,7 +572,9 @@ class Arabp : MainAPI() {
                 }
             }
 
-            magnet.toString()
+            val magnetStr = magnet.toString()
+            Log.d(TAG, "Extracted magnet: $magnetStr")
+            magnetStr
         } catch (e: Exception) {
             Log.e(TAG, "extractMagnetFromTorrent Error: ${e.message}")
             null
