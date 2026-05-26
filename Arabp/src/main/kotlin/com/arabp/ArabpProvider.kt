@@ -254,20 +254,117 @@ class Arabp : MainAPI() {
     }
 
     // ==================== SEARCH ====================
+    //
+    // Searches TWO sources:
+    // 1. Anime listing (PUBLIC - no login needed) - shows anime entries
+    // 2. Torrents page (PRIVATE - requires login) - shows individual torrents
+    //
+    // If login works, you'll see results from BOTH sources.
+    // If login fails, you'll only see anime listing results.
 
     override suspend fun search(query: String): List<SearchResponse> {
         val encoded = URLEncoder.encode(query, "UTF-8")
-        val url = "$mainUrl/index.php?page=anime-listing&search=$encoded"
-        val doc = app.get(url).document
+        val results = mutableListOf<SearchResponse>()
 
-        return doc.select("div.listing_div1").mapNotNull { element ->
-            toSearchResult(element)
+        // Source 1: PUBLIC anime listing (no login needed)
+        try {
+            val animeUrl = "$mainUrl/index.php?page=anime-listing&search=$encoded"
+            val animeDoc = app.get(animeUrl).document
+            val animeResults = animeDoc.select("div.listing_div1").mapNotNull { toSearchResult(it) }
+            Log.d(TAG, "Anime listing search: found ${animeResults.size} results")
+            results.addAll(animeResults)
+        } catch (e: Exception) {
+            Log.e(TAG, "Anime listing search error: ${e.message}")
+        }
+
+        // Source 2: PRIVATE torrents page (requires login)
+        if (ensureLogin()) {
+            try {
+                val torrentsUrl = "$mainUrl/index.php?page=torrents&search=$encoded&category=0&active=0"
+                val request = Request.Builder()
+                    .url(torrentsUrl)
+                    .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
+                    .build()
+
+                authClient.newCall(request).execute().use { response ->
+                    val body = response.body?.string() ?: ""
+                    val torrentsDoc = Jsoup.parse(body, torrentsUrl)
+
+                    val torrentResults = torrentsDoc.select("table.lista2t tr.lista2, table tr:has(a[href*=torrent-details])").mapNotNull { row ->
+                        torrentRowToSearchResult(row)
+                    }
+                    Log.d(TAG, "Torrents search (LOGGED IN): found ${torrentResults.size} results")
+                    results.addAll(torrentResults)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Torrents search error: ${e.message}")
+            }
+        } else {
+            Log.w(TAG, "Torrents search SKIPPED: login failed")
+        }
+
+        Log.d(TAG, "Total search results: ${results.size}")
+        return results
+    }
+
+    /**
+     * Convert a torrent row from the torrents listing page to a SearchResponse.
+     * Format is different from the anime listing page.
+     */
+    private fun torrentRowToSearchResult(row: Element): SearchResponse? {
+        return try {
+            val nameLink = row.selectFirst("a[href*=torrent-details]") ?: return null
+            val name = cleanTitleText(nameLink.text())
+            val detailHref = toAbsoluteUrl(nameLink.attr("href"))
+
+            // Extract torrent ID from detail link
+            val torrentId = DIGITS.find(detailHref.substringAfter("id="))?.value ?: return null
+
+            // Find download URL with &f= parameter
+            val downloadLink = row.selectFirst("a[href*=download.php]")
+            val downloadHref = downloadLink?.attr("href") ?: ""
+
+            // Extract size and seeders
+            val tds = row.select("td")
+            val size = tds.getOrNull(3)?.text()?.trim() ?: ""
+            val seeders = tds.getOrNull(4)?.text()?.trim() ?: ""
+
+            // Check category for TvType
+            val categoryLink = row.selectFirst("a[href*=category=]")
+            val categoryName = categoryLink?.text()?.trim() ?: ""
+            val tvType = when {
+                categoryName.contains("فيلم", ignoreCase = true) ||
+                        categoryName.contains("Movie", ignoreCase = true) ||
+                        name.contains("فيلم", ignoreCase = true) -> TvType.AnimeMovie
+                else -> TvType.Anime
+            }
+
+            val displayName = buildString {
+                append(name)
+                if (size.isNotEmpty()) append(" | $size")
+                if (seeders.isNotEmpty()) append(" | ▲$seeders")
+            }
+
+            // Store data as: torrent_id|detail_url|download_url
+            val epData = "$torrentId|$detailHref|${toAbsoluteUrl(downloadHref)}"
+
+            newAnimeSearchResponse(displayName, epData, tvType) {
+                this.posterUrl = ""
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "torrentRowToSearchResult Error: ${e.message}")
+            null
         }
     }
 
     // ==================== LOAD (Detail Page) ====================
 
     override suspend fun load(url: String): LoadResponse? {
+        // Check if URL is encoded torrent data from search (format: torrentId|detailUrl|downloadUrl)
+        if (url.contains("|")) {
+            return loadFromTorrentData(url)
+        }
+
         val fullUrl = toAbsoluteUrl(url)
         val doc = app.get(fullUrl).document
 
@@ -335,6 +432,47 @@ class Arabp : MainAPI() {
         } catch (e: Exception) {
             Log.e(TAG, "Load Error: ${e.message}")
             null
+        }
+    }
+
+    /**
+     * Handle load() when the URL is encoded torrent data from search results.
+     * Format: "torrentId|detailUrl|downloadUrl"
+     * Creates a single movie/episode that will call loadLinks() with this data.
+     */
+    private suspend fun loadFromTorrentData(data: String): LoadResponse? {
+        val parts = data.split("|", limit = 3)
+        val torrentId = parts.getOrNull(0) ?: "0"
+        val detailUrl = parts.getOrNull(1) ?: ""
+        val downloadUrl = parts.getOrNull(2) ?: ""
+
+        // Try to get more info from the detail page
+        var title = "Torrent #$torrentId"
+        var posterUrl = ""
+
+        try {
+            if (ensureLogin() && detailUrl.isNotBlank()) {
+                val request = Request.Builder()
+                    .url(toAbsoluteUrl(detailUrl))
+                    .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
+                    .build()
+
+                authClient.newCall(request).execute().use { response ->
+                    val body = response.body?.string() ?: ""
+                    val detailDoc = Jsoup.parse(body, toAbsoluteUrl(detailUrl))
+
+                    // Get title from detail page
+                    title = detailDoc.selectFirst("td#Title h1")?.text()?.trim() ?: title
+                    posterUrl = detailDoc.selectFirst("img.listing_poster")?.attr("src") ?: ""
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "loadFromTorrentData detail fetch error: ${e.message}")
+        }
+
+        return newMovieLoadResponse(title, data, TvType.Anime, data) {
+            this.posterUrl = toAbsoluteUrl(posterUrl)
+            this.posterHeaders = imageHeaders
         }
     }
 
