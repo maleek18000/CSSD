@@ -797,5 +797,25 @@
     "description": "لا يعمل خارج العراق او اي شبكة غير ايرثلنك",
     "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/cinemana.cs3",
     "name": "Shabakaty Cinemana (🇮🇶)"
+  },
+  {
+    "iconUrl": "https://www.arabp2p.net/favicon.ico",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/maleek18000/CSSD",
+    "fileSize": 15623,
+    "status": 1,
+    "language": "ar",
+    "authors": [
+      "Abodabodd"
+    ],
+    "tvTypes": [
+      "TvSeries",
+      "Movie",
+      "Anime"
+    ],
+    "version": 2,
+    "internalName": "Arabp",
+    "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/Arabp.cs3",
+    "name": "Arabp"
   }
 ]
