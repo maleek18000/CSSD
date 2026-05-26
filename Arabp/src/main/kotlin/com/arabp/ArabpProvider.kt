@@ -24,6 +24,11 @@ class Arabp : MainAPI() {
         private val NON_DIGITS = Regex("[^0-9]")
     }
 
+    // Images require Referer header to avoid 403
+    private val posterHeaders = mapOf(
+        "Referer" to "https://www.arabp2p.net/"
+    )
+
     private fun toAbsoluteUrl(url: String): String {
         return when {
             url.startsWith("http") -> url
@@ -91,6 +96,7 @@ class Arabp : MainAPI() {
 
             newAnimeSearchResponse(title, href, tvType) {
                 this.posterUrl = toAbsoluteUrl(posterUrl)
+                this.posterHeaders = posterHeaders
             }
         } catch (e: Exception) {
             Log.e(TAG, "toSearchResult Error: ${e.message}")
@@ -166,11 +172,13 @@ class Arabp : MainAPI() {
                 // If no episodes found, return as a movie
                 newMovieLoadResponse(title, fullUrl, TvType.Anime, fullUrl) {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
+                    this.posterHeaders = posterHeaders
                     this.plot = desc
                 }
             } else {
                 newTvSeriesLoadResponse(title, fullUrl, TvType.Anime, episodes) {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
+                    this.posterHeaders = posterHeaders
                     this.plot = desc
                 }
             }
