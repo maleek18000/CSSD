@@ -1,6 +1,7 @@
 package com.arabp
 
 import android.util.Log
+import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -15,7 +16,6 @@ import java.net.CookiePolicy
 import java.net.HttpCookie
 import java.net.URI
 import java.net.URLEncoder
-import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
 class Arabp : MainAPI() {
@@ -40,12 +40,10 @@ class Arabp : MainAPI() {
 
     // ==================== SESSION / COOKIE MANAGEMENT ====================
 
-    // Use java.net.CookieManager to properly handle PHPSESSID
     private val cookieManager = CookieManager().apply {
         setCookiePolicy(CookiePolicy.ACCEPT_ALL)
     }
 
-    // Dedicated OkHttpClient with cookie jar for authenticated requests
     private val authClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .cookieJar(object : okhttp3.CookieJar {
@@ -121,7 +119,6 @@ class Arabp : MainAPI() {
                 .header("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
                 .build()
             authClient.newCall(initRequest).execute().use { response ->
-                // This sets PHPSESSID in the cookie manager
                 Log.d(TAG, "Init login page: ${response.code}")
             }
 
@@ -142,11 +139,11 @@ class Arabp : MainAPI() {
                 val body = response.body?.string() ?: ""
                 Log.d(TAG, "Login response code: ${response.code}, body length: ${body.length}")
 
-                // Check for login success: look for logout link
+                // Check for login success: look for logout link or absence of login form
                 val loginSuccess = body.contains("logout.php") ||
                         body.contains("page=logout") ||
                         !body.contains("name=\"uid\"") ||
-                        body.contains("مرحبا") || // "Welcome" in Arabic
+                        body.contains("مرحبا") ||
                         body.contains(LOGIN_USERNAME)
 
                 if (loginSuccess) {
@@ -326,7 +323,22 @@ class Arabp : MainAPI() {
         }
     }
 
-    // ==================== LOAD LINKS (Torrent/Magnet Extraction) ====================
+    // ==================== LOAD LINKS ====================
+    //
+    // KEY INSIGHT: arabp2p.net is a PRIVATE tracker. 98% of torrents are internal.
+    // - Converting .torrent → magnet FAILS because private trackers disable DHT/PEX
+    // - Public trackers don't know about private tracker torrents
+    // - The .torrent file from arabp2p.net contains a private announce URL with a passkey
+    //   that authenticates with the tracker and returns a peer list
+    //
+    // SOLUTION: Download the .torrent file ourselves (with auth cookies), then pass
+    // the .torrent data directly to CloudStream using a data: URI with TORRENT type.
+    // CloudStream's libtorrent engine will:
+    //   1. Parse the .torrent file
+    //   2. Connect to the private tracker's announce URL (with embedded passkey)
+    //   3. Get the peer list from the tracker
+    //   4. Stream from those peers
+    //
 
     override suspend fun loadLinks(
         data: String,
@@ -349,63 +361,33 @@ class Arabp : MainAPI() {
                 return false
             }
 
-            val headers = getAuthHeaders(referer = detailUrl)
             var foundLink = false
 
-            // Strategy 1: Try downloading .torrent file directly and extract magnet
+            // ===== PRIMARY: Download .torrent and pass as data: URI =====
+            // Try the captured download URL first
             if (downloadUrl.isNotBlank()) {
-                try {
-                    val magnet = downloadTorrentAndExtractMagnet(downloadUrl)
-                    if (magnet != null) {
-                        callback(
-                            newExtractorLink(
-                                source = this.name,
-                                name = "${this.name} Magnet",
-                                url = magnet,
-                                type = ExtractorLinkType.MAGNET
-                            )
-                        )
-                        foundLink = true
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to download .torrent from downloadUrl: ${e.message}")
-                }
+                foundLink = passTorrentFile(downloadUrl, callback)
             }
 
-            // Strategy 2: Try constructing download URL if we have the torrent ID
+            // Try constructing download URL from torrent ID
             if (!foundLink && torrentId != "0") {
-                try {
-                    val constructedUrl = "$mainUrl/download.php?id=$torrentId"
-                    val magnet = downloadTorrentAndExtractMagnet(constructedUrl)
-                    if (magnet != null) {
-                        callback(
-                            newExtractorLink(
-                                source = this.name,
-                                name = "${this.name} Magnet",
-                                url = magnet,
-                                type = ExtractorLinkType.MAGNET
-                            )
-                        )
-                        foundLink = true
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to download .torrent by ID: ${e.message}")
-                }
+                val constructedUrl = "$mainUrl/download.php?id=$torrentId"
+                foundLink = passTorrentFile(constructedUrl, callback)
             }
 
-            // Strategy 3: Fetch the torrent detail page and look for magnet/download links
+            // ===== FALLBACK: Check detail page for magnet/download links =====
             if (!foundLink && detailUrl.isNotBlank()) {
                 try {
                     val request = Request.Builder()
                         .url(toAbsoluteUrl(detailUrl))
-                        .headers(headers.toOkHttpHeaders())
+                        .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
                         .build()
 
                     authClient.newCall(request).execute().use { response ->
                         val body = response.body?.string() ?: ""
                         val detailDoc = org.jsoup.Jsoup.parse(body, toAbsoluteUrl(detailUrl))
 
-                        // Check for magnet links on the page
+                        // Check for magnet links (external torrents)
                         val magnetLinks = detailDoc.select("a[href^=magnet:]")
                         for (magnetEl in magnetLinks) {
                             val magnetUrl = magnetEl.attr("href")
@@ -420,43 +402,13 @@ class Arabp : MainAPI() {
                             foundLink = true
                         }
 
-                        // Check for download link on detail page
+                        // Check for download link on the detail page
                         if (!foundLink) {
                             val dlLink = detailDoc.selectFirst("a[href*=download.php]")
+                                ?: detailDoc.selectFirst("td#Title h1 a[href*=download.php]")
                             if (dlLink != null) {
                                 val dlHref = toAbsoluteUrl(dlLink.attr("href"))
-                                val magnet = downloadTorrentAndExtractMagnet(dlHref)
-                                if (magnet != null) {
-                                    callback(
-                                        newExtractorLink(
-                                            source = this.name,
-                                            name = "${this.name} Magnet",
-                                            url = magnet,
-                                            type = ExtractorLinkType.MAGNET
-                                        )
-                                    )
-                                    foundLink = true
-                                }
-                            }
-                        }
-
-                        // Also check the title link (it's often a download link on detail pages)
-                        if (!foundLink) {
-                            val titleLink = detailDoc.selectFirst("td#Title h1 a[href*=download.php]")
-                            if (titleLink != null) {
-                                val dlHref = toAbsoluteUrl(titleLink.attr("href"))
-                                val magnet = downloadTorrentAndExtractMagnet(dlHref)
-                                if (magnet != null) {
-                                    callback(
-                                        newExtractorLink(
-                                            source = this.name,
-                                            name = "${this.name} Magnet",
-                                            url = magnet,
-                                            type = ExtractorLinkType.MAGNET
-                                        )
-                                    )
-                                    foundLink = true
-                                }
+                                foundLink = passTorrentFile(dlHref, callback)
                             }
                         }
                     }
@@ -477,9 +429,14 @@ class Arabp : MainAPI() {
     }
 
     /**
-     * Download a .torrent file using the authenticated client and extract a magnet URI
+     * Download a .torrent file using the authenticated OkHttp client,
+     * then pass it to CloudStream as a data: URI with TORRENT type.
+     *
+     * This preserves the private tracker announce URL (with passkey) inside
+     * the .torrent file, so CloudStream's libtorrent can connect to the
+     * private tracker and get the peer list.
      */
-    private fun downloadTorrentAndExtractMagnet(url: String): String? {
+    private suspend fun passTorrentFile(url: String, callback: (ExtractorLink) -> Unit): Boolean {
         return try {
             val request = Request.Builder()
                 .url(toAbsoluteUrl(url))
@@ -488,24 +445,41 @@ class Arabp : MainAPI() {
 
             authClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    Log.w(TAG, "Download .torrent failed: HTTP ${response.code}")
-                    return null
+                    Log.w(TAG, "Download .torrent failed: HTTP ${response.code} for $url")
+                    return false
                 }
 
-                val torrentBytes = response.body?.bytes() ?: return null
-                Log.d(TAG, "Downloaded .torrent: ${torrentBytes.size} bytes, first byte: ${if (torrentBytes.isNotEmpty()) torrentBytes[0] else 'N'}")
-
-                // Valid bittorrent file starts with 'd' (dictionary)
-                if (torrentBytes.size > 10 && torrentBytes[0] == 'd'.code.toByte()) {
-                    extractMagnetFromTorrent(torrentBytes)
-                } else {
-                    Log.w(TAG, "Not a valid .torrent file. First 20 bytes: ${torrentBytes.take(20).map { it.toInt().toChar() }.joinToString("")}")
-                    null
+                val torrentBytes = response.body?.bytes()
+                if (torrentBytes == null || torrentBytes.size < 10) {
+                    Log.w(TAG, "Empty or too small .torrent response")
+                    return false
                 }
+
+                // Verify it's a valid bittorrent file (starts with 'd' for dictionary)
+                if (torrentBytes[0] != 'd'.code.toByte()) {
+                    Log.w(TAG, "Not a valid .torrent file (first byte: ${torrentBytes[0]})")
+                    return false
+                }
+
+                // Encode the .torrent file as base64 data URI
+                val base64 = Base64.encodeToString(torrentBytes, Base64.NO_WRAP)
+                val dataUri = "data:application/x-bittorrent;base64,$base64"
+
+                Log.d(TAG, "Passing .torrent file (${torrentBytes.size} bytes) as data URI to CloudStream")
+
+                callback(
+                    newExtractorLink(
+                        source = this.name,
+                        name = "${this.name} Torrent",
+                        url = dataUri,
+                        type = ExtractorLinkType.TORRENT
+                    )
+                )
+                true
             }
         } catch (e: Exception) {
-            Log.e(TAG, "downloadTorrentAndExtractMagnet Error: ${e.message}")
-            null
+            Log.e(TAG, "passTorrentFile Error: ${e.message}")
+            false
         }
     }
 
@@ -514,160 +488,6 @@ class Arabp : MainAPI() {
         val builder = okhttp3.Headers.Builder()
         this.forEach { (key, value) -> builder.add(key, value) }
         return builder.build()
-    }
-
-    // ==================== TORRENT → MAGNET EXTRACTION ====================
-
-    /**
-     * Parse a .torrent file and extract the magnet URI from its info dictionary.
-     */
-    private fun extractMagnetFromTorrent(data: ByteArray): String? {
-        return try {
-            val decoded = decodeBencode(data, 0).first as? Map<*, *> ?: return null
-            val info = decoded["info"] as? Map<*, *> ?: return null
-
-            // Re-encode info dictionary to compute SHA1 hash
-            val infoEncoded = encodeBencode(info)
-            val infoHash = sha1Hex(infoEncoded)
-
-            // Get torrent name
-            val name = when (val nameObj = info["name"]) {
-                is ByteArray -> String(nameObj)
-                is String -> nameObj
-                else -> ""
-            }
-
-            // Build magnet link
-            val magnet = StringBuilder("magnet:?xt=urn:btih:$infoHash&dn=")
-                .append(URLEncoder.encode(name, "UTF-8"))
-
-            // Add trackers from announce-list
-            val announceList = decoded["announce-list"] as? List<*>
-            if (announceList != null) {
-                for (tier in announceList) {
-                    when (tier) {
-                        is List<*> -> {
-                            for (tracker in tier) {
-                                val trackerStr = when (tracker) {
-                                    is ByteArray -> String(tracker)
-                                    is String -> tracker
-                                    else -> null
-                                }
-                                if (trackerStr != null) {
-                                    magnet.append("&tr=").append(URLEncoder.encode(trackerStr, "UTF-8"))
-                                }
-                            }
-                        }
-                        is ByteArray -> magnet.append("&tr=").append(URLEncoder.encode(String(tier), "UTF-8"))
-                        is String -> magnet.append("&tr=").append(URLEncoder.encode(tier, "UTF-8"))
-                    }
-                }
-            }
-
-            // Add single announce tracker if no announce-list
-            if (announceList == null) {
-                when (val announce = decoded["announce"]) {
-                    is ByteArray -> magnet.append("&tr=").append(URLEncoder.encode(String(announce), "UTF-8"))
-                    is String -> magnet.append("&tr=").append(URLEncoder.encode(announce, "UTF-8"))
-                }
-            }
-
-            val magnetStr = magnet.toString()
-            Log.d(TAG, "Extracted magnet: $magnetStr")
-            magnetStr
-        } catch (e: Exception) {
-            Log.e(TAG, "extractMagnetFromTorrent Error: ${e.message}")
-            null
-        }
-    }
-
-    // ==================== BENCODE PARSER ====================
-
-    private fun decodeBencode(data: ByteArray, offset: Int): Pair<Any, Int> {
-        val first = data[offset].toInt().toChar()
-        return when {
-            first == 'd' -> {
-                val result = mutableMapOf<String, Any>()
-                var pos = offset + 1
-                while (data[pos].toInt().toChar() != 'e') {
-                    val key = decodeBencode(data, pos)
-                    pos = key.second
-                    val value = decodeBencode(data, pos)
-                    pos = value.second
-                    val keyStr = when (key.first) {
-                        is ByteArray -> String(key.first as ByteArray)
-                        is String -> key.first as String
-                        else -> key.first.toString()
-                    }
-                    result[keyStr] = value.first
-                }
-                result to pos + 1
-            }
-            first == 'l' -> {
-                val result = mutableListOf<Any>()
-                var pos = offset + 1
-                while (data[pos].toInt().toChar() != 'e') {
-                    val item = decodeBencode(data, pos)
-                    pos = item.second
-                    result.add(item.first)
-                }
-                result to pos + 1
-            }
-            first == 'i' -> {
-                val end = indexOfByte(data, 'e'.code.toByte(), offset + 1)
-                val num = String(data, offset + 1, end - offset - 1).toLong()
-                num to end + 1
-            }
-            first in '0'..'9' -> {
-                val colon = indexOfByte(data, ':'.code.toByte(), offset)
-                val length = String(data, offset, colon - offset).toInt()
-                val start = colon + 1
-                data.copyOfRange(start, start + length) to start + length
-            }
-            else -> throw IllegalArgumentException("Invalid bencode at offset $offset: $first")
-        }
-    }
-
-    private fun encodeBencode(obj: Any): ByteArray {
-        return when (obj) {
-            is Map<*, *> -> {
-                val sorted = obj.entries.sortedBy { it.key.toString() }
-                val parts = mutableListOf<ByteArray>()
-                parts.add(byteArrayOf('d'.code.toByte()))
-                for ((k, v) in sorted) {
-                    parts.add(encodeBencode(k!!))
-                    parts.add(encodeBencode(v!!))
-                }
-                parts.add(byteArrayOf('e'.code.toByte()))
-                parts.reduce { acc, bytes -> acc + bytes }
-            }
-            is List<*> -> {
-                val parts = mutableListOf<ByteArray>()
-                parts.add(byteArrayOf('l'.code.toByte()))
-                for (item in obj) {
-                    parts.add(encodeBencode(item!!))
-                }
-                parts.add(byteArrayOf('e'.code.toByte()))
-                parts.reduce { acc, bytes -> acc + bytes }
-            }
-            is Long -> "i${obj}e".toByteArray()
-            is Int -> "i${obj}e".toByteArray()
-            is ByteArray -> "${obj.size}:".toByteArray() + obj
-            is String -> "${obj.length}:".toByteArray() + obj.toByteArray()
-            else -> throw IllegalArgumentException("Cannot bencode: $obj")
-        }
-    }
-
-    private fun sha1Hex(data: ByteArray): String {
-        val md = MessageDigest.getInstance("SHA-1")
-        return md.digest(data).joinToString("") { "%02x".format(it) }
-    }
-
-    private fun indexOfByte(data: ByteArray, b: Byte, fromIndex: Int = 0): Int {
-        for (i in fromIndex until data.size) {
-            if (data[i] == b) return i
-        }
-        return -1
     }
 
     // ==================== HELPERS ====================
