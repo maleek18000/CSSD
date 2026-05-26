@@ -25,9 +25,20 @@ class Arabp : MainAPI() {
     }
 
     // Images require Referer header to avoid 403
-    private val posterHeaders = mapOf(
-        "Referer" to "https://www.arabp2p.net/"
-    )
+    private val posterHeaders: Map<String, String>
+        get() {
+            val headers = mutableMapOf(
+                "Referer" to "https://www.arabp2p.net/",
+                "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+            )
+            try {
+                val cookies = android.webkit.CookieManager.getInstance().getCookie(mainUrl) ?: ""
+                if (cookies.isNotEmpty()) {
+                    headers["Cookie"] = cookies
+                }
+            } catch (_: Exception) {}
+            return headers
+        }
 
     private fun toAbsoluteUrl(url: String): String {
         return when {
