@@ -482,9 +482,17 @@ class Arabp : MainAPI() {
     //   - download.php?id=83836 → 404 (error "E1")
     //   - download.php?id=83836&f=Name.torrent → 200 OK (valid .torrent)
     //
-    // So we ALWAYS fetch the torrent detail page first to get the proper
-    // download URL, then download the .torrent file, extract info hash
-    // and trackers, and build a magnet link.
+    // APPROACH: We provide TWO types of links to CloudStream:
+    //
+    // 1. TORRENT type — CloudStream downloads the .torrent file directly.
+    //    This preserves the private=1 flag and the tracker passkey, so
+    //    CloudStream's libtorrent engine can properly connect to the
+    //    private tracker. We pass auth headers (cookies) with the request.
+    //
+    // 2. MAGNET type — A magnet link built from the .torrent data.
+    //    This is a fallback for external torrents that have public trackers.
+    //    Private tracker torrents likely WON'T work via magnet because
+    //    magnet links don't carry the private=1 flag.
     //
 
     override suspend fun loadLinks(
@@ -555,15 +563,41 @@ class Arabp : MainAPI() {
                 }
             }
 
-            // Step 2: Download .torrent and build magnet
+            // Step 2: Pass the .torrent URL as TORRENT type
+            // CloudStream will download the .torrent file with our auth headers.
+            // This preserves private=1 flag and tracker passkey!
             if (!foundLink && resolvedDownloadUrl.isNotBlank() && resolvedDownloadUrl.contains("&f=")) {
-                foundLink = torrentToMagnet(resolvedDownloadUrl, callback)
-            }
+                val authHeaders = getAuthHeaders(referer = "$mainUrl/")
+                Log.d(TAG, "Passing .torrent URL as TORRENT type with auth headers")
 
-            // Step 3: Last resort - try without &f= (probably won't work but worth trying)
-            if (!foundLink && torrentId != "0") {
-                Log.w(TAG, "Last resort: trying download without &f= param")
-                foundLink = torrentToMagnet("$mainUrl/download.php?id=$torrentId", callback)
+                callback(
+                    newExtractorLink(
+                        source = this.name,
+                        name = "${this.name} (Torrent)",
+                        url = resolvedDownloadUrl,
+                        type = ExtractorLinkType.TORRENT
+                    ) {
+                        this.headers = authHeaders
+                    }
+                )
+                foundLink = true
+
+                // ALSO build a magnet link as fallback
+                try {
+                    val magnet = buildMagnetFromTorrent(resolvedDownloadUrl)
+                    if (magnet != null) {
+                        callback(
+                            newExtractorLink(
+                                source = this.name,
+                                name = "${this.name} (Magnet)",
+                                url = magnet,
+                                type = ExtractorLinkType.MAGNET
+                            )
+                        )
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Magnet build failed (non-critical): ${e.message}")
+                }
             }
 
             if (!foundLink) {
@@ -578,10 +612,10 @@ class Arabp : MainAPI() {
     }
 
     /**
-     * Download a .torrent file, extract info hash and trackers from raw bytes,
-     * and build a magnet link.
+     * Download a .torrent file, extract info hash and trackers, build a magnet link.
+     * Used as a FALLBACK alongside the TORRENT type link.
      */
-    private suspend fun torrentToMagnet(url: String, callback: (ExtractorLink) -> Unit): Boolean {
+    private suspend fun buildMagnetFromTorrent(url: String): String? {
         return try {
             val request = Request.Builder()
                 .url(toAbsoluteUrl(url))
@@ -589,46 +623,20 @@ class Arabp : MainAPI() {
                 .build()
 
             authClient.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    Log.w(TAG, "Download .torrent failed: HTTP ${response.code} for $url")
-                    return false
-                }
+                if (!response.isSuccessful) return null
 
-                val torrentBytes = response.body?.bytes()
-                if (torrentBytes == null || torrentBytes.size < 20) {
-                    Log.w(TAG, "Empty or too small .torrent response (${torrentBytes?.size ?: 0} bytes)")
-                    return false
-                }
+                val torrentBytes = response.body?.bytes() ?: return null
+                if (torrentBytes.size < 20 || torrentBytes[0] != 'd'.code.toByte()) return null
 
-                // Verify it's a valid bittorrent file (starts with 'd')
-                if (torrentBytes[0] != 'd'.code.toByte()) {
-                    val preview = String(torrentBytes, 0, minOf(50, torrentBytes.size), Charsets.US_ASCII)
-                    Log.w(TAG, "Not a valid .torrent file. First 50 chars: $preview")
-                    return false
-                }
-
-                Log.d(TAG, "Downloaded .torrent: ${torrentBytes.size} bytes")
-
-                // Compute info hash from RAW bytes
-                val infoHash = computeInfoHash(torrentBytes)
-                if (infoHash == null) {
-                    Log.e(TAG, "Failed to compute info hash")
-                    return false
-                }
-
-                // Extract announce URL(s) from .torrent
+                val infoHash = computeInfoHash(torrentBytes) ?: return null
                 val trackers = extractTrackers(torrentBytes)
-
-                // Extract torrent name
                 val torrentName = extractTorrentName(torrentBytes)
 
-                // Build magnet link
                 val magnet = StringBuilder("magnet:?xt=urn:btih:$infoHash")
                 if (torrentName.isNotEmpty()) {
                     magnet.append("&dn=").append(URLEncoder.encode(torrentName, "UTF-8"))
                 }
 
-                // Add trackers: private tracker first, then public
                 for (tracker in trackers) {
                     magnet.append("&tr=").append(URLEncoder.encode(tracker, "UTF-8"))
                 }
@@ -636,22 +644,12 @@ class Arabp : MainAPI() {
                     magnet.append("&tr=").append(URLEncoder.encode(tracker, "UTF-8"))
                 }
 
-                val magnetStr = magnet.toString()
-                Log.d(TAG, "Built magnet: hash=$infoHash, name=$torrentName, trackers=${trackers.size}+${PUBLIC_TRACKERS.size}")
-
-                callback(
-                    newExtractorLink(
-                        source = this.name,
-                        name = "${this.name} Torrent",
-                        url = magnetStr,
-                        type = ExtractorLinkType.MAGNET
-                    )
-                )
-                true
+                Log.d(TAG, "Built magnet: hash=$infoHash, trackers=${trackers.size}+${PUBLIC_TRACKERS.size}")
+                magnet.toString()
             }
         } catch (e: Exception) {
-            Log.e(TAG, "torrentToMagnet Error: ${e.message}")
-            false
+            Log.e(TAG, "buildMagnetFromTorrent Error: ${e.message}")
+            null
         }
     }
 
