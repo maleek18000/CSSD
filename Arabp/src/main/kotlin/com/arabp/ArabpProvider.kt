@@ -14,6 +14,8 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import org.json.JSONArray
+import org.json.JSONObject
 import java.net.CookieManager
 import java.net.CookiePolicy
 import java.net.HttpCookie
@@ -37,6 +39,11 @@ class Arabp : MainAPI() {
         // TorrServe Matrix API — default host:port
         // Change this if your TorrServe runs on a different address
         private const val TORRSERVE_HOST = "http://127.0.0.1:8090"
+
+        // How many times to poll TorrServe for file list after upload
+        private const val TORRSERVE_POLL_ATTEMPTS = 6
+        // Delay between polls (ms)
+        private const val TORRSERVE_POLL_DELAY = 1000L
     }
 
     // Images require Referer header to avoid 403
@@ -459,11 +466,14 @@ class Arabp : MainAPI() {
     // 1. External torrents → pass magnet link directly
     // 2. Internal torrents → download .torrent → upload to TorrServe → get file list
     //
-    // MULTI-FILE SUPPORT:
-    // TorrServe returns file_stats with all files in the torrent.
-    // We create one ExtractorLink per VIDEO file, each with its own
-    // stream URL pointing to the correct file index.
-    // This fixes the issue where only the first episode plays.
+    // MULTI-FILE / MULTI-SHOW SUPPORT:
+    // TorrServe returns file_stats with full paths (e.g. "ShowName/Episode01.mkv").
+    // We group video files by their parent folder (= show name) and create
+    // clearly labeled ExtractorLinks:
+    //   - Multi-show torrents: "📁 ShowName — Episode01.mkv"
+    //   - Single-show torrents: "Episode01.mkv"
+    //   - Single-file torrents: "TorrServe"
+    // This lets the user pick the right show and episode.
 
     override suspend fun loadLinks(
         data: String,
@@ -555,13 +565,20 @@ class Arabp : MainAPI() {
                             Log.d(TAG, "Downloaded .torrent: ${result.bytes.size} bytes, uploading to TorrServe...")
                             val streamEntries = uploadToTorrServe(result.bytes, torrentId)
                             if (streamEntries != null && streamEntries.isNotEmpty()) {
+                                // Determine how many unique folders (shows) there are
+                                val folderNames = streamEntries.map { it.folderName }.distinct().filter { it.isNotEmpty() }
+                                val hasMultipleShows = folderNames.size > 1
+
                                 for ((index, entry) in streamEntries.withIndex()) {
-                                    val linkName = if (streamEntries.size == 1) {
-                                        "${this.name} (TorrServe)"
-                                    } else {
-                                        "${this.name} — ${entry.fileName}"
+                                    val linkName = when {
+                                        streamEntries.size == 1 -> "${this.name} (TorrServe)"
+                                        hasMultipleShows && entry.folderName.isNotEmpty() ->
+                                            "\uD83D\uDCC1 ${entry.folderName} — ${entry.fileName}"
+                                        entry.folderName.isNotEmpty() ->
+                                            "${entry.fileName}"
+                                        else -> "${entry.fileName}"
                                     }
-                                    Log.d(TAG, "TorrServe link [$index]: ${entry.fileName} → ${entry.streamUrl}")
+                                    Log.d(TAG, "TorrServe link [$index]: folder=${entry.folderName}, file=${entry.fileName} → ${entry.streamUrl}")
                                     callback(
                                         newExtractorLink(
                                             source = this.name,
@@ -581,7 +598,7 @@ class Arabp : MainAPI() {
                             callback(
                                 newExtractorLink(
                                     source = this.name,
-                                    name = "❌ تجاوزت الحد اليومي للتحميل",
+                                    name = "\u274C تجاوزت الحد اليومي للتحميل",
                                     url = "error://daily-limit-exceeded",
                                     type = ExtractorLinkType.VIDEO
                                 )
@@ -665,23 +682,28 @@ class Arabp : MainAPI() {
 
     /**
      * Represents one streamable file from a TorrServe torrent.
+     * Includes folder structure info for multi-show torrents.
      */
     data class TorrServeStreamEntry(
-        val fileName: String,
-        val fileIndex: Int,
-        val streamUrl: String
+        val fileName: String,      // Just the filename (e.g. "Episode01.mkv")
+        val filePath: String,      // Full path within torrent (e.g. "ShowName/Episode01.mkv")
+        val folderName: String,    // Parent folder / show name (e.g. "ShowName"), empty if in root
+        val fileIndex: Int,        // TorrServe file index (1-based)
+        val streamUrl: String      // Full stream URL with correct index
     )
 
     /**
-     * Upload .torrent to TorrServe, parse file_stats from the response,
-     * and return a list of stream entries — one per VIDEO file.
+     * Upload .torrent to TorrServe, then poll for file list.
      *
-     * For single-file torrents: returns 1 entry with index=1.
-     * For multi-file torrents (season packs): returns one entry per video file,
-     * each with the correct file index for TorrServe's stream URL.
+     * Flow:
+     * 1. POST /torrent/upload with .torrent file → get hash
+     * 2. Try to parse file_stats from upload response
+     * 3. If empty, poll POST /torrents {"action":"get","hash":...} with retries
+     * 4. Filter to video files, group by folder, return stream entries
      */
     private fun uploadToTorrServe(torrentBytes: ByteArray, torrentId: String): List<TorrServeStreamEntry>? {
         return try {
+            // Step 1: Upload .torrent file
             val requestBody = MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
                 .addFormDataPart(
@@ -691,74 +713,92 @@ class Arabp : MainAPI() {
                 .addFormDataPart("save", "1")
                 .build()
 
-            val request = Request.Builder()
+            val uploadRequest = Request.Builder()
                 .url("$TORRSERVE_HOST/torrent/upload")
                 .post(requestBody)
                 .build()
 
-            torrServeClient.newCall(request).execute().use { response ->
+            val hash: String
+            var fileStats: List<Pair<String, Int>>
+
+            torrServeClient.newCall(uploadRequest).execute().use { response ->
                 if (!response.isSuccessful) {
                     Log.e(TAG, "TorrServe upload HTTP error: ${response.code}")
                     return null
                 }
 
                 val responseBody = response.body?.string() ?: return null
-                Log.d(TAG, "TorrServe upload response: $responseBody")
+                Log.d(TAG, "TorrServe upload response (${responseBody.length} chars): ${responseBody.take(500)}")
 
-                val hash = parseHashFromJson(responseBody)
-                if (hash == null) {
-                    Log.e(TAG, "Could not parse hash from TorrServe response")
-                    return null
-                }
+                hash = parseHashFromResponse(responseBody)
+                    ?: run {
+                        Log.e(TAG, "Could not parse hash from TorrServe response")
+                        return null
+                    }
 
                 Log.d(TAG, "TorrServe hash: $hash")
 
-                // Wait for TorrServe to start processing the torrent
-                Thread.sleep(500)
+                // Try to parse file_stats from the upload response
+                fileStats = parseFileStatsFromResponse(responseBody)
+                Log.d(TAG, "Parsed ${fileStats.size} files from upload response")
+            }
 
-                // Parse file_stats from the response to get all files
-                val fileStats = parseFileStatsFromJson(responseBody)
-                Log.d(TAG, "Parsed ${fileStats.size} files from TorrServe response")
+            // Step 2: If file_stats was empty, poll TorrServe until the torrent is ready
+            if (fileStats.isEmpty()) {
+                Log.d(TAG, "file_stats empty in upload response, polling TorrServe API...")
+                fileStats = pollTorrServeFileList(hash)
+            }
 
-                if (fileStats.isEmpty()) {
-                    // Fallback: single file torrent, use index=1
-                    return listOf(
-                        TorrServeStreamEntry(
-                            fileName = "Video",
-                            fileIndex = 1,
-                            streamUrl = "$TORRSERVE_HOST/stream/fname?link=$hash&index=1&play"
-                        )
+            // Step 3: Build stream entries from file stats
+            if (fileStats.isEmpty()) {
+                // Final fallback: single file torrent, use index=1
+                Log.w(TAG, "No file_stats found after polling — falling back to index=1")
+                return listOf(
+                    TorrServeStreamEntry(
+                        fileName = "Video",
+                        filePath = "Video",
+                        folderName = "",
+                        fileIndex = 1,
+                        streamUrl = "$TORRSERVE_HOST/stream/fname?link=$hash&index=1&play"
+                    )
+                )
+            }
+
+            // Filter to only video files and create stream entries with folder info
+            val videoEntries = fileStats
+                .filter { (path, _) -> isVideoFile(path) }
+                .map { (path, id) ->
+                    val normalizedPath = normalizePath(path)
+                    val fileName = normalizedPath.substringAfterLast("/")
+                    val folderName = extractFolderName(normalizedPath)
+
+                    TorrServeStreamEntry(
+                        fileName = fileName,
+                        filePath = normalizedPath,
+                        folderName = folderName,
+                        fileIndex = id,
+                        streamUrl = "$TORRSERVE_HOST/stream/fname?link=$hash&index=$id&play"
                     )
                 }
 
-                // Filter to only video files and create stream entries
-                val videoEntries = fileStats
-                    .filter { (path, _) -> isVideoFile(path) }
-                    .map { (path, id) ->
-                        // Extract just the filename from the path
-                        val fileName = path.substringAfterLast("/")
-                        TorrServeStreamEntry(
-                            fileName = fileName,
-                            fileIndex = id,
-                            streamUrl = "$TORRSERVE_HOST/stream/fname?link=$hash&index=$id&play"
-                        )
-                    }
+            Log.d(TAG, "Created ${videoEntries.size} video stream entries (from ${fileStats.size} total files)")
 
-                Log.d(TAG, "Created ${videoEntries.size} video stream entries (from ${fileStats.size} total files)")
-
-                if (videoEntries.isEmpty()) {
-                    // If no video files detected, use first file as fallback
-                    val first = fileStats.first()
-                    listOf(
-                        TorrServeStreamEntry(
-                            fileName = first.first.substringAfterLast("/"),
-                            fileIndex = first.second,
-                            streamUrl = "$TORRSERVE_HOST/stream/fname?link=$hash&index=${first.second}&play"
-                        )
+            if (videoEntries.isEmpty()) {
+                // If no video files detected, use first file as fallback
+                val first = fileStats.first()
+                val normalizedPath = normalizePath(first.first)
+                listOf(
+                    TorrServeStreamEntry(
+                        fileName = normalizedPath.substringAfterLast("/"),
+                        filePath = normalizedPath,
+                        folderName = extractFolderName(normalizedPath),
+                        fileIndex = first.second,
+                        streamUrl = "$TORRSERVE_HOST/stream/fname?link=$hash&index=${first.second}&play"
                     )
-                } else {
-                    videoEntries
-                }
+                )
+            } else {
+                // Sort: by folder name, then by filename within each folder
+                videoEntries.sortedWith(compareBy({ it.folderName }, { it.fileName }))
             }
         } catch (e: java.net.ConnectException) {
             Log.e(TAG, "TorrServe connection refused — is TorrServe running on $TORRSERVE_HOST?")
@@ -770,58 +810,152 @@ class Arabp : MainAPI() {
     }
 
     /**
-     * Parse file_stats from TorrServe's JSON response.
+     * Poll TorrServe's POST /torrents API to get file_stats.
+     * The torrent may need time to resolve its metadata (stat=1 → stat=3).
+     *
+     * Returns list of (path, id) pairs, or empty list if polling fails.
+     */
+    private fun pollTorrServeFileList(hash: String): List<Pair<String, Int>> {
+        for (attempt in 1..TORRSERVE_POLL_ATTEMPTS) {
+            try {
+                Thread.sleep(TORRSERVE_POLL_DELAY)
+
+                val jsonBody = JSONObject().apply {
+                    put("action", "get")
+                    put("hash", hash)
+                }
+
+                val request = Request.Builder()
+                    .url("$TORRSERVE_HOST/torrents")
+                    .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
+                    .build()
+
+                torrServeClient.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        Log.w(TAG, "TorrServe poll attempt $attempt: HTTP ${response.code}")
+                        return@use
+                    }
+
+                    val responseBody = response.body?.string() ?: return@use
+                    Log.d(TAG, "TorrServe poll attempt $attempt: ${responseBody.take(300)}")
+
+                    val fileStats = parseFileStatsFromResponse(responseBody)
+                    if (fileStats.isNotEmpty()) {
+                        Log.d(TAG, "TorrServe poll SUCCESS on attempt $attempt: ${fileStats.size} files")
+                        return fileStats
+                    }
+
+                    // Check torrent status
+                    try {
+                        val json = JSONObject(responseBody)
+                        val stat = json.optInt("stat", -1)
+                        val statString = json.optString("stat_string", "")
+                        Log.d(TAG, "TorrServe torrent stat=$stat ($statString)")
+
+                        // stat=4 means closed/errored — no point polling further
+                        if (stat == 4) {
+                            Log.e(TAG, "TorrServe torrent closed/errored, stopping polls")
+                            return emptyList()
+                        }
+                    } catch (_: Exception) {}
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "TorrServe poll attempt $attempt error: ${e.message}")
+            }
+        }
+
+        Log.w(TAG, "TorrServe polling exhausted after $TORRSERVE_POLL_ATTEMPTS attempts")
+        return emptyList()
+    }
+
+    // ==================== JSON PARSING (using JSONObject for reliability) ====================
+
+    /**
+     * Parse hash from TorrServe JSON response using JSONObject.
+     */
+    private fun parseHashFromResponse(json: String): String? {
+        return try {
+            val obj = JSONObject(json)
+            val hashValue = obj.optString("hash", "")
+            if (hashValue.isNotEmpty()) hashValue.lowercase() else null
+        } catch (e: Exception) {
+            // Fallback to regex if JSONObject fails
+            Log.w(TAG, "JSONObject hash parsing failed, trying regex: ${e.message}")
+            val hashPattern = """"hash"\s*:\s*"([a-fA-F0-9]{40})"""".toRegex()
+            hashPattern.find(json)?.groupValues?.getOrNull(1)?.lowercase()
+        }
+    }
+
+    /**
+     * Parse file_stats from TorrServe JSON response using JSONObject/JSONArray.
      * Returns list of (path, id) pairs.
      *
-     * Format: "file_stats":[{"id":1,"path":"Episode01.mkv","length":...}, ...]
+     * Handles both single-object and array responses:
+     * - Direct: {"hash":"...","file_stats":[{"id":1,"path":"..."},...]}
+     * - Array:  [{"hash":"...","file_stats":[...]}]
      */
-    private fun parseFileStatsFromJson(json: String): List<Pair<String, Int>> {
+    private fun parseFileStatsFromResponse(json: String): List<Pair<String, Int>> {
         val results = mutableListOf<Pair<String, Int>>()
+
         try {
-            // Find the file_stats array
-            val fsStart = json.indexOf("\"file_stats\"")
-            if (fsStart < 0) return results
-
-            val arrayStart = json.indexOf('[', fsStart)
-            if (arrayStart < 0) return results
-            val arrayEnd = json.indexOf(']', arrayStart)
-            if (arrayEnd < 0) return results
-
-            val fileStatsContent = json.substring(arrayStart, arrayEnd + 1)
-
-            // Extract each {"id":N,"path":"..."} or {"path":"...","id":N} entry
-            val entryPattern = """"path"\s*:\s*"([^"]*?)"[^}]*?"id"\s*:\s*(\d+)""".toRegex()
-            val entryPattern2 = """"id"\s*:\s*(\d+)[^}]*?"path"\s*:\s*"([^"]*?)"""".toRegex()
-
-            for (match in entryPattern.findAll(fileStatsContent)) {
-                val path = match.groupValues[1]
-                val id = match.groupValues[2].toIntOrNull() ?: continue
-                results.add(path to id)
+            // Try parsing as a single JSON object
+            val jsonObj = JSONObject(json)
+            parseFileStatsFromObject(jsonObj, results)
+        } catch (_: Exception) {
+            try {
+                // Try parsing as a JSON array (GET /torrents returns array)
+                val jsonArr = JSONArray(json)
+                for (i in 0 until jsonArr.length()) {
+                    parseFileStatsFromObject(jsonArr.getJSONObject(i), results)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "parseFileStatsFromResponse: both object and array parsing failed: ${e.message}")
             }
+        }
 
-            // If first pattern didn't find anything, try the reverse order
-            if (results.isEmpty()) {
-                for (match in entryPattern2.findAll(fileStatsContent)) {
-                    val id = match.groupValues[1].toIntOrNull() ?: continue
-                    val path = match.groupValues[2]
+        return results
+    }
+
+    /**
+     * Parse file_stats from a single JSONObject.
+     */
+    private fun parseFileStatsFromObject(obj: JSONObject, results: MutableList<Pair<String, Int>>) {
+        val fileStats = obj.optJSONArray("file_stats") ?: return
+
+        for (i in 0 until fileStats.length()) {
+            try {
+                val fileObj = fileStats.getJSONObject(i)
+                val id = fileObj.optInt("id", -1)
+                val path = fileObj.optString("path", "")
+                if (id > 0 && path.isNotEmpty()) {
                     results.add(path to id)
                 }
+            } catch (e: Exception) {
+                Log.w(TAG, "Error parsing file_stats entry $i: ${e.message}")
             }
-
-            // Generic fallback: find all "id":N and "path":"..." pairs
-            if (results.isEmpty()) {
-                val idPattern = """"id"\s*:\s*(\d+)""".toRegex()
-                val pathPattern = """"path"\s*:\s*"([^"]*)"""".toRegex()
-                val ids = idPattern.findAll(fileStatsContent).mapNotNull { it.groupValues[1].toIntOrNull() }.toList()
-                val paths = pathPattern.findAll(fileStatsContent).map { it.groupValues[1] }.toList()
-                for (i in ids.indices) {
-                    if (i < paths.size) results.add(paths[i] to ids[i])
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "parseFileStatsFromJson error: ${e.message}")
         }
-        return results
+    }
+
+    // ==================== PATH HELPERS ====================
+
+    /**
+     * Normalize path separators: replace backslashes with forward slashes.
+     * Some .torrent files use Windows-style paths (ShowName\Episode01.mkv).
+     */
+    private fun normalizePath(path: String): String {
+        return path.replace("\\", "/")
+    }
+
+    /**
+     * Extract the "show name" (first folder component) from a file path.
+     * Examples:
+     *   "ShowName/Episode01.mkv"            → "ShowName"
+     *   "ShowName/Season1/Episode01.mkv"     → "ShowName"
+     *   "Episode01.mkv"                      → "" (no folder = single show)
+     */
+    private fun extractFolderName(normalizedPath: String): String {
+        val slashIndex = normalizedPath.indexOf('/')
+        return if (slashIndex > 0) normalizedPath.substring(0, slashIndex) else ""
     }
 
     /**
@@ -835,11 +969,6 @@ class Arabp : MainAPI() {
         )
         val lower = fileName.lowercase()
         return videoExtensions.any { lower.endsWith(it) }
-    }
-
-    private fun parseHashFromJson(json: String): String? {
-        val hashPattern = """"hash"\s*:\s*"([a-fA-F0-9]{40})"""".toRegex()
-        return hashPattern.find(json)?.groupValues?.getOrNull(1)?.lowercase()
     }
 
     // ==================== HELPERS ====================
