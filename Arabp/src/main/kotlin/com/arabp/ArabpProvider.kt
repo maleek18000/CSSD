@@ -9,6 +9,7 @@ import com.lagradost.cloudstream3.SubtitleFile
 import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.CookieManager
 import java.net.CookiePolicy
@@ -39,8 +40,7 @@ class Arabp : MainAPI() {
     )
 
     /**
-     * Public trackers injected into every magnet link as fallback.
-     * The private tracker announce URL (with passkey) is always included first.
+     * Public trackers injected into magnet links as fallback.
      */
     private val PUBLIC_TRACKERS = listOf(
         "udp://tracker.opentrackr.org:1337/announce",
@@ -98,7 +98,7 @@ class Arabp : MainAPI() {
                 }
             })
             .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
             .followRedirects(true)
             .followSslRedirects(true)
             .build()
@@ -135,7 +135,7 @@ class Arabp : MainAPI() {
         }
 
         return try {
-            // Step 1: GET the login page first to establish PHPSESSID
+            // Step 1: GET the login page to establish PHPSESSID
             val initRequest = Request.Builder()
                 .url("$mainUrl/index.php?page=login")
                 .header("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
@@ -159,19 +159,20 @@ class Arabp : MainAPI() {
 
             authClient.newCall(loginRequest).execute().use { response ->
                 val body = response.body?.string() ?: ""
-                Log.d(TAG, "Login response code: ${response.code}, body length: ${body.length}")
+                Log.d(TAG, "Login response: code=${response.code}, cookies=${getSessionCookies()}")
 
-                val loginSuccess = body.contains("logout.php") ||
+                // Login success = 302 redirect OR page contains logout link OR no login form
+                val loginSuccess = response.code == 302 ||
+                        body.contains("logout.php") ||
                         body.contains("page=logout") ||
                         !body.contains("name=\"uid\"") ||
-                        body.contains("مرحبا") ||
                         body.contains(LOGIN_USERNAME)
 
                 if (loginSuccess) {
                     isLoggedIn = true
-                    Log.d(TAG, "Login SUCCESS! Cookies: ${getSessionCookies()}")
+                    Log.d(TAG, "Login SUCCESS!")
                 } else {
-                    Log.e(TAG, "Login FAILED. Response snippet: ${body.take(500)}")
+                    Log.e(TAG, "Login FAILED. Snippet: ${body.take(300)}")
                 }
 
                 loginSuccess
@@ -295,6 +296,8 @@ class Arabp : MainAPI() {
                 val detailHref = nameLink.attr("href")
                 val torrentId = DIGITS.find(detailHref.substringAfter("id="))?.value ?: return@mapNotNull null
 
+                // The download URL WITH &f= parameter is critical!
+                // Without &f=, download.php returns 404
                 val downloadLink = row.selectFirst("a[href*=download.php]")
                 val downloadHref = downloadLink?.attr("href") ?: ""
 
@@ -337,17 +340,13 @@ class Arabp : MainAPI() {
 
     // ==================== LOAD LINKS ====================
     //
-    // APPROACH: Download the .torrent file with auth cookies, then:
-    // 1. Compute info hash from the RAW info dictionary bytes (NOT re-encoded)
-    // 2. Extract the private tracker announce URL (with passkey) from the .torrent
-    // 3. Build a magnet link: magnet:?xt=urn:btih:HASH&tr=PRIVATE_ANNOUNCE&tr=PUBLIC...
-    // 4. Pass as MAGNET type to CloudStream
+    // CRITICAL: download.php REQUIRES the &f=filename.torrent parameter!
+    //   - download.php?id=83836 → 404 (error "E1")
+    //   - download.php?id=83836&f=Name.torrent → 200 OK (valid .torrent)
     //
-    // The private tracker announce URL contains a passkey that authenticates
-    // with the tracker. CloudStream's libtorrent will:
-    //   - Contact the private tracker announce URL
-    //   - Get the peer list
-    //   - Connect to peers and stream
+    // So we ALWAYS fetch the torrent detail page first to get the proper
+    // download URL, then download the .torrent file, extract info hash
+    // and trackers, and build a magnet link.
     //
 
     override suspend fun loadLinks(
@@ -370,31 +369,35 @@ class Arabp : MainAPI() {
             }
 
             var foundLink = false
+            var resolvedDownloadUrl = downloadUrl
 
-            // Strategy 1: Download .torrent and build magnet from it
-            if (downloadUrl.isNotBlank()) {
-                foundLink = torrentToMagnet(downloadUrl, callback)
-            }
+            // Step 1: If we don't have the download URL with &f= param,
+            // fetch the torrent detail page to find it
+            if (resolvedDownloadUrl.isBlank() || !resolvedDownloadUrl.contains("&f=")) {
+                Log.d(TAG, "Download URL missing &f= param, fetching detail page...")
+                val detailPageUrl = if (detailUrl.isNotBlank()) detailUrl
+                    else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
 
-            // Strategy 2: Try constructing download URL from torrent ID
-            if (!foundLink && torrentId != "0") {
-                val constructedUrl = "$mainUrl/download.php?id=$torrentId"
-                foundLink = torrentToMagnet(constructedUrl, callback)
-            }
-
-            // Strategy 3: Fetch detail page for magnet/download links
-            if (!foundLink && detailUrl.isNotBlank()) {
                 try {
                     val request = Request.Builder()
-                        .url(toAbsoluteUrl(detailUrl))
+                        .url(toAbsoluteUrl(detailPageUrl))
                         .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
                         .build()
 
                     authClient.newCall(request).execute().use { response ->
                         val body = response.body?.string() ?: ""
-                        val detailDoc = org.jsoup.Jsoup.parse(body, toAbsoluteUrl(detailUrl))
+                        val detailDoc = Jsoup.parse(body, toAbsoluteUrl(detailPageUrl))
 
-                        // Check for direct magnet links (external torrents)
+                        // Look for the download link with &f= parameter
+                        val dlLink = detailDoc.selectFirst("a[href*=download.php]")
+                            ?: detailDoc.selectFirst("td#Title h1 a[href*=download.php]")
+
+                        if (dlLink != null) {
+                            resolvedDownloadUrl = toAbsoluteUrl(dlLink.attr("href"))
+                            Log.d(TAG, "Found download URL from detail page: $resolvedDownloadUrl")
+                        }
+
+                        // Also check for direct magnet links (external torrents)
                         val magnetLinks = detailDoc.select("a[href^=magnet:]")
                         for (magnetEl in magnetLinks) {
                             val magnetUrl = magnetEl.attr("href")
@@ -408,24 +411,25 @@ class Arabp : MainAPI() {
                             )
                             foundLink = true
                         }
-
-                        // Check for download link on detail page
-                        if (!foundLink) {
-                            val dlLink = detailDoc.selectFirst("a[href*=download.php]")
-                                ?: detailDoc.selectFirst("td#Title h1 a[href*=download.php]")
-                            if (dlLink != null) {
-                                val dlHref = toAbsoluteUrl(dlLink.attr("href"))
-                                foundLink = torrentToMagnet(dlHref, callback)
-                            }
-                        }
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to fetch detail page: ${e.message}")
                 }
             }
 
+            // Step 2: Download .torrent and build magnet
+            if (!foundLink && resolvedDownloadUrl.isNotBlank() && resolvedDownloadUrl.contains("&f=")) {
+                foundLink = torrentToMagnet(resolvedDownloadUrl, callback)
+            }
+
+            // Step 3: Last resort - try without &f= (probably won't work but worth trying)
+            if (!foundLink && torrentId != "0") {
+                Log.w(TAG, "Last resort: trying download without &f= param")
+                foundLink = torrentToMagnet("$mainUrl/download.php?id=$torrentId", callback)
+            }
+
             if (!foundLink) {
-                Log.w(TAG, "No links found for torrent id=$torrentId")
+                Log.e(TAG, "No links found for torrent id=$torrentId")
             }
 
             foundLink
@@ -436,10 +440,8 @@ class Arabp : MainAPI() {
     }
 
     /**
-     * Download a .torrent file using the authenticated client, then:
-     * 1. Compute the info hash from RAW bytes (no re-encoding — avoids hash mismatches)
-     * 2. Extract the announce URL(s) including the private tracker passkey
-     * 3. Build a magnet link with private tracker + public trackers
+     * Download a .torrent file, extract info hash and trackers from raw bytes,
+     * and build a magnet link.
      */
     private suspend fun torrentToMagnet(url: String, callback: (ExtractorLink) -> Unit): Boolean {
         return try {
@@ -450,44 +452,45 @@ class Arabp : MainAPI() {
 
             authClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    Log.w(TAG, "Download .torrent failed: HTTP ${response.code}")
+                    Log.w(TAG, "Download .torrent failed: HTTP ${response.code} for $url")
                     return false
                 }
 
                 val torrentBytes = response.body?.bytes()
                 if (torrentBytes == null || torrentBytes.size < 20) {
-                    Log.w(TAG, "Empty or too small .torrent response")
+                    Log.w(TAG, "Empty or too small .torrent response (${torrentBytes?.size ?: 0} bytes)")
                     return false
                 }
 
-                // Verify it's a valid bittorrent file
+                // Verify it's a valid bittorrent file (starts with 'd')
                 if (torrentBytes[0] != 'd'.code.toByte()) {
-                    Log.w(TAG, "Not a valid .torrent file (first byte: ${torrentBytes[0]})")
+                    val preview = String(torrentBytes, 0, minOf(50, torrentBytes.size), Charsets.US_ASCII)
+                    Log.w(TAG, "Not a valid .torrent file. First 50 chars: $preview")
                     return false
                 }
 
                 Log.d(TAG, "Downloaded .torrent: ${torrentBytes.size} bytes")
 
-                // Step 1: Compute info hash from RAW bytes
+                // Compute info hash from RAW bytes
                 val infoHash = computeInfoHash(torrentBytes)
                 if (infoHash == null) {
-                    Log.e(TAG, "Failed to compute info hash from .torrent")
+                    Log.e(TAG, "Failed to compute info hash")
                     return false
                 }
 
-                // Step 2: Extract announce URL(s)
+                // Extract announce URL(s) from .torrent
                 val trackers = extractTrackers(torrentBytes)
 
-                // Step 3: Extract torrent name
+                // Extract torrent name
                 val torrentName = extractTorrentName(torrentBytes)
 
-                // Step 4: Build magnet link
+                // Build magnet link
                 val magnet = StringBuilder("magnet:?xt=urn:btih:$infoHash")
                 if (torrentName.isNotEmpty()) {
                     magnet.append("&dn=").append(URLEncoder.encode(torrentName, "UTF-8"))
                 }
 
-                // Add ALL trackers: private tracker first, then public
+                // Add trackers: private tracker first, then public
                 for (tracker in trackers) {
                     magnet.append("&tr=").append(URLEncoder.encode(tracker, "UTF-8"))
                 }
@@ -514,12 +517,11 @@ class Arabp : MainAPI() {
         }
     }
 
-    // ==================== TORRENT PARSING (RAW BYTE APPROACH) ====================
+    // ==================== TORRENT PARSING ====================
 
     /**
      * Compute the info hash by finding the raw "info" dictionary in the .torrent
-     * and SHA-1 hashing its bytes directly. This avoids any re-encoding issues
-     * that could produce a wrong hash.
+     * and SHA-1 hashing its bytes directly.
      */
     private fun computeInfoHash(data: ByteArray): String? {
         return try {
@@ -531,22 +533,18 @@ class Arabp : MainAPI() {
                 return null
             }
 
-            // The info value starts right after "4:info"
             val infoStart = infoKeyOffset + infoKey.size
-
-            // The info value is a bencode element (should be a dictionary starting with 'd')
             val infoEnd = findBencodeEnd(data, infoStart)
             if (infoEnd < 0) {
                 Log.e(TAG, "Could not find end of info dictionary")
                 return null
             }
 
-            // SHA-1 hash the raw bytes
             val infoBytes = data.copyOfRange(infoStart, infoEnd)
             val md = MessageDigest.getInstance("SHA-1")
             val hash = md.digest(infoBytes).joinToString("") { "%02x".format(it) }
 
-            Log.d(TAG, "Info hash: $hash (from ${infoBytes.size} raw bytes, offset $infoStart-$infoEnd)")
+            Log.d(TAG, "Info hash: $hash (${infoBytes.size} bytes)")
             hash
         } catch (e: Exception) {
             Log.e(TAG, "computeInfoHash Error: ${e.message}")
@@ -556,22 +554,17 @@ class Arabp : MainAPI() {
 
     /**
      * Extract the announce URL and announce-list from the .torrent file.
-     * These contain the private tracker's announce URL with the user's passkey.
      */
     private fun extractTrackers(data: ByteArray): List<String> {
         val trackers = mutableListOf<String>()
-
         try {
-            // Parse the top-level dictionary
             val decoded = parseBencode(data) as? Map<*, *> ?: return trackers
 
-            // Single announce URL
             when (val announce = decoded["announce"]) {
                 is ByteArray -> trackers.add(String(announce))
                 is String -> trackers.add(announce)
             }
 
-            // Announce-list (list of tiers, each tier is a list of URLs)
             val announceList = decoded["announce-list"] as? List<*>
             if (announceList != null) {
                 for (tier in announceList) {
@@ -593,13 +586,10 @@ class Arabp : MainAPI() {
             Log.w(TAG, "extractTrackers Error: ${e.message}")
         }
 
-        Log.d(TAG, "Extracted ${trackers.size} tracker(s): ${trackers.map { it.substringBefore("?").substringAfterLast("//") }}")
+        Log.d(TAG, "Extracted ${trackers.size} tracker(s)")
         return trackers
     }
 
-    /**
-     * Extract the torrent name from the info dictionary.
-     */
     private fun extractTorrentName(data: ByteArray): String {
         return try {
             val decoded = parseBencode(data) as? Map<*, *> ?: return ""
@@ -614,12 +604,8 @@ class Arabp : MainAPI() {
         }
     }
 
-    // ==================== BENCODE PARSER (for tracker/name extraction only) ====================
+    // ==================== BENCODE PARSER ====================
 
-    /**
-     * Full bencode parser — used to extract announce URLs and torrent name.
-     * NOT used for info hash computation (that uses raw bytes directly).
-     */
     private fun parseBencode(data: ByteArray): Any {
         val result = parseBencodeAt(data, 0)
         return result.first
@@ -672,22 +658,16 @@ class Arabp : MainAPI() {
 
     // ==================== RAW BYTE HELPERS ====================
 
-    /**
-     * Find the end position of a bencode element starting at `offset`.
-     * Returns the position right after the element ends.
-     */
     private fun findBencodeEnd(data: ByteArray, offset: Int): Int {
         val first = data[offset].toInt().toChar()
         return when {
             first == 'd' -> {
                 var pos = offset + 1
                 while (pos < data.size && data[pos].toInt().toChar() != 'e') {
-                    // Skip key
                     pos = findBencodeEnd(data, pos)
-                    // Skip value
                     pos = findBencodeEnd(data, pos)
                 }
-                pos + 1 // skip the 'e'
+                pos + 1
             }
             first == 'l' -> {
                 var pos = offset + 1
@@ -709,9 +689,6 @@ class Arabp : MainAPI() {
         }
     }
 
-    /**
-     * Find a byte sequence within a byte array.
-     */
     private fun findBytes(data: ByteArray, pattern: ByteArray, fromIndex: Int): Int {
         if (pattern.isEmpty()) return fromIndex
         val maxStart = data.size - pattern.size
@@ -735,13 +712,13 @@ class Arabp : MainAPI() {
         return -1
     }
 
-    // ==================== HELPERS ====================
-
     private fun Map<String, String>.toOkHttpHeaders(): okhttp3.Headers {
         val builder = okhttp3.Headers.Builder()
         this.forEach { (key, value) -> builder.add(key, value) }
         return builder.build()
     }
+
+    // ==================== HELPERS ====================
 
     private fun cleanTitleText(text: String): String {
         return text.replace("\\n", " ")
