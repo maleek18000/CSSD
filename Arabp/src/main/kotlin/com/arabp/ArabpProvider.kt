@@ -25,20 +25,10 @@ class Arabp : MainAPI() {
     }
 
     // Images require Referer header to avoid 403
-    private val posterHeaders: Map<String, String>
-        get() {
-            val headers = mutableMapOf(
-                "Referer" to "https://www.arabp2p.net/",
-                "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-            )
-            try {
-                val cookies = android.webkit.CookieManager.getInstance().getCookie(mainUrl) ?: ""
-                if (cookies.isNotEmpty()) {
-                    headers["Cookie"] = cookies
-                }
-            } catch (_: Exception) {}
-            return headers
-        }
+    private val imageHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "Referer" to "$mainUrl/"
+    )
 
     private fun toAbsoluteUrl(url: String): String {
         return when {
@@ -106,8 +96,7 @@ class Arabp : MainAPI() {
             }
 
             newAnimeSearchResponse(title, href, tvType) {
-                this.posterUrl = toAbsoluteUrl(posterUrl)
-                this.posterHeaders = posterHeaders
+                this.addPoster(toAbsoluteUrl(posterUrl), headers = imageHeaders)
             }
         } catch (e: Exception) {
             Log.e(TAG, "toSearchResult Error: ${e.message}")
@@ -183,13 +172,13 @@ class Arabp : MainAPI() {
                 // If no episodes found, return as a movie
                 newMovieLoadResponse(title, fullUrl, TvType.Anime, fullUrl) {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
-                    this.posterHeaders = posterHeaders
+                    this.posterHeaders = imageHeaders
                     this.plot = desc
                 }
             } else {
                 newTvSeriesLoadResponse(title, fullUrl, TvType.Anime, episodes) {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
-                    this.posterHeaders = posterHeaders
+                    this.posterHeaders = imageHeaders
                     this.plot = desc
                 }
             }
