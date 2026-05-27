@@ -802,7 +802,7 @@
     "iconUrl": "https://www.arabp2p.net/favicon.ico",
     "apiVersion": 1,
     "repositoryUrl": "https://github.com/maleek18000/CSSD",
-    "fileSize": 15623,
+    "fileSize": 60799,
     "status": 1,
     "language": "ar",
     "authors": [
@@ -813,8 +813,9 @@
       "Movie",
       "Anime"
     ],
-    "version": 2,
+    "version": 10,
     "internalName": "Arabp",
+    "description": "Requires TorrServe Matrix. Multi-show torrents use seasons: select a season to see that show's episodes.",
     "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/Arabp.cs3",
     "name": "Arabp"
   }
