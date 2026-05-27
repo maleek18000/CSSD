@@ -498,12 +498,12 @@ class Arabp : MainAPI() {
                     val epData = "ts://${entry.streamUrl}|${entry.fileName}"
 
                     episodes.add(
-                        newEpisode(epData) {
+                        newEpisode(epData, fix = false, initializer = {
                             name = entry.fileName
                             season = seasonNum
                             episode = epIndex + 1
                             this.posterUrl = absPosterUrl
-                        }
+                        })
                     )
                 }
                 seasonNum++
@@ -518,12 +518,12 @@ class Arabp : MainAPI() {
                     val epData = "ts://${entry.streamUrl}|${entry.fileName}"
 
                     episodes.add(
-                        newEpisode(epData) {
+                        newEpisode(epData, fix = false, initializer = {
                             name = entry.fileName
                             season = seasonNum
                             episode = epIndex + 1
                             this.posterUrl = absPosterUrl
-                        }
+                        })
                     )
                 }
             }
@@ -538,12 +538,12 @@ class Arabp : MainAPI() {
             for ((epIndex, entry) in streamEntries.withIndex()) {
                 val epData = "ts://${entry.streamUrl}|${entry.fileName}"
                 episodes.add(
-                    newEpisode(epData) {
+                    newEpisode(epData, fix = false, initializer = {
                         name = entry.fileName
                         season = 1
                         episode = epIndex + 1
                         this.posterUrl = absPosterUrl
-                    }
+                    })
                 )
             }
 
@@ -605,12 +605,12 @@ class Arabp : MainAPI() {
                     val epData = "$torrentId|${toAbsoluteUrl(detailHref)}|${toAbsoluteUrl(downloadHref)}||${if (isFree) "1" else "0"}|0"
                     seasonNamesList.add(SeasonData(season = globalSeasonNum, name = displayName))
                     episodes.add(
-                        newEpisode(epData) {
+                        newEpisode(epData, fix = false, initializer = {
                             name = displayName
                             season = globalSeasonNum
                             episode = 1
                             this.posterUrl = absPosterUrl
-                        }
+                        })
                     )
                     globalSeasonNum++
                     continue
@@ -623,12 +623,12 @@ class Arabp : MainAPI() {
                     val epData = "ts://${entry.streamUrl}|${entry.fileName}"
                     seasonNamesList.add(SeasonData(season = globalSeasonNum, name = displayName))
                     episodes.add(
-                        newEpisode(epData) {
+                        newEpisode(epData, fix = false, initializer = {
                             name = displayName
                             season = globalSeasonNum
                             episode = 1
                             this.posterUrl = absPosterUrl
-                        }
+                        })
                     )
                     globalSeasonNum++
                 } else {
@@ -655,12 +655,12 @@ class Arabp : MainAPI() {
                         val remappedSeason = globalSeasonNum + localSeason - 1
 
                         episodes.add(
-                            newEpisode(ep.data ?: "") {
+                            newEpisode(ep.data ?: "", fix = false, initializer = {
                                 name = ep.name ?: ""
                                 season = remappedSeason
                                 episode = ep.episode
                                 this.posterUrl = absPosterUrl
-                            }
+                            })
                         )
                     }
                     globalSeasonNum += fileSeasonMap.size
@@ -755,12 +755,12 @@ class Arabp : MainAPI() {
             // loadLinks() will try again when the user clicks play.
             Log.w(TAG, "Pre-resolve failed for torrent $torrentId, falling back to single-episode format")
             return newTvSeriesLoadResponse(title, data, TvType.Anime, listOf(
-                newEpisode(data) {
+                newEpisode(data, fix = false, initializer = {
                     name = title
                     season = 1
                     episode = 1
                     this.posterUrl = absPosterUrl
-                }
+                })
             )) {
                 this.posterUrl = absPosterUrl
                 this.posterHeaders = imageHeaders
