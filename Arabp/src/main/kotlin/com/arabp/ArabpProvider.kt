@@ -366,20 +366,194 @@ class Arabp : MainAPI() {
         }
     }
 
+    // ==================== SMART FOLDER GROUPING ====================
+    //
+    // The key problem: simple extractFolderName() only takes the FIRST path
+    // component, but many torrents have a wrapper folder like:
+    //   "RootFolder/Show1/E01.mkv"
+    //   "RootFolder/Show2/E01.mkv"
+    // extractFolderName returns "RootFolder" for both → hasMultipleShows=false!
+    //
+    // Solution: analyze ALL paths together and find the grouping level
+    // where there are MULTIPLE distinct values.
+
+    /**
+     * Represents a file's path split into components, with the computed
+     * "show name" (the grouping key at the diversity level).
+     */
+    data class PathGroup(
+        val path: String,           // Full normalized path
+        val fileName: String,       // Just the filename
+        val showName: String,       // Computed show/group name
+        val showDepth: Int          // How deep the show level is (0=root, 1=first folder, etc.)
+    )
+
+    /**
+     * Analyze all file paths together to find the correct grouping level.
+     *
+     * Algorithm:
+     * 1. Split every path into components
+     * 2. Find the shallowest level where there are 2+ distinct values
+     * 3. Group files by their value at that level
+     *
+     * Examples:
+     *   ["Show1/E01.mkv", "Show2/E01.mkv"]
+     *     → Level 0: {"Show1","Show2"} → 2 values → shows at level 0
+     *
+     *   ["Root/Show1/E01.mkv", "Root/Show2/E01.mkv"]
+     *     → Level 0: {"Root","Root"} → 1 value → skip
+     *     → Level 1: {"Show1","Show2"} → 2 values → shows at level 1
+     *
+     *   ["Show1/E01.mkv", "Show1/E02.mkv"]
+     *     → Level 0: {"Show1","Show1"} → 1 value → single show
+     */
+    private fun computeShowGroups(entries: List<TorrServeStreamEntry>): List<PathGroup> {
+        if (entries.isEmpty()) return emptyList()
+
+        // Split each entry's filePath into components
+        val pathParts = entries.map { entry ->
+            val parts = entry.filePath.split("/").filter { it.isNotEmpty() }
+            // Last component is the filename, rest are folders
+            Pair(entry, if (parts.isNotEmpty()) parts.dropLast(1) else emptyList())
+        }
+
+        // Find the maximum folder depth
+        val maxDepth = pathParts.maxOf { it.second.size }
+
+        // Find the shallowest level with 2+ distinct values
+        var showLevel = -1
+        for (level in 0 until maxDepth) {
+            val valuesAtLevel = pathParts.mapNotNull { it.second.getOrNull(level) }.toSet()
+            if (valuesAtLevel.size >= 2) {
+                showLevel = level
+                break
+            }
+        }
+
+        // Build PathGroup for each entry
+        return pathParts.map { (entry, parts) ->
+            val showName = if (showLevel >= 0 && showLevel < parts.size) {
+                parts[showLevel]
+            } else if (parts.isNotEmpty()) {
+                // All files share the same path prefix — single show
+                // Use the last folder component as the show name (or empty if only root)
+                if (parts.size > 1) parts.last() else parts.first()
+            } else {
+                "" // No folder at all
+            }
+
+            PathGroup(
+                path = entry.filePath,
+                fileName = entry.fileName,
+                showName = showName,
+                showDepth = showLevel
+            )
+        }
+    }
+
+    /**
+     * Check if the entries represent multiple shows based on smart grouping.
+     */
+    private fun hasMultipleShowsSmart(entries: List<TorrServeStreamEntry>): Boolean {
+        val groups = computeShowGroups(entries)
+        val distinctShows = groups.map { it.showName }.filter { it.isNotEmpty() }.toSet()
+        return distinctShows.size > 1
+    }
+
+    // ==================== BUILD EPISODES FROM STREAM ENTRIES ====================
+    //
+    // Shared logic for both load() and loadFromTorrentData().
+    // Creates per-file episodes with ts:// data, grouped by show/season.
+
+    /**
+     * Build a list of Episodes from pre-resolved stream entries.
+     * Each video file becomes its own Episode with a ts:// data URL,
+     * so loadLinks() returns exactly ONE source (not a flat list of all files).
+     *
+     * For multi-show torrents, each show becomes a SEASON with a readable name.
+     */
+    private fun buildEpisodesFromEntries(
+        streamEntries: List<TorrServeStreamEntry>,
+        absPosterUrl: String
+    ): Pair<List<Episode>, List<SeasonData>> {
+        val groups = computeShowGroups(streamEntries)
+        val distinctShows = groups.map { it.showName }.filter { it.isNotEmpty() }.distinct()
+        val isMultiShow = distinctShows.size > 1
+
+        val episodes = mutableListOf<Episode>()
+        val seasonNamesList = mutableListOf<SeasonData>()
+
+        if (isMultiShow) {
+            // MULTI-SHOW: each show = one season
+            var seasonNum = 1
+
+            for (showName in distinctShows) {
+                seasonNamesList.add(SeasonData(season = seasonNum, name = showName))
+
+                // Find all entries belonging to this show
+                val showEntries = groups.filter { it.showName == showName }
+                for ((epIndex, group) in showEntries.withIndex()) {
+                    // Find the original TorrServeStreamEntry for this file
+                    val entry = streamEntries.find { it.filePath == group.path } ?: continue
+                    val epData = "ts://${entry.streamUrl}|${entry.fileName}"
+
+                    episodes.add(
+                        newEpisode(epData) {
+                            name = entry.fileName
+                            season = seasonNum
+                            episode = epIndex + 1
+                            this.posterUrl = absPosterUrl
+                        }
+                    )
+                }
+                seasonNum++
+            }
+
+            // Files without a show name → put in next season
+            val noShowEntries = groups.filter { it.showName.isEmpty() }
+            if (noShowEntries.isNotEmpty()) {
+                seasonNamesList.add(SeasonData(season = seasonNum, name = "أخرى"))
+                for ((epIndex, group) in noShowEntries.withIndex()) {
+                    val entry = streamEntries.find { it.filePath == group.path } ?: continue
+                    val epData = "ts://${entry.streamUrl}|${entry.fileName}"
+
+                    episodes.add(
+                        newEpisode(epData) {
+                            name = entry.fileName
+                            season = seasonNum
+                            episode = epIndex + 1
+                            this.posterUrl = absPosterUrl
+                        }
+                    )
+                }
+            }
+
+            Log.d(TAG, "buildEpisodes: MULTI-SHOW → ${episodes.size} episodes in ${seasonNamesList.size} seasons")
+        } else {
+            // SINGLE-SHOW: all files in season 1
+            val showLabel = distinctShows.firstOrNull() ?: ""
+            val sName = if (showLabel.isNotEmpty()) showLabel else "مواسم" // "Seasons"
+            seasonNamesList.add(SeasonData(season = 1, name = sName))
+
+            for ((epIndex, entry) in streamEntries.withIndex()) {
+                val epData = "ts://${entry.streamUrl}|${entry.fileName}"
+                episodes.add(
+                    newEpisode(epData) {
+                        name = entry.fileName
+                        season = 1
+                        episode = epIndex + 1
+                        this.posterUrl = absPosterUrl
+                    }
+                )
+            }
+
+            Log.d(TAG, "buildEpisodes: SINGLE-SHOW → ${episodes.size} episodes")
+        }
+
+        return Pair(episodes, seasonNamesList)
+    }
+
     // ==================== LOAD (Detail Page) ====================
-    //
-    // Two entry paths:
-    //
-    // 1. Anime listing URL (no "|"): Shows the anime page with a list of
-    //    available torrents. Each torrent row becomes ONE Episode.
-    //    No pre-resolve here — it would be too slow/wasteful for multiple
-    //    torrents on one page. The user clicks an episode, then loadLinks()
-    //    resolves the torrent and returns stream links.
-    //
-    // 2. Pipe-delimited data (contains "|"): Comes from search results.
-    //    Routes to loadFromTorrentData() which pre-resolves the single
-    //    torrent via TorrServe to detect multi-show structure and create
-    //    proper per-file episodes.
 
     override suspend fun load(url: String): LoadResponse? {
         if (url.contains("|")) return loadFromTorrentData(url)
@@ -399,8 +573,10 @@ class Arabp : MainAPI() {
             val absPosterUrl = toAbsoluteUrl(posterUrl)
             val rows = doc.select("table#listing_table tr")
             val episodes = mutableListOf<Episode>()
+            val seasonNamesList = mutableListOf<SeasonData>()
+            var globalSeasonNum = 1
 
-            for ((rowIndex, row) in rows.withIndex()) {
+            for (row in rows) {
                 val nameLink = row.selectFirst("a[href*=torrent-details]") ?: continue
                 val epName = cleanTitleText(nameLink.text())
                 val detailHref = nameLink.attr("href")
@@ -419,19 +595,76 @@ class Arabp : MainAPI() {
                     if (seeders.isNotEmpty()) append(" | ▲$seeders")
                 }
 
-                // NO pre-resolve here — each torrent row becomes one Episode.
-                // loadLinks() will resolve the torrent when the user clicks play.
-                // This is fast, doesn't waste daily downloads, and avoids
-                // the "all episodes as sources" problem.
-                val epData = "$torrentId|${toAbsoluteUrl(detailHref)}|${toAbsoluteUrl(downloadHref)}||${if (isFree) "1" else "0"}|0"
-                episodes.add(
-                    newEpisode(epData) {
-                        name = displayName
-                        season = 1
-                        episode = rowIndex + 1
-                        this.posterUrl = absPosterUrl
-                    }
+                // Try to pre-resolve via TorrServe to detect multi-show torrents
+                val streamEntries = tryResolveTorrent(
+                    torrentId, toAbsoluteUrl(detailHref), toAbsoluteUrl(downloadHref), isFree
                 )
+
+                if (streamEntries == null || streamEntries.isEmpty()) {
+                    // Pre-resolve failed — fall back to legacy data (one episode = one torrent)
+                    val epData = "$torrentId|${toAbsoluteUrl(detailHref)}|${toAbsoluteUrl(downloadHref)}||${if (isFree) "1" else "0"}|0"
+                    seasonNamesList.add(SeasonData(season = globalSeasonNum, name = displayName))
+                    episodes.add(
+                        newEpisode(epData) {
+                            name = displayName
+                            season = globalSeasonNum
+                            episode = 1
+                            this.posterUrl = absPosterUrl
+                        }
+                    )
+                    globalSeasonNum++
+                    continue
+                }
+
+                // Pre-resolve succeeded — build per-file episodes
+                if (streamEntries.size == 1) {
+                    // Single file → one episode in its own season
+                    val entry = streamEntries.first()
+                    val epData = "ts://${entry.streamUrl}|${entry.fileName}"
+                    seasonNamesList.add(SeasonData(season = globalSeasonNum, name = displayName))
+                    episodes.add(
+                        newEpisode(epData) {
+                            name = displayName
+                            season = globalSeasonNum
+                            episode = 1
+                            this.posterUrl = absPosterUrl
+                        }
+                    )
+                    globalSeasonNum++
+                } else {
+                    // Multiple files — use smart grouping for seasons
+                    val (fileEpisodes, fileSeasonNames) = buildEpisodesFromEntries(streamEntries, absPosterUrl)
+
+                    // Build a lookup map from the SeasonData list for easy access
+                    val fileSeasonMap = fileSeasonNames.associate { it.season to (it.name ?: "") }
+
+                    // Add one SeasonData per unique remapped season (not per episode!)
+                    for ((localSeason, showName) in fileSeasonMap) {
+                        val remappedSeason = globalSeasonNum + localSeason - 1
+                        val seasonDisplay = if (fileSeasonMap.size > 1) {
+                            "$displayName — $showName"
+                        } else {
+                            displayName
+                        }
+                        seasonNamesList.add(SeasonData(season = remappedSeason, name = seasonDisplay))
+                    }
+
+                    // Remap season numbers in episodes to our global numbering
+                    for (ep in fileEpisodes) {
+                        val localSeason = ep.season ?: 1
+                        val remappedSeason = globalSeasonNum + localSeason - 1
+
+                        episodes.add(
+                            newEpisode(ep.data ?: "") {
+                                name = ep.name ?: ""
+                                season = remappedSeason
+                                episode = ep.episode
+                                this.posterUrl = absPosterUrl
+                            }
+                        )
+                    }
+                    globalSeasonNum += fileSeasonMap.size
+                }
             }
 
             if (episodes.isEmpty()) {
@@ -443,6 +676,7 @@ class Arabp : MainAPI() {
                 newTvSeriesLoadResponse(title, fullUrl, TvType.Anime, episodes) {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
+                    this.seasonNames = seasonNamesList
                 }
             }
         } catch (e: Exception) {
@@ -459,11 +693,10 @@ class Arabp : MainAPI() {
     //
     // Strategy:
     // - Pre-resolve the torrent (download .torrent → upload to TorrServe)
-    // - If torrent has MULTIPLE shows (multiple top-level folders):
-    //   Each folder becomes a SEASON. User picks a season (show) first,
-    //   then sees only that show's episodes. Each episode has a ts://
-    //   data URL pointing to exactly one video stream.
-    // - If torrent has ONE show (single folder or no folders):
+    // - If torrent has MULTIPLE shows (detected via smart grouping):
+    //   Each show becomes a SEASON with a readable name. User picks a
+    //   season (show) first, then sees only that show's episodes.
+    // - If torrent has ONE show:
     //   Each video file becomes one Episode. All in season 1.
     // - If pre-resolve fails:
     //   Fall back to one episode with legacy data; loadLinks() will
@@ -534,11 +767,6 @@ class Arabp : MainAPI() {
             }
         }
 
-        // === Build TV series from stream entries ===
-        val folderGroups = streamEntries.groupBy { it.folderName }
-        val distinctFolders = folderGroups.keys.filter { it.isNotEmpty() }.sorted()
-        val hasMultipleShows = distinctFolders.size > 1
-
         // Single video file → Movie
         if (streamEntries.size == 1) {
             val entry = streamEntries.first()
@@ -551,73 +779,15 @@ class Arabp : MainAPI() {
             }
         }
 
-        // Multiple video files → TV Series
-        val episodes = mutableListOf<Episode>()
-
-        if (hasMultipleShows) {
-            // MULTI-SHOW: use SEASONS — each folder = one season
-            // CloudStream shows season tabs so user can pick a show first,
-            // then see only that show's episodes.
-            // Each episode has its own ts:// URL → loadLinks() returns ONE source.
-            var seasonNum = 1
-            Log.d(TAG, "loadFromTorrentData: MULTI-SHOW → ${distinctFolders.size} folders")
-
-            for (folder in distinctFolders) {
-                val entries = folderGroups[folder] ?: continue
-                for ((epIndex, entry) in entries.withIndex()) {
-                    val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-                    episodes.add(
-                        newEpisode(epData) {
-                            name = entry.fileName
-                            season = seasonNum
-                            episode = epIndex + 1
-                            this.posterUrl = absPosterUrl
-                        }
-                    )
-                }
-                seasonNum++
-            }
-
-            // Files without a folder → put in next season
-            val otherEntries = folderGroups[""]
-            if (otherEntries != null && otherEntries.isNotEmpty()) {
-                for ((epIndex, entry) in otherEntries.withIndex()) {
-                    val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-                    episodes.add(
-                        newEpisode(epData) {
-                            name = entry.fileName
-                            season = seasonNum
-                            episode = epIndex + 1
-                            this.posterUrl = absPosterUrl
-                        }
-                    )
-                }
-            }
-
-            Log.d(TAG, "loadFromTorrentData: MULTI-SHOW → ${episodes.size} episodes in ${distinctFolders.size}+ seasons")
-        } else {
-            // SINGLE-SHOW (or no folders): each file = one episode
-            for ((epIndex, entry) in streamEntries.withIndex()) {
-                val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-                episodes.add(
-                    newEpisode(epData) {
-                        name = entry.fileName
-                        season = 1
-                        episode = epIndex + 1
-                        this.posterUrl = absPosterUrl
-                    }
-                )
-            }
-
-            Log.d(TAG, "loadFromTorrentData: SINGLE-SHOW → ${episodes.size} episodes")
-        }
+        // Multiple video files → TV Series with smart show grouping
+        val (episodes, seasonNames) = buildEpisodesFromEntries(streamEntries, absPosterUrl)
 
         return newTvSeriesLoadResponse(title, data, TvType.Anime, episodes) {
             this.posterUrl = absPosterUrl
             this.posterHeaders = imageHeaders
+            this.seasonNames = seasonNames
         }
     }
-
 
     /**
      * Try to download and upload the .torrent to TorrServe, returning
@@ -716,8 +886,7 @@ class Arabp : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         // === PRE-RESOLVED STREAM: direct link from load() ===
-        // This is the key fix: each episode has its own ts:// URL,
-        // so the user sees ONE source (not all episodes mixed together).
+        // Each episode has its own ts:// URL, so the user sees ONE source.
         if (data.startsWith("ts://")) {
             val afterPrefix = data.substringAfter("ts://")
             val pipeIndex = afterPrefix.indexOf('|')
@@ -821,18 +990,19 @@ class Arabp : MainAPI() {
                             Log.d(TAG, "Downloaded .torrent: ${result.bytes.size} bytes, uploading to TorrServe...")
                             val streamEntries = uploadToTorrServe(result.bytes, torrentId)
                             if (streamEntries != null && streamEntries.isNotEmpty()) {
-                                // Detect multi-folder torrents for better naming
-                                val folderGroups = streamEntries.groupBy { it.folderName }
-                                val distinctFolders = folderGroups.keys.filter { it.isNotEmpty() }
-                                val hasMultipleFolders = distinctFolders.size > 1
+                                // Use smart grouping for better naming
+                                val groups = computeShowGroups(streamEntries)
+                                val distinctShows = groups.map { it.showName }.filter { it.isNotEmpty() }.distinct()
+                                val isMultiShow = distinctShows.size > 1
 
-                                for ((index, entry) in streamEntries.withIndex()) {
+                                for (entry in streamEntries) {
+                                    val group = groups.find { it.path == entry.filePath }
                                     val linkName = when {
                                         streamEntries.size == 1 -> "${this.name} (TorrServe)"
-                                        hasMultipleFolders && entry.folderName.isNotEmpty() -> "[${entry.folderName}] ${entry.fileName}"
+                                        isMultiShow && group != null && group.showName.isNotEmpty() -> "[${group.showName}] ${entry.fileName}"
                                         else -> entry.fileName
                                     }
-                                    Log.d(TAG, "TorrServe link [$index]: ${entry.fileName} → ${entry.streamUrl} (folder: ${entry.folderName})")
+                                    Log.d(TAG, "TorrServe link: ${entry.fileName} → ${entry.streamUrl} (show: ${group?.showName})")
                                     callback(
                                         newExtractorLink(
                                             source = this.name,
@@ -938,19 +1108,13 @@ class Arabp : MainAPI() {
     data class TorrServeStreamEntry(
         val fileName: String,      // Just the filename (e.g. "Episode01.mkv")
         val filePath: String,      // Full path within torrent (e.g. "ShowName/Episode01.mkv")
-        val folderName: String,    // Parent folder / show name (e.g. "ShowName"), empty if in root
+        val folderName: String,    // Legacy: first folder component (for backward compat)
         val fileIndex: Int,        // TorrServe file index (1-based)
         val streamUrl: String      // Full stream URL with correct index
     )
 
     /**
      * Upload .torrent to TorrServe, then poll for file list.
-     *
-     * Flow:
-     * 1. POST /torrent/upload with .torrent file → get hash
-     * 2. Try to parse file_stats from upload response
-     * 3. If empty, poll POST /torrents {"action":"get","hash":...} with retries
-     * 4. Filter to video files, group by folder, return stream entries
      */
     private fun uploadToTorrServe(torrentBytes: ByteArray, torrentId: String): List<TorrServeStreamEntry>? {
         return try {
@@ -1015,7 +1179,7 @@ class Arabp : MainAPI() {
                 )
             }
 
-            // Filter to only video files and create stream entries with folder info
+            // Filter to only video files and create stream entries
             val videoEntries = fileStats
                 .filter { (path, _) -> isVideoFile(path) }
                 .map { (path, id) ->
@@ -1048,8 +1212,8 @@ class Arabp : MainAPI() {
                     )
                 )
             } else {
-                // Sort: by folder name, then by filename within each folder
-                videoEntries.sortedWith(compareBy({ it.folderName }, { it.fileName }))
+                // Sort: by full path for consistent ordering
+                videoEntries.sortedBy { it.filePath }
             }
         } catch (e: java.net.ConnectException) {
             Log.e(TAG, "TorrServe connection refused — is TorrServe running on $TORRSERVE_HOST?")
@@ -1062,9 +1226,6 @@ class Arabp : MainAPI() {
 
     /**
      * Poll TorrServe's POST /torrents API to get file_stats.
-     * The torrent may need time to resolve its metadata (stat=1 → stat=3).
-     *
-     * Returns list of (path, id) pairs, or empty list if polling fails.
      */
     private fun pollTorrServeFileList(hash: String): List<Pair<String, Int>> {
         for (attempt in 1..TORRSERVE_POLL_ATTEMPTS) {
@@ -1117,11 +1278,8 @@ class Arabp : MainAPI() {
     private fun parseHashFromResponse(body: String): String? {
         return try {
             val json = JSONObject(body)
-            // Try "hash" first (direct field)
             json.optString("hash", null)
-                // Then try "data.hash" (nested)
                 ?: json.optJSONObject("data")?.optString("hash", null)
-                // Then try result hash from the first torrent in a list
                 ?: run {
                     val dataArr = json.optJSONArray("data")
                     if (dataArr != null && dataArr.length() > 0) {
@@ -1138,13 +1296,11 @@ class Arabp : MainAPI() {
         val stats = mutableListOf<Pair<String, Int>>()
         try {
             val json = JSONObject(body)
-            // Try top-level file_stats array
             val fileStatsArr = json.optJSONArray("file_stats")
             if (fileStatsArr != null) {
                 parseFileStatsArray(fileStatsArr, stats)
                 if (stats.isNotEmpty()) return stats
             }
-            // Try nested in "data"
             val dataObj = json.optJSONObject("data")
             if (dataObj != null) {
                 val innerStats = dataObj.optJSONArray("file_stats")
@@ -1153,7 +1309,6 @@ class Arabp : MainAPI() {
                     if (stats.isNotEmpty()) return stats
                 }
             }
-            // Try data as array
             val dataArr = json.optJSONArray("data")
             if (dataArr != null && dataArr.length() > 0) {
                 val firstObj = dataArr.getJSONObject(0)
@@ -1186,7 +1341,6 @@ class Arabp : MainAPI() {
             try {
                 val item = arr.getJSONObject(i)
                 val id = item.optInt("id", i + 1)
-                // Try different path field names
                 val path = item.optString("path", "")
                     .ifEmpty { item.optString("name", "") }
                     .ifEmpty { item.optString("file", "") }
@@ -1206,13 +1360,10 @@ class Arabp : MainAPI() {
     }
 
     /**
-     * Extract the top-level folder name from a file path within the torrent.
-     * For multi-show torrents, this is the show name.
-     *
-     * Examples:
-     *   "ShowName/Season01/Episode01.mkv" → "ShowName"
-     *   "ShowName/Episode01.mkv" → "ShowName"
-     *   "Episode01.mkv" → "" (no folder, root level)
+     * Extract the first folder name from a path.
+     * NOTE: This is used for the TorrServeStreamEntry.folderName field
+     * for backward compatibility, but the ACTUAL multi-show detection
+     * uses computeShowGroups() which handles nested folders correctly.
      */
     private fun extractFolderName(normalizedPath: String): String {
         val parts = normalizedPath.split("/")
