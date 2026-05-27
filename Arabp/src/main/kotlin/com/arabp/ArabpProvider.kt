@@ -13,6 +13,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.json.JSONArray
 import org.json.JSONObject
@@ -242,6 +243,48 @@ class Arabp : MainAPI() {
         }
     }
 
+    // ==================== AUTH-AWARE DOCUMENT FETCHING ====================
+
+    /**
+     * Whether a page URL requires authentication to view its content.
+     * Anime listing is public; tv-listing and movies-listing require login.
+     */
+    private fun requiresAuth(url: String): Boolean {
+        return url.contains("tv-listing") || url.contains("movies-listing")
+    }
+
+    /**
+     * Fetch an HTML document using authenticated OkHttp + Jsoup.
+     * Used for pages that require login (tv-listing, movies-listing).
+     */
+    private fun fetchDocWithAuth(url: String): Document? {
+        if (!ensureLogin()) return null
+        return try {
+            val request = Request.Builder()
+                .url(url)
+                .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
+                .build()
+            authClient.newCall(request).execute().use { response ->
+                val body = response.body?.string() ?: return null
+                Jsoup.parse(body, url)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchDocWithAuth error for $url: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Fetch a document with auth if needed, otherwise use CloudStream's app.get().
+     */
+    private suspend fun fetchDoc(url: String): Document? {
+        return if (requiresAuth(url)) {
+            fetchDocWithAuth(url)
+        } else {
+            app.get(url).document
+        }
+    }
+
     // ==================== HOME PAGE ====================
 
     override val mainPage = mainPageOf(
@@ -252,7 +295,7 @@ class Arabp : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val url = if (page > 1) "${request.data}&pages=$page" else request.data
-        val doc = app.get(url).document
+        val doc = fetchDoc(url) ?: return newHomePageResponse(mutableListOf())
         val homeSets = mutableListOf<HomePageList>()
 
         try {
@@ -305,7 +348,7 @@ class Arabp : MainAPI() {
         val encoded = URLEncoder.encode(query, "UTF-8")
         val results = mutableListOf<SearchResponse>()
 
-        // Source 1: PUBLIC listings (anime, tv, movies)
+        // Source 1: LISTINGS (anime=public, tv/movies=require auth)
         val listingPages = listOf(
             Triple("$mainUrl/index.php?page=anime-listing&search=$encoded", "anime", TvType.Anime),
             Triple("$mainUrl/index.php?page=tv-listing&search=$encoded", "tv", TvType.TvSeries),
@@ -314,8 +357,8 @@ class Arabp : MainAPI() {
 
         for ((listingUrl, label, tvType) in listingPages) {
             try {
-                val doc = app.get(listingUrl).document
-                val listingResults = doc.select("div.listing_div1").mapNotNull { toSearchResult(it, tvType) }
+                val doc = fetchDoc(listingUrl)
+                val listingResults = doc?.select("div.listing_div1")?.mapNotNull { toSearchResult(it, tvType) } ?: emptyList()
                 Log.d(TAG, "$label listing search: found ${listingResults.size} results")
                 results.addAll(listingResults)
             } catch (e: Exception) {
@@ -453,7 +496,7 @@ class Arabp : MainAPI() {
         if (url.contains("|")) return loadFromTorrentData(url)
 
         val fullUrl = toAbsoluteUrl(url)
-        val doc = app.get(fullUrl).document
+        val doc = fetchDoc(fullUrl) ?: return null
 
         return try {
             val h1 = doc.selectFirst("div.listing_div_id h1")
