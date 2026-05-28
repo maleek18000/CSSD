@@ -238,7 +238,8 @@ class Arabp : MainAPI() {
                 this.posterHeaders = posterHeaders
             }
             else -> newAnimeSearchResponse(title, url, tvType) {
-                this.addPoster(posterUrl, headers = posterHeaders)
+                this.posterUrl = posterUrl
+                this.posterHeaders = posterHeaders
             }
         }
     }
@@ -502,8 +503,7 @@ class Arabp : MainAPI() {
      * Returns Pair<episodes, seasonNames> where seasonNames is a List<SeasonData>.
      */
     private fun buildEpisodesFromEntries(
-        entries: List<TorrServeStreamEntry>,
-        posterUrl: String
+        entries: List<TorrServeStreamEntry>
     ): Pair<List<Episode>, List<SeasonData>> {
         val sortedEntries = entries.sortedBy { naturalSortKey(it.fileName) }
         val folderGroups = sortedEntries.groupBy { it.folderName }
@@ -529,12 +529,11 @@ class Arabp : MainAPI() {
                 for ((epIndex, entry) in folderEntries.withIndex()) {
                     val epData = "ts://${entry.streamUrl}|${entry.fileName}"
                     episodes.add(
-                        newEpisode(epData, fix = false, initializer = {
+                        newEpisode(epData) {
                             name = entry.fileName
                             season = seasonNum
                             episode = epIndex + 1
-                            this.posterUrl = posterUrl
-                        })
+                        }
                     )
                 }
             }
@@ -550,12 +549,11 @@ class Arabp : MainAPI() {
                 for ((epIndex, entry) in otherEntries.withIndex()) {
                     val epData = "ts://${entry.streamUrl}|${entry.fileName}"
                     episodes.add(
-                        newEpisode(epData, fix = false, initializer = {
+                        newEpisode(epData) {
                             name = entry.fileName
                             season = otherSeasonNum
                             episode = epIndex + 1
-                            this.posterUrl = posterUrl
-                        })
+                        }
                     )
                 }
             }
@@ -568,12 +566,11 @@ class Arabp : MainAPI() {
             for ((epIndex, entry) in folderEntries.withIndex()) {
                 val epData = "ts://${entry.streamUrl}|${entry.fileName}"
                 episodes.add(
-                    newEpisode(epData, fix = false, initializer = {
+                    newEpisode(epData) {
                         name = entry.fileName
                         season = 1
                         episode = epIndex + 1
-                        this.posterUrl = posterUrl
-                    })
+                    }
                 )
             }
 
@@ -583,12 +580,11 @@ class Arabp : MainAPI() {
                 for ((epIndex, entry) in rootEntries.withIndex()) {
                     val epData = "ts://${entry.streamUrl}|${entry.fileName}"
                     episodes.add(
-                        newEpisode(epData, fix = false, initializer = {
+                        newEpisode(epData) {
                             name = entry.fileName
                             season = 1
                             episode = folderEntries.size + epIndex + 1
-                            this.posterUrl = posterUrl
-                        })
+                        }
                     )
                 }
             }
@@ -598,12 +594,11 @@ class Arabp : MainAPI() {
             for ((epIndex, entry) in sortedEntries.withIndex()) {
                 val epData = "ts://${entry.streamUrl}|${entry.fileName}"
                 episodes.add(
-                    newEpisode(epData, fix = false, initializer = {
+                    newEpisode(epData) {
                         name = entry.fileName
                         season = 1
                         episode = epIndex + 1
-                        this.posterUrl = posterUrl
-                    })
+                    }
                 )
             }
         }
@@ -666,10 +661,9 @@ class Arabp : MainAPI() {
                     // Pre-resolve failed — fall back to legacy data
                     val epData = "$torrentId|${toAbsoluteUrl(detailHref)}|${toAbsoluteUrl(downloadHref)}||${if (isFree) "1" else "0"}|0"
                     allEpisodes.add(
-                        newEpisode(epData, fix = false, initializer = {
+                        newEpisode(epData) {
                             name = displayName
-                            this.posterUrl = absPosterUrl
-                        })
+                        }
                     )
                     continue
                 }
@@ -679,14 +673,13 @@ class Arabp : MainAPI() {
                     val entry = streamEntries.first()
                     val epData = "ts://${entry.streamUrl}|${entry.fileName}"
                     allEpisodes.add(
-                        newEpisode(epData, fix = false, initializer = {
+                        newEpisode(epData) {
                             name = displayName
-                            this.posterUrl = absPosterUrl
-                        })
+                        }
                     )
                 } else {
                     // Multiple files → use buildEpisodesFromEntries with seasons
-                    val (eps, seasonNames) = buildEpisodesFromEntries(streamEntries, absPosterUrl)
+                    val (eps, seasonNames) = buildEpisodesFromEntries(streamEntries)
 
                     // Offset season numbers so they don't collide with previous torrents
                     val seasonOffset = allSeasonNames.size
@@ -694,12 +687,11 @@ class Arabp : MainAPI() {
                         val origSeason = ep.season ?: 1
                         val newSeason = seasonOffset + origSeason
                         allEpisodes.add(
-                            newEpisode(ep.data ?: "", fix = false, initializer = {
+                            newEpisode(ep.data ?: "") {
                                 name = ep.name
                                 season = newSeason
                                 episode = ep.episode
-                                this.posterUrl = ep.posterUrl ?: absPosterUrl
-                            })
+                            }
                         )
                     }
                     // Add season names with offset
@@ -823,7 +815,7 @@ class Arabp : MainAPI() {
         }
 
         // Multiple video files → TV Series with seasons (using buildEpisodesFromEntries)
-        val (episodes, seasonData) = buildEpisodesFromEntries(sortedEntries, absPosterUrl)
+        val (episodes, seasonData) = buildEpisodesFromEntries(sortedEntries)
 
         Log.d(TAG, "loadFromTorrentData: ${episodes.size} episodes, ${seasonData.size} seasons")
         for (sd in seasonData) {
@@ -939,8 +931,17 @@ class Arabp : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         // === PRE-RESOLVED FOLDER: show with multiple episodes ===
-        if (data.startsWith("tsfolder://")) {
-            val afterPrefix = data.substringAfter("tsfolder://")
+        // Handle both clean "tsfolder://..." and fixUrl-corrupted versions
+        val folderData = if (data.startsWith("tsfolder://")) {
+            data
+        } else if (data.contains("tsfolder://")) {
+            data.substring(data.indexOf("tsfolder://"))
+        } else {
+            null
+        }
+
+        if (folderData != null) {
+            val afterPrefix = folderData.substringAfter("tsfolder://")
             // Format: FOLDER_NAME|FILE_COUNT|ts://URL1|FILE1;;ts://URL2|FILE2;;...
             val firstPipe = afterPrefix.indexOf('|')
             if (firstPipe < 0) return false
@@ -976,8 +977,18 @@ class Arabp : MainAPI() {
         }
 
         // === PRE-RESOLVED STREAM: single direct link from load() ===
-        if (data.startsWith("ts://")) {
-            val afterPrefix = data.substringAfter("ts://")
+        // Handle both clean "ts://..." and fixUrl-corrupted "https://www.arabp2p.net/ts://..."
+        val tsData = if (data.startsWith("ts://")) {
+            data
+        } else if (data.contains("ts://")) {
+            // fixUrl may have prepended mainUrl, extract the ts:// part
+            data.substring(data.indexOf("ts://"))
+        } else {
+            null
+        }
+
+        if (tsData != null) {
+            val afterPrefix = tsData.substringAfter("ts://")
             val pipeIndex = afterPrefix.indexOf('|')
             val streamUrl = if (pipeIndex >= 0) afterPrefix.substring(0, pipeIndex) else afterPrefix
             val fileName = if (pipeIndex >= 0) afterPrefix.substring(pipeIndex + 1) else "Video"
