@@ -490,6 +490,127 @@ class Arabp : MainAPI() {
         }.lowercase()
     }
 
+    // ==================== BUILD EPISODES FROM STREAM ENTRIES ====================
+
+    /**
+     * Build episodes and season data from a list of TorrServe stream entries.
+     *
+     * For multi-show torrents (multiple folders), each folder becomes a season
+     * with the folder name as the season name. Episodes are naturally sorted
+     * within each season so Episode 1 appears first.
+     *
+     * Returns Pair<episodes, seasonNames> where seasonNames is a List<SeasonData>.
+     */
+    private fun buildEpisodesFromEntries(
+        entries: List<TorrServeStreamEntry>,
+        posterUrl: String
+    ): Pair<List<Episode>, List<SeasonData>> {
+        val sortedEntries = entries.sortedBy { naturalSortKey(it.fileName) }
+        val folderGroups = sortedEntries.groupBy { it.folderName }
+        val distinctFolders = folderGroups.keys.filter { it.isNotEmpty() }.sortedBy { naturalSortKey(it) }
+
+        val episodes = mutableListOf<Episode>()
+        val seasonNamesList = mutableListOf<SeasonData>()
+        val addedSeasons = mutableSetOf<Int>()
+
+        if (distinctFolders.size > 1) {
+            // MULTI-SHOW: each folder = one season
+            for ((folderIndex, folder) in distinctFolders.withIndex()) {
+                val seasonNum = folderIndex + 1
+                val folderEntries = folderGroups[folder] ?: continue
+
+                // Add season name (only once per season)
+                if (!addedSeasons.contains(seasonNum)) {
+                    seasonNamesList.add(SeasonData(seasonNum, folder))
+                    addedSeasons.add(seasonNum)
+                }
+
+                // Create one episode per file in this folder
+                for ((epIndex, entry) in folderEntries.withIndex()) {
+                    val epData = "ts://${entry.streamUrl}|${entry.fileName}"
+                    episodes.add(
+                        newEpisode(epData, fix = false, initializer = {
+                            name = entry.fileName
+                            season = seasonNum
+                            episode = epIndex + 1
+                            this.posterUrl = posterUrl
+                        })
+                    )
+                }
+            }
+
+            // Files without a folder → "Other" season
+            val otherEntries = folderGroups[""]
+            if (otherEntries != null && otherEntries.isNotEmpty()) {
+                val otherSeasonNum = distinctFolders.size + 1
+                if (!addedSeasons.contains(otherSeasonNum)) {
+                    seasonNamesList.add(SeasonData(otherSeasonNum, "أخرى"))
+                    addedSeasons.add(otherSeasonNum)
+                }
+                for ((epIndex, entry) in otherEntries.withIndex()) {
+                    val epData = "ts://${entry.streamUrl}|${entry.fileName}"
+                    episodes.add(
+                        newEpisode(epData, fix = false, initializer = {
+                            name = entry.fileName
+                            season = otherSeasonNum
+                            episode = epIndex + 1
+                            this.posterUrl = posterUrl
+                        })
+                    )
+                }
+            }
+        } else if (distinctFolders.size == 1) {
+            // SINGLE folder: one season named after the folder
+            val folder = distinctFolders.first()
+            val folderEntries = folderGroups[folder] ?: emptyList()
+            seasonNamesList.add(SeasonData(1, folder))
+
+            for ((epIndex, entry) in folderEntries.withIndex()) {
+                val epData = "ts://${entry.streamUrl}|${entry.fileName}"
+                episodes.add(
+                    newEpisode(epData, fix = false, initializer = {
+                        name = entry.fileName
+                        season = 1
+                        episode = epIndex + 1
+                        this.posterUrl = posterUrl
+                    })
+                )
+            }
+
+            // Also handle root-level files if any
+            val rootEntries = folderGroups[""]
+            if (rootEntries != null && rootEntries.isNotEmpty()) {
+                for ((epIndex, entry) in rootEntries.withIndex()) {
+                    val epData = "ts://${entry.streamUrl}|${entry.fileName}"
+                    episodes.add(
+                        newEpisode(epData, fix = false, initializer = {
+                            name = entry.fileName
+                            season = 1
+                            episode = folderEntries.size + epIndex + 1
+                            this.posterUrl = posterUrl
+                        })
+                    )
+                }
+            }
+        } else {
+            // NO folders: all files in root, single season
+            seasonNamesList.add(SeasonData(1, "الموسم 1"))
+            for ((epIndex, entry) in sortedEntries.withIndex()) {
+                val epData = "ts://${entry.streamUrl}|${entry.fileName}"
+                episodes.add(
+                    newEpisode(epData, fix = false, initializer = {
+                        name = entry.fileName
+                        season = 1
+                        episode = epIndex + 1
+                        this.posterUrl = posterUrl
+                    })
+                )
+            }
+        }
+
+        return Pair(episodes, seasonNamesList)
+    }
+
     // ==================== LOAD (Detail Page) ====================
 
     override suspend fun load(url: String): LoadResponse? {
@@ -513,7 +634,9 @@ class Arabp : MainAPI() {
             val pageTvType = tvTypeFromPage(fullUrl)
 
             val rows = doc.select("table#listing_table tr")
-            val episodes = mutableListOf<Episode>()
+            val allEpisodes = mutableListOf<Episode>()
+            val allSeasonNames = mutableListOf<SeasonData>()
+            val addedSeasons = mutableSetOf<Int>()
 
             for (row in rows) {
                 val nameLink = row.selectFirst("a[href*=torrent-details]") ?: continue
@@ -542,7 +665,7 @@ class Arabp : MainAPI() {
                 if (streamEntries == null || streamEntries.isEmpty()) {
                     // Pre-resolve failed — fall back to legacy data
                     val epData = "$torrentId|${toAbsoluteUrl(detailHref)}|${toAbsoluteUrl(downloadHref)}||${if (isFree) "1" else "0"}|0"
-                    episodes.add(
+                    allEpisodes.add(
                         newEpisode(epData, fix = false, initializer = {
                             name = displayName
                             this.posterUrl = absPosterUrl
@@ -551,81 +674,57 @@ class Arabp : MainAPI() {
                     continue
                 }
 
-                // Pre-resolve succeeded — sort entries naturally (Episode 1 first)
-                val sortedEntries = streamEntries.sortedBy { naturalSortKey(it.fileName) }
-
-                val folderGroups = sortedEntries.groupBy { it.folderName }
-                val distinctFolders = folderGroups.keys.filter { it.isNotEmpty() }.sortedBy { naturalSortKey(it) }
-                val hasMultipleShows = distinctFolders.size > 1
-
-                if (sortedEntries.size == 1) {
+                if (streamEntries.size == 1) {
                     // Single file → one episode
-                    val entry = sortedEntries.first()
+                    val entry = streamEntries.first()
                     val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-                    episodes.add(
+                    allEpisodes.add(
                         newEpisode(epData, fix = false, initializer = {
                             name = displayName
                             this.posterUrl = absPosterUrl
                         })
                     )
-                } else if (hasMultipleShows) {
-                    // Multi-show torrent → one Episode per show/folder
-                    for (folder in distinctFolders) {
-                        val entries = folderGroups[folder] ?: continue
-                        val filesEncoded = entries.joinToString(";;") { entry ->
-                            "ts://${entry.streamUrl}|${entry.fileName}"
-                        }
-                        val epData = "tsfolder://$folder|${entries.size}|$filesEncoded"
-                        episodes.add(
-                            newEpisode(epData, fix = false, initializer = {
-                                name = "\uD83D\uDCC1 $folder (${entries.size} حلقات) — $displayName"
-                                season = 1
-                                episode = episodes.size + 1
-                                this.posterUrl = absPosterUrl
-                            })
-                        )
-                    }
-                    // Files without a folder
-                    val otherEntries = folderGroups[""]
-                    if (otherEntries != null && otherEntries.isNotEmpty()) {
-                        val filesEncoded = otherEntries.joinToString(";;") { entry ->
-                            "ts://${entry.streamUrl}|${entry.fileName}"
-                        }
-                        val epData = "tsfolder://أخرى|${otherEntries.size}|$filesEncoded"
-                        episodes.add(
-                            newEpisode(epData, fix = false, initializer = {
-                                name = "\uD83D\uDCC1 أخرى (${otherEntries.size} حلقات) — $displayName"
-                                season = 1
-                                episode = episodes.size + 1
-                                this.posterUrl = absPosterUrl
-                            })
-                        )
-                    }
                 } else {
-                    // Single show with multiple files → one Episode per file (sorted naturally)
-                    for ((epIndex, entry) in sortedEntries.withIndex()) {
-                        val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-                        episodes.add(
-                            newEpisode(epData, fix = false, initializer = {
-                                name = "${entry.fileName} — $displayName"
-                                season = 1
-                                episode = epIndex + 1
-                                this.posterUrl = absPosterUrl
+                    // Multiple files → use buildEpisodesFromEntries with seasons
+                    val (eps, seasonNames) = buildEpisodesFromEntries(streamEntries, absPosterUrl)
+
+                    // Offset season numbers so they don't collide with previous torrents
+                    val seasonOffset = allSeasonNames.size
+                    for (ep in eps) {
+                        val origSeason = ep.season ?: 1
+                        val newSeason = seasonOffset + origSeason
+                        allEpisodes.add(
+                            newEpisode(ep.data ?: "", fix = false, initializer = {
+                                name = ep.name
+                                season = newSeason
+                                episode = ep.episode
+                                this.posterUrl = ep.posterUrl ?: absPosterUrl
                             })
                         )
+                    }
+                    // Add season names with offset
+                    for (sd in seasonNames) {
+                        val newSeasonNum = seasonOffset + sd.season
+                        if (!addedSeasons.contains(newSeasonNum)) {
+                            allSeasonNames.add(SeasonData(newSeasonNum, sd.name))
+                            addedSeasons.add(newSeasonNum)
+                        }
                     }
                 }
             }
 
-            if (episodes.isEmpty()) {
+            if (allEpisodes.isEmpty()) {
                 newMovieLoadResponse(title, fullUrl, pageTvType.toMovieType(), "0|$fullUrl|||0|0") {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
                 }
             } else {
-                newTvSeriesLoadResponse(title, fullUrl, pageTvType.toSeriesType(), episodes) {
+                newTvSeriesLoadResponse(title, fullUrl, pageTvType.toSeriesType(), allEpisodes) {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
+                    if (allSeasonNames.isNotEmpty()) {
+                        this.seasonNames = allSeasonNames
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -641,16 +740,12 @@ class Arabp : MainAPI() {
     // we do it right here in load() so we can create proper episode entries.
     //
     // For MULTI-SHOW torrents (multiple folders), each show/folder
-    // becomes its own Episode. When the user clicks that episode,
-    // loadLinks() shows only that show's video files as links.
-    // This gives a two-level selection:
-    //   Episode list: "📁 Show A (5 حلقات)", "📁 Show B (3 حلقات)"
-    //   Links for Show A: "Episode01.mkv", "Episode02.mkv", ...
+    // becomes its own season in CloudStream's UI, with episodes nested
+    // under each season.
     //
-    // Episode data formats:
-    //   Single file:  ts://STREAM_URL|FILENAME
-    //   Folder/show:  tsfolder://FOLDER_NAME|FILE_COUNT|ts://URL1|FILE1;;ts://URL2|FILE2;;...
-    //   (loadLinks detects the prefix and creates ExtractorLink(s) accordingly)
+    // Episode data format:
+    //   ts://STREAM_URL|FILENAME
+    //   (loadLinks detects the ts:// prefix and creates ExtractorLink)
 
     private suspend fun loadFromTorrentData(data: String): LoadResponse? {
         val parts = data.split("|", limit = 6)
@@ -715,11 +810,6 @@ class Arabp : MainAPI() {
         // Sort entries naturally (Episode 1 first)
         val sortedEntries = streamEntries.sortedBy { naturalSortKey(it.fileName) }
 
-        // === Build TV series from stream entries ===
-        val folderGroups = sortedEntries.groupBy { it.folderName }
-        val distinctFolders = folderGroups.keys.filter { it.isNotEmpty() }.sortedBy { naturalSortKey(it) }
-        val hasMultipleShows = distinctFolders.size > 1
-
         // Single video file → Movie
         if (sortedEntries.size == 1) {
             val entry = sortedEntries.first()
@@ -732,73 +822,17 @@ class Arabp : MainAPI() {
             }
         }
 
-        // Multiple video files → TV Series
-        val episodes = mutableListOf<Episode>()
+        // Multiple video files → TV Series with seasons (using buildEpisodesFromEntries)
+        val (episodes, seasonNames) = buildEpisodesFromEntries(sortedEntries, absPosterUrl)
 
-        if (hasMultipleShows) {
-            // MULTI-SHOW: each folder = one Episode (show)
-            // When the user clicks an episode, loadLinks() shows
-            // only that show's video files as links.
-
-            for ((folderIndex, folder) in distinctFolders.withIndex()) {
-                val entries = folderGroups[folder] ?: continue
-                val fileCount = entries.size
-
-                // Encode all files for this folder into one data string
-                // Format: tsfolder://FOLDER_NAME|FILE_COUNT|ts://URL1|FILE1;;ts://URL2|FILE2;;...
-                val filesEncoded = entries.joinToString(";;") { entry ->
-                    "ts://${entry.streamUrl}|${entry.fileName}"
-                }
-                val epData = "tsfolder://$folder|$fileCount|$filesEncoded"
-
-                episodes.add(
-                    newEpisode(epData, fix = false, initializer = {
-                        name = "\uD83D\uDCC1 $folder ($fileCount حلقات)"
-                        season = 1
-                        episode = folderIndex + 1
-                        this.posterUrl = absPosterUrl
-                    })
-                )
-            }
-
-            // Files without a folder → put in "Other" episode
-            val otherEntries = folderGroups[""]
-            if (otherEntries != null && otherEntries.isNotEmpty()) {
-                val filesEncoded = otherEntries.joinToString(";;") { entry ->
-                    "ts://${entry.streamUrl}|${entry.fileName}"
-                }
-                val epData = "tsfolder://أخرى|${otherEntries.size}|$filesEncoded"
-                episodes.add(
-                    newEpisode(epData, fix = false, initializer = {
-                        name = "\uD83D\uDCC1 أخرى (${otherEntries.size} حلقات)"
-                        season = 1
-                        episode = episodes.size + 1
-                        this.posterUrl = absPosterUrl
-                    })
-                )
-            }
-
-            Log.d(TAG, "loadFromTorrentData: MULTI-SHOW → ${episodes.size} show-episodes (${distinctFolders.size} folders)")
-        } else {
-            // SINGLE-SHOW (or no folders): each file = one episode (sorted naturally)
-            for ((epIndex, entry) in sortedEntries.withIndex()) {
-                val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-                episodes.add(
-                    newEpisode(epData, fix = false, initializer = {
-                        name = entry.fileName
-                        season = 1
-                        episode = epIndex + 1
-                        this.posterUrl = absPosterUrl
-                    })
-                )
-            }
-
-            Log.d(TAG, "loadFromTorrentData: SINGLE-SHOW → ${episodes.size} episodes")
-        }
+        Log.d(TAG, "loadFromTorrentData: ${episodes.size} episodes, ${seasonNames.size} seasons")
 
         return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), episodes) {
             this.posterUrl = absPosterUrl
             this.posterHeaders = imageHeaders
+            if (seasonNames.isNotEmpty()) {
+                this.seasonNames = seasonNames
+            }
         }
     }
 
@@ -877,18 +911,16 @@ class Arabp : MainAPI() {
 
     // ==================== LOAD LINKS ====================
     //
-    // Three data formats handled:
+    // Data formats handled:
     //
-    // 1. Pre-resolved single file (ts://...):
+    // 1. Pre-resolved stream (ts://...):
     //    Format: ts://STREAM_URL|FILENAME
     //    The torrent was already uploaded to TorrServe in load().
     //    We create one ExtractorLink directly.
+    //    This is now used for ALL pre-resolved episodes (including multi-show).
     //
-    // 2. Pre-resolved folder (tsfolder://...):
+    // 2. Legacy folder (tsfolder://...) — DEPRECATED, kept for cached data:
     //    Format: tsfolder://FOLDER_NAME|FILE_COUNT|ts://URL1|FILE1;;ts://URL2|FILE2;;...
-    //    The torrent was already uploaded to TorrServe in load().
-    //    We create one ExtractorLink per video file in this folder (show).
-    //    This is used for multi-show torrents where each show is a separate Episode.
     //
     // 3. Legacy (pipe-delimited):
     //    Format: torrentId|detailUrl|downloadUrl|magnetUrl|isFree|isExternal
