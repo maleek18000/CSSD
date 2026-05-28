@@ -719,13 +719,13 @@ class Arabp : MainAPI() {
                     this.posterHeaders = imageHeaders
                 }
             } else {
-                newTvSeriesLoadResponse(title, fullUrl, pageTvType.toSeriesType(), allEpisodes) {
+                val response = newTvSeriesLoadResponse(title, fullUrl, pageTvType.toSeriesType(), allEpisodes) {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
-                    if (allSeasonNames.isNotEmpty()) {
-                        this.seasonNames = allSeasonNames
-                    }
+                    seasonNames = allSeasonNames.ifEmpty { null }
                 }
+                Log.d(TAG, "load: returning TvSeriesLoadResponse with ${allEpisodes.size} episodes, seasonNames=${allSeasonNames.map { "S${it.season}=${it.name}" }}")
+                response
             }
         } catch (e: Exception) {
             Log.e(TAG, "Load Error: ${e.message}")
@@ -823,17 +823,22 @@ class Arabp : MainAPI() {
         }
 
         // Multiple video files → TV Series with seasons (using buildEpisodesFromEntries)
-        val (episodes, seasonNames) = buildEpisodesFromEntries(sortedEntries, absPosterUrl)
+        val (episodes, seasonData) = buildEpisodesFromEntries(sortedEntries, absPosterUrl)
 
-        Log.d(TAG, "loadFromTorrentData: ${episodes.size} episodes, ${seasonNames.size} seasons")
+        Log.d(TAG, "loadFromTorrentData: ${episodes.size} episodes, ${seasonData.size} seasons")
+        for (sd in seasonData) {
+            Log.d(TAG, "  Season ${sd.season}: ${sd.name}")
+        }
+        for (ep in episodes) {
+            Log.d(TAG, "  S${ep.season}E${ep.episode}: ${ep.name}")
+        }
 
-        return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), episodes) {
+        val response = newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), episodes) {
             this.posterUrl = absPosterUrl
             this.posterHeaders = imageHeaders
-            if (seasonNames.isNotEmpty()) {
-                this.seasonNames = seasonNames
-            }
+            seasonNames = seasonData.ifEmpty { null }
         }
+        return response
     }
 
     /**
