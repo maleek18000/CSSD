@@ -156,12 +156,14 @@ class Arabmagnet : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         if (page > MAX_PAGES) return newHomePageResponse(mutableListOf(), false)
 
-        val url = "${request.data}&p=$page"
+        val url = if (page == 1) request.data else "${request.data}&p=$page"
         return try {
-            val doc = app.get(url).document
-            val items = doc.select("table#torrents > tr").mapNotNull { toSearchResult(it) }
+            val doc = app.get(url, headers = imageHeaders).document
+            // Use "table#torrents tr" NOT "table#torrents > tr" because
+            // browsers insert <tbody> between <table> and <tr>
+            val items = doc.select("table#torrents tr").mapNotNull { toSearchResult(it) }
             Log.d(TAG, "MainPage page $page: found ${items.size} items")
-            newHomePageResponse(request.name, items, items.size >= 20 && page < MAX_PAGES)
+            newHomePageResponse(request.name, items, items.size >= 10 && page < MAX_PAGES)
         } catch (e: Exception) {
             Log.e(TAG, "MainPage Error: ${e.message}")
             newHomePageResponse(mutableListOf(), false)
@@ -172,30 +174,33 @@ class Arabmagnet : MainAPI() {
 
     /**
      * Data format stored in SearchResponse.url and passed to load():
-     *   magnet:URL|TITLE|POSTER_URL|FILE_SIZE|DETAIL_TID
-     * The "magnet:" prefix at the start identifies this as our custom data format.
+     *   magnetUrl|TITLE|POSTER_URL|FILE_SIZE|DETAIL_TID
      */
     private fun toSearchResult(row: Element): SearchResponse? {
         return try {
             // Magnet link (required)
+            // The HTML has: <a href = "magnet:..."> — Jsoup normalizes the spaces
             val magnetEl = row.selectFirst("a[href^=magnet:]") ?: return null
             val magnetUrl = magnetEl.attr("href")
 
-            // Title: prefer dn= from magnet, fall back to link text
+            if (magnetUrl.isBlank() || !magnetUrl.startsWith("magnet:")) return null
+
+            // Title: prefer dn= from magnet URL, fall back to link text
             val title = titleFromMagnet(magnetUrl)
                 ?: stripDownloadPrefix(cleanTitleText(magnetEl.text()))
 
             if (title.isBlank()) return null
 
-            // Poster URL: find the img.posterIcon with image icon src, get parent <a> href
+            // Poster URL: find the img.posterIcon with "211677_image_icon" src,
+            // then get its parent <a> tag's href (the actual poster image URL)
             val posterUrl = row.select("img.posterIcon")
-                .find { it.attr("src").contains("211677_image_icon") }
+                .find { it.attr("src").contains("211677") }
                 ?.parent()?.attr("href") ?: ""
 
             // File size
             val fileSize = row.selectFirst("div.fsize")?.text()?.trim() ?: ""
 
-            // Detail page tid (optional)
+            // Detail page tid (optional, used for reference)
             val detailTid = row.selectFirst("a[href*=tid=]")
                 ?.attr("href")
                 ?.substringAfter("tid=")
@@ -222,31 +227,15 @@ class Arabmagnet : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
 
-        // Use the site's search: POST to index.php with search parameter
+        // Use the site's search
         try {
             val searchUrl = "$mainUrl/index.php?page=torrents&search=${URLEncoder.encode(query, "UTF-8")}&cat_id=ar_anime"
-            val doc = app.get(searchUrl).document
-            val items = doc.select("table#torrents > tr").mapNotNull { toSearchResult(it) }
+            val doc = app.get(searchUrl, headers = imageHeaders).document
+            val items = doc.select("table#torrents tr").mapNotNull { toSearchResult(it) }
             Log.d(TAG, "Search for '$query': found ${items.size} results")
             results.addAll(items)
         } catch (e: Exception) {
             Log.e(TAG, "Search error: ${e.message}")
-        }
-
-        // Also search through our category pages for more results
-        try {
-            for (p in 1..5) {
-                val pageUrl = "$mainUrl/index.php?cat=$CATEGORY_ID&p=$p"
-                val doc = app.get(pageUrl).document
-                val items = doc.select("table#torrents > tr").mapNotNull { row ->
-                    val result = toSearchResult(row)
-                    // Filter to only matching results
-                    if (result != null && result.name.contains(query, ignoreCase = true)) result else null
-                }
-                results.addAll(items)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Category search error: ${e.message}")
         }
 
         return results.distinctBy { it.name }
@@ -261,7 +250,6 @@ class Arabmagnet : MainAPI() {
         val title = parts.getOrNull(1) ?: "Unknown"
         val posterUrl = parts.getOrNull(2) ?: ""
         val fileSize = parts.getOrNull(3) ?: ""
-        val detailTid = parts.getOrNull(4) ?: ""
 
         if (!magnetUrl.startsWith("magnet:")) return null
 
@@ -299,7 +287,6 @@ class Arabmagnet : MainAPI() {
         val addedSeasons = mutableSetOf<Int>()
 
         if (distinctFolders.size > 1) {
-            // Multiple folders → each folder = one season
             for ((folderIndex, folder) in distinctFolders.withIndex()) {
                 val seasonNum = folderIndex + 1
                 val folderEntries = folderGroups[folder] ?: continue
@@ -321,7 +308,6 @@ class Arabmagnet : MainAPI() {
                 }
             }
 
-            // Root-level files → "Other" season
             val otherEntries = folderGroups[""]
             if (otherEntries != null && otherEntries.isNotEmpty()) {
                 val otherSeasonNum = distinctFolders.size + 1
@@ -341,7 +327,6 @@ class Arabmagnet : MainAPI() {
                 }
             }
         } else if (distinctFolders.size == 1) {
-            // Single folder → one season named after the folder
             val folder = distinctFolders.first()
             val folderEntries = folderGroups[folder] ?: emptyList()
             seasonNamesList.add(SeasonData(1, folder))
@@ -357,7 +342,6 @@ class Arabmagnet : MainAPI() {
                 )
             }
 
-            // Root-level files
             val rootEntries = folderGroups[""]
             if (rootEntries != null && rootEntries.isNotEmpty()) {
                 for ((epIndex, entry) in rootEntries.withIndex()) {
@@ -372,7 +356,6 @@ class Arabmagnet : MainAPI() {
                 }
             }
         } else {
-            // No folders → all files in root, single season
             seasonNamesList.add(SeasonData(1, "الموسم 1"))
             for ((epIndex, entry) in sortedEntries.withIndex()) {
                 val epData = "ts://${entry.streamUrl}|${entry.fileName}"
@@ -431,7 +414,6 @@ class Arabmagnet : MainAPI() {
         }
 
         // === FALLBACK: Direct magnet link (TorrServe not available) ===
-        // Data format: magnetUrl|title|posterUrl|fileSize|detailTid
         val magnetUrl = if (data.startsWith("magnet:")) {
             data.substringBefore("|")
         } else if (data.contains("magnet:")) {
@@ -467,13 +449,8 @@ class Arabmagnet : MainAPI() {
         val streamUrl: String
     )
 
-    /**
-     * Try to add a magnet link to TorrServe and resolve its file list.
-     * Returns null if TorrServe is not available or fails.
-     */
     private fun tryResolveMagnet(magnetUrl: String): List<TorrServeStreamEntry>? {
         return try {
-            // Step 1: Add magnet to TorrServe via /torrents API
             val jsonBody = JSONObject().apply {
                 put("action", "add")
                 put("link", magnetUrl)
@@ -504,19 +481,15 @@ class Arabmagnet : MainAPI() {
                     }
 
                 Log.d(TAG, "TorrServe hash: $hash")
-
-                // Try to parse file_stats from the add response
                 fileStats = parseFileStatsFromResponse(responseBody)
                 Log.d(TAG, "Parsed ${fileStats.size} files from add response")
             }
 
-            // Step 2: If file_stats was empty, poll TorrServe until metadata is resolved
             if (fileStats.isEmpty()) {
                 Log.d(TAG, "file_stats empty in add response, polling TorrServe API...")
                 fileStats = pollTorrServeFileList(hash)
             }
 
-            // Step 3: Build stream entries from file stats
             if (fileStats.isEmpty()) {
                 Log.w(TAG, "No file_stats found after polling — falling back to index=1")
                 return listOf(
@@ -530,7 +503,6 @@ class Arabmagnet : MainAPI() {
                 )
             }
 
-            // Filter to only video files and create stream entries
             val videoEntries = fileStats
                 .filter { (path, _) -> isVideoFile(path) }
                 .map { (path, id) ->
@@ -573,10 +545,6 @@ class Arabmagnet : MainAPI() {
         }
     }
 
-    /**
-     * Poll TorrServe's POST /torrents API to get file_stats.
-     * The torrent may need time to resolve its metadata (stat=1 → stat=3).
-     */
     private fun pollTorrServeFileList(hash: String): List<Pair<String, Int>> {
         for (attempt in 1..TORRSERVE_POLL_ATTEMPTS) {
             try {
@@ -607,7 +575,6 @@ class Arabmagnet : MainAPI() {
                         return fileStats
                     }
 
-                    // Check torrent status
                     try {
                         val json = JSONObject(responseBody)
                         val stat = json.optInt("stat", -1)
