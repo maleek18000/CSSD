@@ -174,14 +174,29 @@ class Arabmagnet : MainAPI() {
 
     /**
      * Data format stored in SearchResponse.url and passed to load():
-     *   magnetUrl|TITLE|POSTER_URL|FILE_SIZE|DETAIL_TID
+     *   PAGE_URL|MAGNET_URL|TITLE|POSTER_URL|FILE_SIZE
+     *
+     * IMPORTANT: The URL MUST start with "https://" so CloudStream does not
+     * try to resolve it against mainUrl.  If we put "magnet:" first,
+     * CloudStream resolves it to "https://arab-torrents.com/magnet:..."
+     * which breaks load().
      */
     private fun toSearchResult(row: Element): SearchResponse? {
         return try {
             // Magnet link (required)
-            // The HTML has: <a href = "magnet:..."> — Jsoup normalizes the spaces
             val magnetEl = row.selectFirst("a[href^=magnet:]") ?: return null
-            val magnetUrl = magnetEl.attr("href")
+            var magnetUrl = magnetEl.attr("href")
+
+            // Jsoup may absolutify the href against the page's base URI.
+            // If so, strip the "https://arab-torrents.com/" prefix that was
+            // incorrectly prepended to the magnet: URI.
+            if (magnetUrl.contains("://") && magnetUrl.contains("magnet:")) {
+                val idx = magnetUrl.indexOf("magnet:")
+                if (idx > 0) {
+                    Log.w(TAG, "Stripping base URL from magnet href: ${magnetUrl.take(60)}...")
+                    magnetUrl = magnetUrl.substring(idx)
+                }
+            }
 
             if (magnetUrl.isBlank() || !magnetUrl.startsWith("magnet:")) return null
 
@@ -200,20 +215,27 @@ class Arabmagnet : MainAPI() {
             // File size
             val fileSize = row.selectFirst("div.fsize")?.text()?.trim() ?: ""
 
-            // Detail page tid (optional, used for reference)
-            val detailTid = row.selectFirst("a[href*=tid=]")
-                ?.attr("href")
-                ?.substringAfter("tid=")
-                ?.substringBefore("&")
-                ?.trim() ?: ""
+            // Detail page tid (optional, used as the page URL)
+            val detailHref = row.selectFirst("a[href*=tid=]")
+                ?.attr("href") ?: ""
+
+            // The pageUrl MUST start with https:// so CloudStream does NOT
+            // try to resolve the SearchResponse URL against mainUrl.
+            // If we have a detail link, absolutify it; otherwise use mainUrl.
+            val pageUrl = if (detailHref.isNotBlank()) {
+                toAbsoluteUrl(detailHref)
+            } else {
+                "$mainUrl/"
+            }
 
             // Build display name with size info
             val displayName = if (fileSize.isNotEmpty()) "$title | $fileSize" else title
 
             val tvType = tvTypeFromTitle(title)
 
-            // Encode data: magnetUrl|title|posterUrl|fileSize|detailTid
-            val data = "$magnetUrl|$title|$posterUrl|$fileSize|$detailTid"
+            // Encode data: pageUrl|magnetUrl|title|posterUrl|fileSize
+            // pageUrl starts with https:// — CloudStream leaves it alone
+            val data = "$pageUrl|$magnetUrl|$title|$posterUrl|$fileSize"
 
             buildSearchResponse(displayName, data, tvType, posterUrl, imageHeaders)
         } catch (e: Exception) {
@@ -244,24 +266,38 @@ class Arabmagnet : MainAPI() {
     // ==================== LOAD (Detail Page) ====================
 
     override suspend fun load(url: String): LoadResponse? {
-        // Data format: magnetUrl|title|posterUrl|fileSize|detailTid
+        // Data format: pageUrl|magnetUrl|title|posterUrl|fileSize
+        // The URL may have been absolutified by CloudStream, so handle
+        // both the raw format and the corrupted format.
         val parts = url.split("|", limit = 5)
-        val magnetUrl = parts.getOrNull(0) ?: return null
-        val title = parts.getOrNull(1) ?: "Unknown"
-        val posterUrl = parts.getOrNull(2) ?: ""
-        val fileSize = parts.getOrNull(3) ?: ""
+        val magnetUrl = parts.getOrNull(1) ?: return null
+        val title = parts.getOrNull(2) ?: "Unknown"
+        val posterUrl = parts.getOrNull(3) ?: ""
+        val fileSize = parts.getOrNull(4) ?: ""
 
-        if (!magnetUrl.startsWith("magnet:")) return null
+        // The magnet URL might have been corrupted by CloudStream prepending
+        // mainUrl to it.  Fix it by stripping the base URL prefix.
+        val cleanMagnet = fixMagnetUrl(magnetUrl)
+        if (!cleanMagnet.startsWith("magnet:")) {
+            Log.e(TAG, "load: invalid magnet URL after fix: ${cleanMagnet.take(80)}")
+            return null
+        }
+
+        Log.d(TAG, "load: title='$title', magnet=${cleanMagnet.take(60)}...")
 
         val tvType = tvTypeFromTitle(title)
 
         // Try to resolve via TorrServe to detect multi-file torrents
-        val streamEntries = tryResolveMagnet(magnetUrl)
+        val streamEntries = tryResolveMagnet(cleanMagnet)
+
+        // Build the data string that will be passed to loadLinks()
+        // We use a custom format: "amm|MAGNET_URL" which loadLinks() can parse
+        val magnetData = "amm|$cleanMagnet"
 
         if (streamEntries.isNullOrEmpty()) {
             // TorrServe not available or failed — fall back to movie format with magnet link
             Log.w(TAG, "TorrServe resolve failed for '$title', falling back to direct magnet")
-            return newMovieLoadResponse(title, url, tvType.toMovieType(), url) {
+            return newMovieLoadResponse(title, url, tvType.toMovieType(), magnetData) {
                 this.posterUrl = posterUrl
                 this.posterHeaders = imageHeaders
             }
@@ -378,6 +414,30 @@ class Arabmagnet : MainAPI() {
         }
     }
 
+    // ==================== MAGNET URL FIX ====================
+
+    /**
+     * CloudStream resolves SearchResponse URLs against mainUrl.
+     * If "magnet:?xt=urn:..." was stored, it becomes
+     * "https://arab-torrents.com/magnet:?xt=urn:...".
+     * This function strips the corrupted prefix to recover the real magnet URI.
+     */
+    private fun fixMagnetUrl(url: String): String {
+        // Already a clean magnet link
+        if (url.startsWith("magnet:")) return url
+
+        // CloudStream prepended mainUrl — strip everything before "magnet:"
+        val magnetIdx = url.indexOf("magnet:")
+        if (magnetIdx > 0) {
+            val fixed = url.substring(magnetIdx)
+            Log.d(TAG, "fixMagnetUrl: stripped prefix, ${url.take(50)}... → ${fixed.take(50)}...")
+            return fixed
+        }
+
+        // Not a magnet link at all
+        return url
+    }
+
     // ==================== LOAD LINKS ====================
 
     override suspend fun loadLinks(
@@ -386,6 +446,8 @@ class Arabmagnet : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        Log.d(TAG, "loadLinks: data=${data.take(80)}...")
+
         // === PRE-RESOLVED STREAM (ts://...): from load() with TorrServe ===
         val tsData = if (data.startsWith("ts://")) {
             data
@@ -413,11 +475,29 @@ class Arabmagnet : MainAPI() {
             return true
         }
 
-        // === FALLBACK: Direct magnet link (TorrServe not available) ===
+        // === ARABMAGNET FORMAT (amm|MAGNET_URL): from load() fallback ===
+        if (data.startsWith("amm|")) {
+            val magnetUrl = fixMagnetUrl(data.substringAfter("amm|"))
+            if (magnetUrl.startsWith("magnet:")) {
+                Log.d(TAG, "loadLinks: passing magnet link (amm format)")
+                callback(
+                    newExtractorLink(
+                        source = this.name,
+                        name = "${this.name} (Magnet)",
+                        url = magnetUrl,
+                        type = ExtractorLinkType.MAGNET
+                    )
+                )
+                return true
+            }
+        }
+
+        // === FALLBACK: Direct magnet link in any format ===
         val magnetUrl = if (data.startsWith("magnet:")) {
             data.substringBefore("|")
         } else if (data.contains("magnet:")) {
-            data.substring(data.indexOf("magnet:")).substringBefore("|")
+            val raw = data.substring(data.indexOf("magnet:")).substringBefore("|")
+            fixMagnetUrl(raw)
         } else {
             null
         }
@@ -435,7 +515,7 @@ class Arabmagnet : MainAPI() {
             return true
         }
 
-        Log.e(TAG, "loadLinks: no valid data format found")
+        Log.e(TAG, "loadLinks: no valid data format found in: ${data.take(100)}")
         return false
     }
 
