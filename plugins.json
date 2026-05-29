@@ -818,5 +818,27 @@
     "description": "Requires TorrServe Matrix. Multi-show torrents use seasons: select a season to see that show's episodes.",
     "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/Arabp.cs3",
     "name": "Arabp"
-  }
+  },
+  {
+  "iconUrl": "https://arab-torrents.com/favicon.ico",
+  "apiVersion": 1,
+  "repositoryUrl": "https://github.com/maleek18000/CSSD",
+  "fileSize": 27000,
+  "status": 1,
+  "language": "ar",
+  "authors": [
+    "maleek18000"
+  ],
+  "tvTypes": [
+    "Anime",
+    "TvSeries",
+    "Movie"
+  ],
+  "version": 1,
+  "internalName": "ArabMagnet",
+  "description": "Arabic dubbed anime from arab-torrents.com. Supports TorrServe for direct streaming or magnet link playback.",
+  "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/Arabmagnet.cs3",
+  "name": "ArabMagnet"
+}
 ]
+
