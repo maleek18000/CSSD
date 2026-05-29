@@ -6,15 +6,8 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.SubtitleFile
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.jsoup.nodes.Element
-import org.json.JSONArray
-import org.json.JSONObject
 import java.net.URLEncoder
-import java.util.concurrent.TimeUnit
 
 class Arabmagnet : MainAPI() {
     override var mainUrl = "https://arab-torrents.com"
@@ -27,33 +20,14 @@ class Arabmagnet : MainAPI() {
 
     companion object {
         private const val TAG = "ArabMagnet_Log"
-
-        // Category 100 = Arabic Dubbed Anime Series
         private const val CATEGORY_ID = 100
         private const val MAX_PAGES = 30
-
-        // TorrServe Matrix API — default host:port
-        // Change this if your TorrServe runs on a different address
-        private const val TORRSERVE_HOST = "http://127.0.0.1:8090"
-
-        // How many times to poll TorrServe for file list after adding magnet
-        private const val TORRSERVE_POLL_ATTEMPTS = 10
-        // Delay between polls (ms)
-        private const val TORRSERVE_POLL_DELAY = 2000L
     }
 
     private val imageHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
         "Referer" to "$mainUrl/"
     )
-
-    private val torrServeClient: OkHttpClient by lazy {
-        OkHttpClient.Builder()
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
-            .writeTimeout(30, TimeUnit.SECONDS)
-            .build()
-    }
 
     // ==================== HELPERS ====================
 
@@ -70,17 +44,10 @@ class Arabmagnet : MainAPI() {
         return text.replace("\\n", " ").replace("\n", " ").replace(Regex("\\s+"), " ").trim()
     }
 
-    /**
-     * Strip the "تحميل " prefix that the site prepends to download link text.
-     */
     private fun stripDownloadPrefix(title: String): String {
         return title.removePrefix("تحميل ").removePrefix("تحميل").trim()
     }
 
-    /**
-     * Parse the display name from the magnet link's dn= parameter.
-     * This gives a cleaner title than the link text.
-     */
     private fun titleFromMagnet(magnetUrl: String): String? {
         return try {
             val dnParam = magnetUrl.substringAfter("dn=", "")
@@ -93,14 +60,6 @@ class Arabmagnet : MainAPI() {
         }
     }
 
-    private fun naturalSortKey(str: String): String {
-        return str.replace(Regex("\\d+")) { match ->
-            match.value.padStart(6, '0')
-        }.lowercase()
-    }
-
-    // ==================== TV TYPE HELPERS ====================
-
     private fun tvTypeFromTitle(title: String): TvType {
         return when {
             title.contains("فيلم", ignoreCase = true) || title.contains("Movie", ignoreCase = true) -> TvType.AnimeMovie
@@ -108,43 +67,21 @@ class Arabmagnet : MainAPI() {
         }
     }
 
-    private fun TvType.toSeriesType(): TvType {
-        return when (this) {
-            TvType.Anime, TvType.AnimeMovie, TvType.OVA -> TvType.Anime
-            TvType.Movie -> TvType.TvSeries
-            else -> this
+    /**
+     * CloudStream resolves SearchResponse URLs against mainUrl.
+     * If "magnet:?xt=..." was stored, it becomes
+     * "https://arab-torrents.com/magnet:?xt=..." which is broken.
+     * This function strips the corrupted prefix.
+     */
+    private fun fixMagnetUrl(url: String): String {
+        if (url.startsWith("magnet:")) return url
+        val idx = url.indexOf("magnet:")
+        if (idx > 0) {
+            val fixed = url.substring(idx)
+            Log.d(TAG, "fixMagnetUrl: stripped prefix → ${fixed.take(60)}...")
+            return fixed
         }
-    }
-
-    private fun TvType.toMovieType(): TvType {
-        return when (this) {
-            TvType.Anime, TvType.AnimeMovie, TvType.OVA -> TvType.AnimeMovie
-            TvType.TvSeries -> TvType.Movie
-            else -> this
-        }
-    }
-
-    private fun buildSearchResponse(
-        title: String,
-        url: String,
-        tvType: TvType,
-        posterUrl: String = "",
-        posterHeaders: Map<String, String> = imageHeaders
-    ): SearchResponse {
-        return when (tvType) {
-            TvType.Movie, TvType.AnimeMovie -> newMovieSearchResponse(title, url, tvType) {
-                this.posterUrl = posterUrl
-                this.posterHeaders = posterHeaders
-            }
-            TvType.TvSeries -> newTvSeriesSearchResponse(title, url, tvType) {
-                this.posterUrl = posterUrl
-                this.posterHeaders = posterHeaders
-            }
-            else -> newAnimeSearchResponse(title, url, tvType) {
-                this.posterUrl = posterUrl
-                this.posterHeaders = posterHeaders
-            }
-        }
+        return url
     }
 
     // ==================== HOME PAGE ====================
@@ -159,8 +96,6 @@ class Arabmagnet : MainAPI() {
         val url = if (page == 1) request.data else "${request.data}&p=$page"
         return try {
             val doc = app.get(url, headers = imageHeaders).document
-            // Use "table#torrents tr" NOT "table#torrents > tr" because
-            // browsers insert <tbody> between <table> and <tr>
             val items = doc.select("table#torrents tr").mapNotNull { toSearchResult(it) }
             Log.d(TAG, "MainPage page $page: found ${items.size} items")
             newHomePageResponse(request.name, items, items.size >= 10 && page < MAX_PAGES)
@@ -173,71 +108,46 @@ class Arabmagnet : MainAPI() {
     // ==================== SEARCH RESULT BUILDER ====================
 
     /**
-     * Data format stored in SearchResponse.url and passed to load():
-     *   PAGE_URL|MAGNET_URL|TITLE|POSTER_URL|FILE_SIZE
-     *
-     * IMPORTANT: The URL MUST start with "https://" so CloudStream does not
-     * try to resolve it against mainUrl.  If we put "magnet:" first,
-     * CloudStream resolves it to "https://arab-torrents.com/magnet:..."
-     * which breaks load().
+     * Data format: PAGE_URL|MAGNET_URL|TITLE|POSTER_URL|FILE_SIZE
+     * PAGE_URL starts with https:// so CloudStream doesn't corrupt it.
      */
     private fun toSearchResult(row: Element): SearchResponse? {
         return try {
-            // Magnet link (required)
             val magnetEl = row.selectFirst("a[href^=magnet:]") ?: return null
             var magnetUrl = magnetEl.attr("href")
 
-            // Jsoup may absolutify the href against the page's base URI.
-            // If so, strip the "https://arab-torrents.com/" prefix that was
-            // incorrectly prepended to the magnet: URI.
+            // Jsoup may absolutify the href — strip the base URL if so
             if (magnetUrl.contains("://") && magnetUrl.contains("magnet:")) {
                 val idx = magnetUrl.indexOf("magnet:")
-                if (idx > 0) {
-                    Log.w(TAG, "Stripping base URL from magnet href: ${magnetUrl.take(60)}...")
-                    magnetUrl = magnetUrl.substring(idx)
-                }
+                if (idx > 0) magnetUrl = magnetUrl.substring(idx)
             }
 
             if (magnetUrl.isBlank() || !magnetUrl.startsWith("magnet:")) return null
 
-            // Title: prefer dn= from magnet URL, fall back to link text
             val title = titleFromMagnet(magnetUrl)
                 ?: stripDownloadPrefix(cleanTitleText(magnetEl.text()))
-
             if (title.isBlank()) return null
 
-            // Poster URL: find the img.posterIcon with "211677_image_icon" src,
-            // then get its parent <a> tag's href (the actual poster image URL)
             val posterUrl = row.select("img.posterIcon")
                 .find { it.attr("src").contains("211677") }
                 ?.parent()?.attr("href") ?: ""
 
-            // File size
             val fileSize = row.selectFirst("div.fsize")?.text()?.trim() ?: ""
 
-            // Detail page tid (optional, used as the page URL)
+            // Use detail page link or fallback to mainUrl as the first part
+            // (must start with https:// so CloudStream doesn't resolve against mainUrl)
             val detailHref = row.selectFirst("a[href*=tid=]")
                 ?.attr("href") ?: ""
+            val pageUrl = if (detailHref.isNotBlank()) toAbsoluteUrl(detailHref) else "$mainUrl/"
 
-            // The pageUrl MUST start with https:// so CloudStream does NOT
-            // try to resolve the SearchResponse URL against mainUrl.
-            // If we have a detail link, absolutify it; otherwise use mainUrl.
-            val pageUrl = if (detailHref.isNotBlank()) {
-                toAbsoluteUrl(detailHref)
-            } else {
-                "$mainUrl/"
-            }
-
-            // Build display name with size info
             val displayName = if (fileSize.isNotEmpty()) "$title | $fileSize" else title
-
             val tvType = tvTypeFromTitle(title)
-
-            // Encode data: pageUrl|magnetUrl|title|posterUrl|fileSize
-            // pageUrl starts with https:// — CloudStream leaves it alone
             val data = "$pageUrl|$magnetUrl|$title|$posterUrl|$fileSize"
 
-            buildSearchResponse(displayName, data, tvType, posterUrl, imageHeaders)
+            newAnimeSearchResponse(displayName, data, tvType) {
+                this.posterUrl = posterUrl
+                this.posterHeaders = imageHeaders
+            }
         } catch (e: Exception) {
             Log.e(TAG, "toSearchResult Error: ${e.message}")
             null
@@ -247,195 +157,43 @@ class Arabmagnet : MainAPI() {
     // ==================== SEARCH ====================
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val results = mutableListOf<SearchResponse>()
-
-        // Use the site's search
-        try {
+        return try {
             val searchUrl = "$mainUrl/index.php?page=torrents&search=${URLEncoder.encode(query, "UTF-8")}&cat_id=ar_anime"
             val doc = app.get(searchUrl, headers = imageHeaders).document
-            val items = doc.select("table#torrents tr").mapNotNull { toSearchResult(it) }
-            Log.d(TAG, "Search for '$query': found ${items.size} results")
-            results.addAll(items)
+            doc.select("table#torrents tr").mapNotNull { toSearchResult(it) }
+                .distinctBy { it.name }
         } catch (e: Exception) {
             Log.e(TAG, "Search error: ${e.message}")
+            emptyList()
         }
-
-        return results.distinctBy { it.name }
     }
 
     // ==================== LOAD (Detail Page) ====================
 
     override suspend fun load(url: String): LoadResponse? {
         // Data format: pageUrl|magnetUrl|title|posterUrl|fileSize
-        // The URL may have been absolutified by CloudStream, so handle
-        // both the raw format and the corrupted format.
         val parts = url.split("|", limit = 5)
-        val magnetUrl = parts.getOrNull(1) ?: return null
+        val magnetUrl = fixMagnetUrl(parts.getOrNull(1) ?: return null)
         val title = parts.getOrNull(2) ?: "Unknown"
         val posterUrl = parts.getOrNull(3) ?: ""
         val fileSize = parts.getOrNull(4) ?: ""
 
-        // The magnet URL might have been corrupted by CloudStream prepending
-        // mainUrl to it.  Fix it by stripping the base URL prefix.
-        val cleanMagnet = fixMagnetUrl(magnetUrl)
-        if (!cleanMagnet.startsWith("magnet:")) {
-            Log.e(TAG, "load: invalid magnet URL after fix: ${cleanMagnet.take(80)}")
+        if (!magnetUrl.startsWith("magnet:")) {
+            Log.e(TAG, "load: invalid magnet URL: ${magnetUrl.take(80)}")
             return null
         }
 
-        Log.d(TAG, "load: title='$title', magnet=${cleanMagnet.take(60)}...")
+        Log.d(TAG, "load: title='$title', magnet=${magnetUrl.take(60)}...")
 
         val tvType = tvTypeFromTitle(title)
 
-        // Try to resolve via TorrServe to detect multi-file torrents
-        val streamEntries = tryResolveMagnet(cleanMagnet)
-
-        // Build the data string that will be passed to loadLinks()
-        // We use a custom format: "amm|MAGNET_URL" which loadLinks() can parse
-        val magnetData = "amm|$cleanMagnet"
-
-        if (streamEntries.isNullOrEmpty()) {
-            // TorrServe not available or failed — fall back to movie format with magnet link
-            Log.w(TAG, "TorrServe resolve failed for '$title', falling back to direct magnet")
-            return newMovieLoadResponse(title, url, tvType.toMovieType(), magnetData) {
-                this.posterUrl = posterUrl
-                this.posterHeaders = imageHeaders
-            }
-        }
-
-        if (streamEntries.size == 1) {
-            // Single file → Movie
-            val entry = streamEntries.first()
-            val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-            return newMovieLoadResponse(title, url, tvType.toMovieType(), epData) {
-                this.posterUrl = posterUrl
-                this.posterHeaders = imageHeaders
-            }
-        }
-
-        // Multiple files → TV Series with episodes
-        val sortedEntries = streamEntries.sortedBy { naturalSortKey(it.fileName) }
-        val folderGroups = sortedEntries.groupBy { it.folderName }
-        val distinctFolders = folderGroups.keys.filter { it.isNotEmpty() }.sortedBy { naturalSortKey(it) }
-
-        val episodes = mutableListOf<Episode>()
-        val seasonNamesList = mutableListOf<SeasonData>()
-        val addedSeasons = mutableSetOf<Int>()
-
-        if (distinctFolders.size > 1) {
-            for ((folderIndex, folder) in distinctFolders.withIndex()) {
-                val seasonNum = folderIndex + 1
-                val folderEntries = folderGroups[folder] ?: continue
-
-                if (!addedSeasons.contains(seasonNum)) {
-                    seasonNamesList.add(SeasonData(seasonNum, folder))
-                    addedSeasons.add(seasonNum)
-                }
-
-                for ((epIndex, entry) in folderEntries.withIndex()) {
-                    val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-                    episodes.add(
-                        newEpisode(epData) {
-                            name = entry.fileName
-                            season = seasonNum
-                            episode = epIndex + 1
-                        }
-                    )
-                }
-            }
-
-            val otherEntries = folderGroups[""]
-            if (otherEntries != null && otherEntries.isNotEmpty()) {
-                val otherSeasonNum = distinctFolders.size + 1
-                if (!addedSeasons.contains(otherSeasonNum)) {
-                    seasonNamesList.add(SeasonData(otherSeasonNum, "أخرى"))
-                    addedSeasons.add(otherSeasonNum)
-                }
-                for ((epIndex, entry) in otherEntries.withIndex()) {
-                    val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-                    episodes.add(
-                        newEpisode(epData) {
-                            name = entry.fileName
-                            season = otherSeasonNum
-                            episode = epIndex + 1
-                        }
-                    )
-                }
-            }
-        } else if (distinctFolders.size == 1) {
-            val folder = distinctFolders.first()
-            val folderEntries = folderGroups[folder] ?: emptyList()
-            seasonNamesList.add(SeasonData(1, folder))
-
-            for ((epIndex, entry) in folderEntries.withIndex()) {
-                val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-                episodes.add(
-                    newEpisode(epData) {
-                        name = entry.fileName
-                        season = 1
-                        episode = epIndex + 1
-                    }
-                )
-            }
-
-            val rootEntries = folderGroups[""]
-            if (rootEntries != null && rootEntries.isNotEmpty()) {
-                for ((epIndex, entry) in rootEntries.withIndex()) {
-                    val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-                    episodes.add(
-                        newEpisode(epData) {
-                            name = entry.fileName
-                            season = 1
-                            episode = folderEntries.size + epIndex + 1
-                        }
-                    )
-                }
-            }
-        } else {
-            seasonNamesList.add(SeasonData(1, "الموسم 1"))
-            for ((epIndex, entry) in sortedEntries.withIndex()) {
-                val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-                episodes.add(
-                    newEpisode(epData) {
-                        name = entry.fileName
-                        season = 1
-                        episode = epIndex + 1
-                    }
-                )
-            }
-        }
-
-        Log.d(TAG, "load: ${episodes.size} episodes, ${seasonNamesList.size} seasons for '$title'")
-
-        return newTvSeriesLoadResponse(title, url, tvType.toSeriesType(), episodes) {
+        // Return a Movie-style response so user sees "Play" button.
+        // The magnet link is stored as the data for loadLinks().
+        // CloudStream natively handles magnet links — no TorrServe needed.
+        return newMovieLoadResponse(title, url, tvType, "amm|$magnetUrl") {
             this.posterUrl = posterUrl
             this.posterHeaders = imageHeaders
-            seasonNames = seasonNamesList.ifEmpty { null }
         }
-    }
-
-    // ==================== MAGNET URL FIX ====================
-
-    /**
-     * CloudStream resolves SearchResponse URLs against mainUrl.
-     * If "magnet:?xt=urn:..." was stored, it becomes
-     * "https://arab-torrents.com/magnet:?xt=urn:...".
-     * This function strips the corrupted prefix to recover the real magnet URI.
-     */
-    private fun fixMagnetUrl(url: String): String {
-        // Already a clean magnet link
-        if (url.startsWith("magnet:")) return url
-
-        // CloudStream prepended mainUrl — strip everything before "magnet:"
-        val magnetIdx = url.indexOf("magnet:")
-        if (magnetIdx > 0) {
-            val fixed = url.substring(magnetIdx)
-            Log.d(TAG, "fixMagnetUrl: stripped prefix, ${url.take(50)}... → ${fixed.take(50)}...")
-            return fixed
-        }
-
-        // Not a magnet link at all
-        return url
     }
 
     // ==================== LOAD LINKS ====================
@@ -448,42 +206,15 @@ class Arabmagnet : MainAPI() {
     ): Boolean {
         Log.d(TAG, "loadLinks: data=${data.take(80)}...")
 
-        // === PRE-RESOLVED STREAM (ts://...): from load() with TorrServe ===
-        val tsData = if (data.startsWith("ts://")) {
-            data
-        } else if (data.contains("ts://")) {
-            data.substring(data.indexOf("ts://"))
-        } else {
-            null
-        }
-
-        if (tsData != null) {
-            val afterPrefix = tsData.substringAfter("ts://")
-            val pipeIndex = afterPrefix.indexOf('|')
-            val streamUrl = if (pipeIndex >= 0) afterPrefix.substring(0, pipeIndex) else afterPrefix
-            val fileName = if (pipeIndex >= 0) afterPrefix.substring(pipeIndex + 1) else "Video"
-
-            Log.d(TAG, "loadLinks: pre-resolved stream → $fileName")
-            callback(
-                newExtractorLink(
-                    source = this.name,
-                    name = fileName,
-                    url = streamUrl,
-                    type = ExtractorLinkType.VIDEO
-                )
-            )
-            return true
-        }
-
-        // === ARABMAGNET FORMAT (amm|MAGNET_URL): from load() fallback ===
+        // Format: amm|MAGNET_URL
         if (data.startsWith("amm|")) {
             val magnetUrl = fixMagnetUrl(data.substringAfter("amm|"))
             if (magnetUrl.startsWith("magnet:")) {
-                Log.d(TAG, "loadLinks: passing magnet link (amm format)")
+                Log.d(TAG, "loadLinks: passing magnet link to CloudStream")
                 callback(
                     newExtractorLink(
                         source = this.name,
-                        name = "${this.name} (Magnet)",
+                        name = "${this.name}",
                         url = magnetUrl,
                         type = ExtractorLinkType.MAGNET
                     )
@@ -492,22 +223,20 @@ class Arabmagnet : MainAPI() {
             }
         }
 
-        // === FALLBACK: Direct magnet link in any format ===
+        // Fallback: direct magnet in data
         val magnetUrl = if (data.startsWith("magnet:")) {
-            data.substringBefore("|")
+            data
         } else if (data.contains("magnet:")) {
-            val raw = data.substring(data.indexOf("magnet:")).substringBefore("|")
-            fixMagnetUrl(raw)
+            fixMagnetUrl(data.substring(data.indexOf("magnet:")))
         } else {
             null
         }
 
         if (magnetUrl != null && magnetUrl.startsWith("magnet:")) {
-            Log.d(TAG, "loadLinks: passing magnet link directly")
             callback(
                 newExtractorLink(
                     source = this.name,
-                    name = "${this.name} (Magnet)",
+                    name = this.name,
                     url = magnetUrl,
                     type = ExtractorLinkType.MAGNET
                 )
@@ -515,236 +244,7 @@ class Arabmagnet : MainAPI() {
             return true
         }
 
-        Log.e(TAG, "loadLinks: no valid data format found in: ${data.take(100)}")
+        Log.e(TAG, "loadLinks: no magnet link found in: ${data.take(100)}")
         return false
-    }
-
-    // ==================== TORRSERVE INTEGRATION ====================
-
-    data class TorrServeStreamEntry(
-        val fileName: String,
-        val filePath: String,
-        val folderName: String,
-        val fileIndex: Int,
-        val streamUrl: String
-    )
-
-    private fun tryResolveMagnet(magnetUrl: String): List<TorrServeStreamEntry>? {
-        return try {
-            val jsonBody = JSONObject().apply {
-                put("action", "add")
-                put("link", magnetUrl)
-                put("save", true)
-            }
-
-            val addRequest = Request.Builder()
-                .url("$TORRSERVE_HOST/torrents")
-                .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
-                .build()
-
-            val hash: String
-            var fileStats: List<Pair<String, Int>>
-
-            torrServeClient.newCall(addRequest).execute().use { response ->
-                if (!response.isSuccessful) {
-                    Log.e(TAG, "TorrServe add magnet HTTP error: ${response.code}")
-                    return null
-                }
-
-                val responseBody = response.body?.string() ?: return null
-                Log.d(TAG, "TorrServe add magnet response (${responseBody.length} chars): ${responseBody.take(500)}")
-
-                hash = parseHashFromResponse(responseBody)
-                    ?: run {
-                        Log.e(TAG, "Could not parse hash from TorrServe response")
-                        return null
-                    }
-
-                Log.d(TAG, "TorrServe hash: $hash")
-                fileStats = parseFileStatsFromResponse(responseBody)
-                Log.d(TAG, "Parsed ${fileStats.size} files from add response")
-            }
-
-            if (fileStats.isEmpty()) {
-                Log.d(TAG, "file_stats empty in add response, polling TorrServe API...")
-                fileStats = pollTorrServeFileList(hash)
-            }
-
-            if (fileStats.isEmpty()) {
-                Log.w(TAG, "No file_stats found after polling — falling back to index=1")
-                return listOf(
-                    TorrServeStreamEntry(
-                        fileName = "Video",
-                        filePath = "Video",
-                        folderName = "",
-                        fileIndex = 1,
-                        streamUrl = "$TORRSERVE_HOST/stream/fname?link=$hash&index=1&play"
-                    )
-                )
-            }
-
-            val videoEntries = fileStats
-                .filter { (path, _) -> isVideoFile(path) }
-                .map { (path, id) ->
-                    val normalizedPath = normalizePath(path)
-                    val fileName = normalizedPath.substringAfterLast("/")
-                    val folderName = extractFolderName(normalizedPath)
-
-                    TorrServeStreamEntry(
-                        fileName = fileName,
-                        filePath = normalizedPath,
-                        folderName = folderName,
-                        fileIndex = id,
-                        streamUrl = "$TORRSERVE_HOST/stream/fname?link=$hash&index=$id&play"
-                    )
-                }
-
-            Log.d(TAG, "Created ${videoEntries.size} video stream entries (from ${fileStats.size} total files)")
-
-            if (videoEntries.isEmpty()) {
-                val first = fileStats.first()
-                val normalizedPath = normalizePath(first.first)
-                listOf(
-                    TorrServeStreamEntry(
-                        fileName = normalizedPath.substringAfterLast("/"),
-                        filePath = normalizedPath,
-                        folderName = extractFolderName(normalizedPath),
-                        fileIndex = first.second,
-                        streamUrl = "$TORRSERVE_HOST/stream/fname?link=$hash&index=${first.second}&play"
-                    )
-                )
-            } else {
-                videoEntries.sortedBy { naturalSortKey(it.fileName) }
-            }
-        } catch (e: java.net.ConnectException) {
-            Log.e(TAG, "TorrServe connection refused — is TorrServe running on $TORRSERVE_HOST?")
-            null
-        } catch (e: Exception) {
-            Log.e(TAG, "tryResolveMagnet Error: ${e.message}")
-            null
-        }
-    }
-
-    private fun pollTorrServeFileList(hash: String): List<Pair<String, Int>> {
-        for (attempt in 1..TORRSERVE_POLL_ATTEMPTS) {
-            try {
-                Thread.sleep(TORRSERVE_POLL_DELAY)
-
-                val jsonBody = JSONObject().apply {
-                    put("action", "get")
-                    put("hash", hash)
-                }
-
-                val request = Request.Builder()
-                    .url("$TORRSERVE_HOST/torrents")
-                    .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
-                    .build()
-
-                torrServeClient.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) {
-                        Log.w(TAG, "TorrServe poll attempt $attempt: HTTP ${response.code}")
-                        return@use
-                    }
-
-                    val responseBody = response.body?.string() ?: return@use
-                    Log.d(TAG, "TorrServe poll attempt $attempt: ${responseBody.take(300)}")
-
-                    val fileStats = parseFileStatsFromResponse(responseBody)
-                    if (fileStats.isNotEmpty()) {
-                        Log.d(TAG, "TorrServe poll SUCCESS on attempt $attempt: ${fileStats.size} files")
-                        return fileStats
-                    }
-
-                    try {
-                        val json = JSONObject(responseBody)
-                        val stat = json.optInt("stat", -1)
-                        val statString = json.optString("stat_string", "")
-                        Log.d(TAG, "TorrServe torrent stat=$stat ($statString)")
-
-                        if (stat == 4) {
-                            Log.e(TAG, "TorrServe torrent closed/errored, stopping polls")
-                            return emptyList()
-                        }
-                    } catch (_: Exception) {}
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "TorrServe poll attempt $attempt error: ${e.message}")
-            }
-        }
-
-        Log.w(TAG, "TorrServe polling exhausted after $TORRSERVE_POLL_ATTEMPTS attempts")
-        return emptyList()
-    }
-
-    // ==================== JSON PARSING ====================
-
-    private fun parseHashFromResponse(json: String): String? {
-        return try {
-            val obj = JSONObject(json)
-            val hashValue = obj.optString("hash", "")
-            if (hashValue.isNotEmpty()) hashValue.lowercase() else null
-        } catch (e: Exception) {
-            Log.w(TAG, "JSONObject hash parsing failed, trying regex: ${e.message}")
-            val hashPattern = """"hash"\s*:\s*"([a-fA-F0-9]{40})"""".toRegex()
-            hashPattern.find(json)?.groupValues?.getOrNull(1)?.lowercase()
-        }
-    }
-
-    private fun parseFileStatsFromResponse(json: String): List<Pair<String, Int>> {
-        val results = mutableListOf<Pair<String, Int>>()
-
-        try {
-            val jsonObj = JSONObject(json)
-            parseFileStatsFromObject(jsonObj, results)
-        } catch (_: Exception) {
-            try {
-                val jsonArr = JSONArray(json)
-                for (i in 0 until jsonArr.length()) {
-                    parseFileStatsFromObject(jsonArr.getJSONObject(i), results)
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "parseFileStatsFromResponse: both object and array parsing failed: ${e.message}")
-            }
-        }
-
-        return results
-    }
-
-    private fun parseFileStatsFromObject(obj: JSONObject, results: MutableList<Pair<String, Int>>) {
-        val fileStats = obj.optJSONArray("file_stats") ?: return
-
-        for (i in 0 until fileStats.length()) {
-            try {
-                val fileObj = fileStats.getJSONObject(i)
-                val id = fileObj.optInt("id", -1)
-                val path = fileObj.optString("path", "")
-                if (id > 0 && path.isNotEmpty()) {
-                    results.add(path to id)
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Error parsing file_stats entry $i: ${e.message}")
-            }
-        }
-    }
-
-    // ==================== PATH HELPERS ====================
-
-    private fun normalizePath(path: String): String {
-        return path.replace("\\", "/")
-    }
-
-    private fun extractFolderName(normalizedPath: String): String {
-        val slashIndex = normalizedPath.indexOf('/')
-        return if (slashIndex > 0) normalizedPath.substring(0, slashIndex) else ""
-    }
-
-    private fun isVideoFile(fileName: String): Boolean {
-        val videoExtensions = listOf(
-            ".mkv", ".mp4", ".avi", ".wmv", ".flv", ".mov", ".webm",
-            ".m4v", ".ts", ".mpg", ".mpeg", ".ogv", ".rmvb", ".rm",
-            ".vob", ".m2ts", ".mts", ".3gp", ".divx"
-        )
-        val lower = fileName.lowercase()
-        return videoExtensions.any { lower.endsWith(it) }
     }
 }
