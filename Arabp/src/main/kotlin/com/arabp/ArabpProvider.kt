@@ -295,50 +295,22 @@ class Arabp : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        val tvType = tvTypeFromPage(request.data)
-
-        // Determine how many pages to fetch for each section.
-        // tv-listing has 2 pages, movies-listing has 3 pages, anime has many (use CloudStream pagination).
-        val maxPages = when {
-            request.data.contains("tv-listing") -> 2
-            request.data.contains("movies-listing") -> 3
-            else -> 0 // anime: use CloudStream's built-in pagination (0 = let it paginate naturally)
-        }
-
-        val allItems = mutableListOf<SearchResponse>()
+        val url = if (page > 1) "${request.data}&pages=$page" else request.data
+        val doc = fetchDoc(url) ?: return newHomePageResponse(mutableListOf())
+        val homeSets = mutableListOf<HomePageList>()
 
         try {
-            if (maxPages > 0) {
-                // Fetch ALL pages at once for tv-listing and movies-listing
-                // so the entire catalog appears on the home page.
-                for (pageNum in 1..maxPages) {
-                    val url = if (pageNum > 1) "${request.data}&pages=$pageNum" else request.data
-                    val doc = fetchDoc(url) ?: continue
-                    val items = doc.select("div.listing_div1").mapNotNull { toSearchResult(it, tvType) }
-                    allItems.addAll(items)
-                    Log.d(TAG, "MainPage ${request.name} page $pageNum: found ${items.size} items")
-                }
-                // Return all items at once, no more pages needed
-                val homeSets = mutableListOf<HomePageList>()
-                if (allItems.isNotEmpty()) {
-                    homeSets.add(HomePageList(request.name, allItems))
-                }
-                return newHomePageResponse(homeSets, false)
-            } else {
-                // Anime listing: use CloudStream's normal pagination
-                val url = if (page > 1) "${request.data}&pages=$page" else request.data
-                val doc = fetchDoc(url) ?: return newHomePageResponse(mutableListOf())
-                val items = doc.select("div.listing_div1").mapNotNull { toSearchResult(it, tvType) }
-                val homeSets = mutableListOf<HomePageList>()
-                if (items.isNotEmpty()) {
-                    homeSets.add(HomePageList(request.name, items))
-                }
-                return newHomePageResponse(homeSets, items.isNotEmpty())
+            val tvType = tvTypeFromPage(request.data)
+            val items = doc.select("div.listing_div1").mapNotNull { toSearchResult(it, tvType) }
+            if (items.isNotEmpty()) {
+                homeSets.add(HomePageList(request.name, items))
             }
+            Log.d(TAG, "MainPage ${request.name} page $page: found ${items.size} items")
+            return newHomePageResponse(homeSets, items.isNotEmpty())
         } catch (e: Exception) {
             Log.e(TAG, "MainPage Error: ${e.message}")
         }
-        return newHomePageResponse(mutableListOf())
+        return newHomePageResponse(homeSets)
     }
 
     private fun toSearchResult(element: Element, fallbackTvType: TvType = TvType.Anime): SearchResponse? {
