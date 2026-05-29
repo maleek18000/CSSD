@@ -133,6 +133,7 @@ class Arabp : MainAPI() {
     @Volatile
     private var isLoggedIn = false
 
+    @Synchronized
     private fun ensureLogin(): Boolean {
         if (isLoggedIn) return true
 
@@ -256,14 +257,16 @@ class Arabp : MainAPI() {
 
     /**
      * Fetch an HTML document using authenticated OkHttp + Jsoup.
-     * Used for pages that require login (tv-listing, movies-listing).
+     * Used as fallback when CloudStream's app.get() doesn't work for auth pages.
      */
     private fun fetchDocWithAuth(url: String): Document? {
         if (!ensureLogin()) return null
         return try {
             val request = Request.Builder()
                 .url(url)
-                .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+                .header("Referer", "$mainUrl/")
+                // Note: don't add Cookie header manually — authClient's CookieJar handles it
                 .build()
             authClient.newCall(request).execute().use { response ->
                 val body = response.body?.string() ?: return null
@@ -276,11 +279,44 @@ class Arabp : MainAPI() {
     }
 
     /**
+     * Fetch a document using CloudStream's app.get() with auth cookies.
+     * This is the preferred method for auth-required pages because app.get()
+     * works properly in CloudStream's coroutine context (unlike blocking OkHttp).
+     */
+    private suspend fun fetchDocWithCookies(url: String): Document? {
+        if (!ensureLogin()) return null
+        val cookies = getSessionCookies()
+        if (cookies.isBlank()) {
+            Log.w(TAG, "fetchDocWithCookies: no session cookies available")
+            return null
+        }
+        return try {
+            app.get(url, headers = mapOf(
+                "Cookie" to cookies,
+                "Referer" to "$mainUrl/"
+            )).document
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchDocWithCookies error for $url: ${e.message}")
+            null
+        }
+    }
+
+    /**
      * Fetch a document with auth if needed, otherwise use CloudStream's app.get().
+     * For auth-required pages, tries app.get() with cookies first, then falls
+     * back to OkHttp-based fetchDocWithAuth() if that fails.
      */
     private suspend fun fetchDoc(url: String): Document? {
         return if (requiresAuth(url)) {
-            fetchDocWithAuth(url)
+            // Try app.get() with cookies first (works best in CloudStream coroutine context)
+            val doc = fetchDocWithCookies(url)
+            if (doc != null && doc.select("div.listing_div1").isNotEmpty()) {
+                doc
+            } else {
+                // Fallback: use OkHttp directly
+                Log.d(TAG, "fetchDoc: app.get() with cookies returned no content for $url, trying OkHttp")
+                fetchDocWithAuth(url)
+            }
         } else {
             app.get(url).document
         }
