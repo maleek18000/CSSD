@@ -1069,28 +1069,41 @@ class Arabp : MainAPI() {
                         }
                     }
                     // ===== STOP TRACKER COUNTING =====
-                    // Strategy: Combine multiple approaches to stop arabp2p from
-                    // counting downloads. We try them ALL because TorrServe's API
-                    // alone is unreliable.
+                    // Multi-pronged strategy to stop arabp2p from counting:
                     //
-                    // 1. Wait for the tracker to connect and find peers
-                    // 2. Send event=stopped DIRECTLY to the tracker (bypasses TorrServe)
-                    // 3. Replace trackers with dummy URL in TorrServe
-                    // 4. Pause+resume the torrent (forces re-announce to dummy tracker)
-                    // 5. Start a background reaper that periodically re-sends event=stopped
+                    // A) PRIMARY: Delete torrent + re-add via magnet WITHOUT trackers
+                    //    This completely removes the tracker URL from TorrServe.
+                    //    No tracker = no announce = no counting.
+                    //    The magnet link enables DHT/PEX since the .torrent's
+                    //    private flag isn't loaded when adding via magnet.
+                    //
+                    // B) BACKUP: Send event=stopped directly to the tracker.
+                    //    Uses TorrServe's actual peer_id and port (queried from API).
+                    //
+                    // C) BACKUP: Replace trackers with dummy URL via API.
+                    //
+                    // D) REAPER: Background thread that re-sends event=stopped
+                    //    every 30 seconds for 30 minutes to counter re-announces.
                     Thread.sleep(TRACKER_STRIP_DELAY)
 
                     val originalBytes = torrentBytesCache[hash]
 
-                    // Step 1: Send event=stopped directly to the tracker
-                    // This is the most reliable method — bypasses TorrServe entirely
+                    // First, query TorrServe for the torrent's session properties
+                    // (peer_id, port, tracker URLs, etc.)
+                    val torrentProps = getTorrServeTorrentProps(hash)
+
+                    // === APPROACH B: Send event=stopped directly to the tracker ===
+                    // Do this BEFORE deleting, while the session is still active
                     if (originalBytes != null) {
                         try {
                             val infoHash = computeInfoHash(originalBytes)
                             val announceUrl = extractAnnounceUrl(originalBytes)
                             if (infoHash != null && announceUrl != null) {
-                                Log.d(TAG, "Tracker removal: sending event=stopped to tracker for hash=$hash")
-                                val stopped = sendTrackerStopped(announceUrl, infoHash)
+                                // Use TorrServe's actual peer_id and port if available
+                                val peerId = torrentProps?.peerId
+                                val port = torrentProps?.listenPort ?: 6881
+                                Log.d(TAG, "Tracker removal: sending event=stopped (peerId=$peerId, port=$port)")
+                                val stopped = sendTrackerStopped(announceUrl, infoHash, peerId, port)
                                 Log.d(TAG, "Tracker removal: event=stopped result=$stopped")
                             } else {
                                 Log.w(TAG, "Tracker removal: could not extract info_hash or announce URL")
@@ -1100,7 +1113,26 @@ class Arabp : MainAPI() {
                         }
                     }
 
-                    // Step 2: Replace trackers with dummy URL via TorrServe API
+                    // === APPROACH A: Delete + re-add via magnet without trackers ===
+                    // This is the most reliable method — completely removes the tracker
+                    try {
+                        Log.d(TAG, "Tracker removal: attempting delete + magnet re-add for hash=$hash")
+                        val readded = deleteAndReaddWithoutTrackers(hash, activeIndex)
+                        Log.d(TAG, "Tracker removal: delete + magnet re-add result=$readded")
+
+                        if (readded) {
+                            // Verify the new torrent has no trackers
+                            try { Thread.sleep(2000) } catch (_: InterruptedException) {}
+                            val newProps = getTorrServeTorrentProps(hash)
+                            if (newProps != null) {
+                                Log.d(TAG, "Tracker removal: after re-add, trackers=${newProps.trackerUrls.size}, urls=${newProps.trackerUrls}")
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Tracker removal: delete + magnet re-add failed: ${e.message}")
+                    }
+
+                    // === APPROACH C: Replace trackers with dummy URL (backup) ===
                     try {
                         val replaced = replaceTrackersWithDummy(hash)
                         Log.d(TAG, "Tracker removal: replaceTrackersWithDummy result=$replaced")
@@ -1108,62 +1140,17 @@ class Arabp : MainAPI() {
                         Log.w(TAG, "Tracker removal: replaceTrackersWithDummy failed: ${e.message}")
                     }
 
-                    // Step 3: Verify tracker state
-                    try {
-                        val state = verifyTrackerState(hash)
-                        Log.d(TAG, "Tracker removal: verification after replacement: $state")
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Tracker removal: verify failed: ${e.message}")
-                    }
-
-                    // Step 4: Pause and resume the torrent to force a re-announce.
-                    // If set-trackers worked, the re-announce goes to the dummy URL.
-                    // If set-trackers didn't work, the pause still sends event=stopped
-                    // to the real tracker.
-                    try {
-                        // Pause
-                        val pauseBody = JSONObject().apply {
-                            put("action", "pause")
-                            put("hash", hash)
-                        }
-                        val pauseRequest = okhttp3.Request.Builder()
-                            .url("$TORRSERVE_HOST/torrents")
-                            .post(pauseBody.toString().toRequestBody("application/json".toMediaType()))
-                            .header("Content-Type", "application/json")
-                            .build()
-                        torrServeClient.newCall(pauseRequest).execute().use { resp ->
-                            Log.d(TAG, "Tracker removal: pause torrent → HTTP ${resp.code}")
-                        }
-
-                        // Brief wait for the pause to take effect
-                        Thread.sleep(2000)
-
-                        // Resume — if trackers were replaced, announce goes to dummy
-                        val resumeBody = JSONObject().apply {
-                            put("action", "resume")
-                            put("hash", hash)
-                        }
-                        val resumeRequest = okhttp3.Request.Builder()
-                            .url("$TORRSERVE_HOST/torrents")
-                            .post(resumeBody.toString().toRequestBody("application/json".toMediaType()))
-                            .header("Content-Type", "application/json")
-                            .build()
-                        torrServeClient.newCall(resumeRequest).execute().use { resp ->
-                            Log.d(TAG, "Tracker removal: resume torrent → HTTP ${resp.code}")
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Tracker removal: pause/resume failed: ${e.message}")
-                    }
-
-                    // Step 5: Send event=stopped AGAIN after the pause/resume cycle
-                    // (in case TorrServe re-announced with event=started during resume)
+                    // === APPROACH B again: Send event=stopped after all changes ===
+                    // In case TorrServe re-announced during our operations
                     if (originalBytes != null) {
                         try {
                             val infoHash = computeInfoHash(originalBytes)
                             val announceUrl = extractAnnounceUrl(originalBytes)
                             if (infoHash != null && announceUrl != null) {
-                                Thread.sleep(3000)  // Wait for any re-announce to complete
-                                val stopped = sendTrackerStopped(announceUrl, infoHash)
+                                val peerId = torrentProps?.peerId
+                                val port = torrentProps?.listenPort ?: 6881
+                                Thread.sleep(2000)
+                                val stopped = sendTrackerStopped(announceUrl, infoHash, peerId, port)
                                 Log.d(TAG, "Tracker removal: second event=stopped result=$stopped")
                             }
                         } catch (e: Exception) {
@@ -1172,21 +1159,22 @@ class Arabp : MainAPI() {
                         torrentBytesCache.remove(hash)
                     }
 
-                    // Step 6: Start a background reaper that periodically re-sends
-                    // event=stopped to the tracker. This handles the case where
-                    // TorrServe re-announces despite our efforts.
+                    // === APPROACH D: Background reaper ===
+                    // Periodically re-sends event=stopped to counter any re-announces.
+                    // Runs for 30 minutes (60 iterations × 30 seconds).
                     if (originalBytes != null) {
                         try {
                             val infoHash = computeInfoHash(originalBytes)
                             val announceUrl = extractAnnounceUrl(originalBytes)
                             if (infoHash != null && announceUrl != null) {
+                                val reaperPeerId = torrentProps?.peerId
+                                val reaperPort = torrentProps?.listenPort ?: 6881
                                 Thread {
-                                    // Re-send event=stopped every 30 seconds for 5 minutes
-                                    for (i in 1..10) {
+                                    for (i in 1..60) {
                                         try {
                                             Thread.sleep(30000)
-                                            Log.d(TAG, "Tracker reaper: sending event=stopped (iteration $i)")
-                                            sendTrackerStopped(announceUrl, infoHash)
+                                            Log.d(TAG, "Tracker reaper: sending event=stopped (iteration $i/60)")
+                                            sendTrackerStopped(announceUrl, infoHash, reaperPeerId, reaperPort)
                                         } catch (e: InterruptedException) {
                                             break
                                         } catch (e: Exception) {
@@ -1934,23 +1922,152 @@ class Arabp : MainAPI() {
     //
     // Strategy to stop arabp2p from counting downloads:
     //
-    // The TorrServe API's "set-trackers" does NOT reliably remove trackers.
-    // Instead, we use a COMBINED approach:
+    // APPROACH A (primary): Delete torrent from TorrServe, then re-add via
+    // magnet link WITHOUT tracker URLs. This is the most reliable method
+    // because it completely removes the tracker from the equation.
+    // - We delete with save=true (keep downloaded data on disk)
+    // - We re-add via magnet:?xt=urn:btih:HASH (no &tr= parameter)
+    // - TorrServe checks existing data and can stream from it immediately
+    // - No tracker URL = no announce = no counting
+    // - The torrent uses DHT/PEX to find peers (magnet links enable DHT
+    //   even for private torrents, since the .torrent's private flag isn't loaded)
     //
-    // 1. Send `event=stopped` DIRECTLY to the tracker's HTTP announce URL.
-    //    This bypasses TorrServe entirely — the tracker receives the stop
-    //    event and closes our session. This is the most reliable method.
+    // APPROACH B (backup): Send event=stopped directly to the tracker.
+    // This uses TorrServe's actual peer_id and port (queried from the API)
+    // so the tracker recognizes it as the same session and closes it.
     //
-    // 2. Replace trackers with a DUMMY URL via set-trackers API.
-    //    Instead of setting trackers to empty (which some TorrServe versions
-    //    don't support), we replace them with http://127.0.0.1:1/announce.
-    //    Future announces go to the dummy URL (which never responds) instead
-    //    of the real tracker.
+    // APPROACH C (backup): Replace trackers with a dummy URL via API.
     //
-    // 3. Pause the torrent briefly, then resume it. This forces TorrServe to
-    //    re-announce, but if set-trackers worked, the re-announce goes to the
-    //    dummy URL. If set-trackers didn't work, at least the pause causes
-    //    TorrServe to send event=stopped to the tracker.
+    // Background reaper: Periodically re-sends event=stopped for 30 minutes
+    // to counter any re-announces from TorrServe.
+
+    /**
+     * Data class for TorrServe torrent properties.
+     * Populated by querying the TorrServe API.
+     */
+    data class TorrServeTorrentProps(
+        val peerId: String?,
+        val listenPort: Int,
+        val trackerUrls: List<String>,
+        val totalDownloaded: Long,
+        val totalUploaded: Long,
+        val stat: Int,
+        val rawJson: String
+    )
+
+    /**
+     * Query TorrServe for detailed torrent properties.
+     * Returns peer_id, listening port, tracker URLs, and other session data.
+     * We need this to send a proper event=stopped to the tracker.
+     */
+    private fun getTorrServeTorrentProps(hash: String): TorrServeTorrentProps? {
+        return try {
+            val jsonBody = JSONObject().apply {
+                put("action", "get")
+                put("hash", hash)
+            }
+
+            val request = Request.Builder()
+                .url("$TORRSERVE_HOST/torrents")
+                .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
+                .header("Content-Type", "application/json")
+                .build()
+
+            torrServeClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return null
+                val body = response.body?.string() ?: return null
+
+                // Log the FULL response for debugging — this is critical
+                // to understand what TorrServe actually returns
+                Log.d(TAG, "TorrServe torrent props FULL response: ${body.take(2000)}")
+
+                val json = JSONObject(body)
+                val stat = json.optInt("stat", -1)
+
+                // Try to extract peer_id — it might be under different keys
+                var peerId: String? = null
+                // Try common keys
+                for (key in listOf("peer_id", "peer-id", "peerId", "connection_id")) {
+                    val v = json.optString(key, null)
+                    if (v != null && v.isNotEmpty()) {
+                        peerId = v
+                        Log.d(TAG, "Found peer_id under key '$key': $peerId")
+                        break
+                    }
+                }
+
+                // Try to get it from the torrent object if it's nested
+                if (peerId == null) {
+                    val dataObj = json.optJSONObject("data")
+                    if (dataObj != null) {
+                        for (key in listOf("peer_id", "peer-id", "peerId")) {
+                            val v = dataObj.optString(key, null)
+                            if (v != null && v.isNotEmpty()) {
+                                peerId = v
+                                Log.d(TAG, "Found peer_id under data.$key: $peerId")
+                                break
+                            }
+                        }
+                    }
+                }
+
+                // Extract listening port
+                var listenPort = json.optInt("listen_port",
+                    json.optInt("port",
+                        json.optInt("lp", 0)))
+
+                // Try from data object
+                if (listenPort == 0) {
+                    val dataObj = json.optJSONObject("data")
+                    if (dataObj != null) {
+                        listenPort = dataObj.optInt("listen_port",
+                            dataObj.optInt("port", 0))
+                    }
+                }
+                if (listenPort == 0) listenPort = 6881  // default BitTorrent port
+
+                // Extract tracker URLs
+                val trackerUrls = mutableListOf<String>()
+                val trackersArr = json.optJSONArray("trackers")
+                if (trackersArr != null) {
+                    for (i in 0 until trackersArr.length()) {
+                        when (val item = trackersArr.get(i)) {
+                            is String -> trackerUrls.add(item)
+                            is JSONArray -> {
+                                for (j in 0 until item.length()) {
+                                    val url = item.optString(j)
+                                    if (url.isNotEmpty()) trackerUrls.add(url)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Extract download/upload stats
+                val totalDownloaded = json.optLong("downloaded",
+                    json.optLong("total_download",
+                        json.optLong("total_downloaded", 0L)))
+                val totalUploaded = json.optLong("uploaded",
+                    json.optLong("total_upload",
+                        json.optLong("total_uploaded", 0L)))
+
+                val props = TorrServeTorrentProps(
+                    peerId = peerId,
+                    listenPort = listenPort,
+                    trackerUrls = trackerUrls,
+                    totalDownloaded = totalDownloaded,
+                    totalUploaded = totalUploaded,
+                    stat = stat,
+                    rawJson = body.take(500)
+                )
+                Log.d(TAG, "TorrServe torrent props: peerId=$peerId, port=$listenPort, trackers=${trackerUrls.size}, dl=$totalDownloaded, ul=$totalUploaded, stat=$stat")
+                props
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "getTorrServeTorrentProps error: ${e.message}")
+            null
+        }
+    }
 
     /**
      * Compute the info_hash (SHA-1 of bencoded info dict) from a .torrent file.
@@ -2034,12 +2151,18 @@ class Arabp : MainAPI() {
      *
      * @param announceUrl The tracker announce URL (with passkey)
      * @param infoHashHex The info_hash as hex string
+     * @param peerId The peer_id to use (TorrServe's actual peer_id if available)
+     * @param port The port to report (TorrServe's actual listening port if available)
      * @return true if the tracker accepted the stopped event
      */
-    private fun sendTrackerStopped(announceUrl: String, infoHashHex: String): Boolean {
+    private fun sendTrackerStopped(
+        announceUrl: String,
+        infoHashHex: String,
+        peerId: String? = null,
+        port: Int = 6881
+    ): Boolean {
         return try {
             // Convert hex info_hash to URL-encoded binary format
-            // Tracker protocol expects info_hash as URL-encoded 20-byte binary
             val infoHashBytes = ByteArray(20)
             for (i in 0 until 20) {
                 infoHashBytes[i] = infoHashHex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
@@ -2050,10 +2173,13 @@ class Arabp : MainAPI() {
                 "%${String.format("%02x", byte.toInt() and 0xFF)}"
             }
 
-            // Generate a random peer_id (libtorrent style: -LT1000- + 12 random hex)
-            val peerId = "-LT1000-" + (1..12).map {
-                "0123456789abcdef".random()
-            }.joinToString("")
+            // Use TorrServe's actual peer_id if available, otherwise generate one
+            val effectivePeerId = peerId ?: run {
+                // Generate a libtorrent-style peer_id: -LT1000- + 12 random hex
+                "-LT1000-" + (1..12).map {
+                    "0123456789abcdef".random()
+                }.joinToString("")
+            }
 
             // Build the announce URL with event=stopped
             val separator = if ("?" in announceUrl) "&" else "?"
@@ -2061,16 +2187,17 @@ class Arabp : MainAPI() {
                 append(announceUrl)
                 append(separator)
                 append("info_hash=").append(encodedInfoHash)
-                append("&peer_id=").append(URLEncoder.encode(peerId, "UTF-8"))
-                append("&port=6881")
+                append("&peer_id=").append(URLEncoder.encode(effectivePeerId, "UTF-8"))
+                append("&port=").append(port)
                 append("&uploaded=0")
                 append("&downloaded=0")
                 append("&left=0")
+                append("&compact=1")
                 append("&event=stopped")
                 append("&numwant=0")
             }
 
-            Log.d(TAG, "sendTrackerStopped: sending event=stopped to $announceUrl")
+            Log.d(TAG, "sendTrackerStopped: sending event=stopped to $announceUrl (peer_id=$effectivePeerId, port=$port)")
 
             val request = Request.Builder()
                 .url(stoppedUrl)
@@ -2079,18 +2206,17 @@ class Arabp : MainAPI() {
 
             torrServeClient.newCall(request).execute().use { response ->
                 val body = response.body?.string() ?: ""
-                Log.d(TAG, "sendTrackerStopped: HTTP ${response.code}, body=${body.take(200)}")
+                Log.d(TAG, "sendTrackerStopped: HTTP ${response.code}, body=${body.take(300)}")
 
                 if (response.isSuccessful) {
                     // Check if the response is a valid bencoded tracker response
-                    // A successful stopped event typically returns: d8:intervali1800ee
                     if (body.startsWith("d") || body.contains("interval")) {
                         Log.d(TAG, "sendTrackerStopped: SUCCESS — tracker accepted event=stopped")
                         true
                     } else {
+                        // Even non-bencoded 200 might mean success
                         Log.w(TAG, "sendTrackerStopped: tracker returned unexpected response: ${body.take(100)}")
-                        // Even if the response format is unexpected, HTTP 200 might mean success
-                        response.isSuccessful
+                        true
                     }
                 } else {
                     Log.w(TAG, "sendTrackerStopped: FAILED — HTTP ${response.code}")
@@ -2105,10 +2231,6 @@ class Arabp : MainAPI() {
 
     /**
      * Replace the trackers in a TorrServe torrent with a dummy URL.
-     * Instead of setting trackers to empty (which some TorrServe versions don't
-     * support), we replace them with http://127.0.0.1:1/announce — a URL that
-     * never responds. Future announce attempts go to the dummy URL and fail
-     * silently, so the real tracker never receives another announce.
      */
     private fun replaceTrackersWithDummy(hash: String): Boolean {
         val dummyTracker = "http://127.0.0.1:1/announce"
@@ -2160,7 +2282,7 @@ class Arabp : MainAPI() {
             }
         }
 
-        // Method 3: set-trackers with dummy URL as nested array (announce-list format)
+        // Method 3: set-trackers with nested array (announce-list format)
         if (!success) {
             try {
                 val jsonBody = JSONObject().apply {
@@ -2191,52 +2313,118 @@ class Arabp : MainAPI() {
     }
 
     /**
-     * Verify tracker state after attempting removal.
-     * Queries TorrServe to check if the tracker list was actually changed.
+     * Delete a torrent from TorrServe and re-add it via magnet link
+     * WITHOUT tracker URLs. This completely removes the tracker from
+     * the equation — no tracker URL means no announce.
+     *
+     * The magnet link is: magnet:?xt=urn:btih:HASH (no &tr=)
+     * TorrServe will check existing data on disk and can stream from it.
+     * Without trackers, the torrent uses DHT/PEX to find peers.
+     * Since we add via magnet (not .torrent), the private flag is NOT
+     * enforced, so DHT/PEX are enabled.
+     *
+     * @param hash The torrent info hash
+     * @param activeFileIndex The file index to resume after re-adding
+     * @return true if the operation succeeded
      */
-    private fun verifyTrackerState(hash: String): String {
-        return try {
-            val jsonBody = JSONObject().apply {
-                put("action", "get")
+    private fun deleteAndReaddWithoutTrackers(hash: String, activeFileIndex: Int): Boolean {
+        // Step 1: Delete torrent from TorrServe (keep downloaded data on disk)
+        try {
+            val deleteBody = JSONObject().apply {
+                put("action", "delete")
                 put("hash", hash)
+                put("save", true)  // keep downloaded data
             }
-
-            val request = Request.Builder()
+            val deleteRequest = okhttp3.Request.Builder()
                 .url("$TORRSERVE_HOST/torrents")
-                .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
+                .post(deleteBody.toString().toRequestBody("application/json".toMediaType()))
                 .header("Content-Type", "application/json")
+                .build()
+            torrServeClient.newCall(deleteRequest).execute().use { delResp ->
+                Log.d(TAG, "TorrServe: delete torrent $hash → HTTP ${delResp.code}")
+                if (!delResp.isSuccessful) {
+                    Log.w(TAG, "TorrServe: delete failed, aborting re-add")
+                    return false
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "TorrServe: delete torrent failed: ${e.message}")
+            return false
+        }
+
+        // Step 2: Re-add via magnet link WITHOUT trackers
+        // magnet:?xt=urn:btih:HASH — no &tr= parameter
+        val magnetUri = "magnet:?xt=urn:btih:$hash"
+        Log.d(TAG, "TorrServe: re-adding via magnet (no trackers): $magnetUri")
+
+        try {
+            val addBody = JSONObject().apply {
+                put("action", "add")
+                put("link", magnetUri)
+                put("save", true)  // save to disk
+            }
+            val addRequest = okhttp3.Request.Builder()
+                .url("$TORRSERVE_HOST/torrents")
+                .post(addBody.toString().toRequestBody("application/json".toMediaType()))
+                .header("Content-Type", "application/json")
+                .build()
+            torrServeClient.newCall(addRequest).execute().use { addResp ->
+                Log.d(TAG, "TorrServe: add magnet → HTTP ${addResp.code}")
+                if (!addResp.isSuccessful) {
+                    Log.w(TAG, "TorrServe: add magnet failed, trying upload endpoint")
+                    // Try the upload endpoint as a fallback
+                    return tryAddMagnetViaUpload(magnetUri)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "TorrServe: add magnet failed: ${e.message}")
+            return tryAddMagnetViaUpload(magnetUri)
+        }
+
+        // Step 3: Wait a moment for TorrServe to process the magnet
+        try { Thread.sleep(3000) } catch (_: InterruptedException) {}
+
+        // Step 4: Resume the active file, pause all others
+        try {
+            val allIndices = getTorrServeFileIndices(hash)
+            if (allIndices.isNotEmpty()) {
+                for (idx in allIndices) {
+                    setTorrServeFilePriority(hash, idx, if (idx == activeFileIndex) 1 else 0)
+                }
+                Log.d(TAG, "TorrServe: re-applied file priorities after magnet re-add")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "TorrServe: re-apply priorities failed: ${e.message}")
+        }
+
+        return true
+    }
+
+    /**
+     * Try adding a magnet link via the torrent/upload endpoint.
+     * Some TorrServe versions accept magnet links through this endpoint.
+     */
+    private fun tryAddMagnetViaUpload(magnetUri: String): Boolean {
+        return try {
+            val requestBody = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("file", magnetUri)
+                .addFormDataPart("save", "1")
+                .build()
+
+            val request = okhttp3.Request.Builder()
+                .url("$TORRSERVE_HOST/torrent/upload")
+                .post(requestBody)
                 .build()
 
             torrServeClient.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return "HTTP ${response.code}"
-                val body = response.body?.string() ?: return "empty body"
-                val json = JSONObject(body)
-
-                val stat = json.optInt("stat", -1)
-                val trackerStr = json.optString("trackers", "N/A")
-                val trackersArr = json.optJSONArray("trackers")
-                val trackerCount = trackersArr?.length() ?: -1
-
-                // Also try to get tracker info from the response
-                val trackerUrls = if (trackersArr != null) {
-                    (0 until trackersArr.length()).mapNotNull { i ->
-                        when (val item = trackersArr.get(i)) {
-                            is String -> item
-                            is JSONArray -> (0 until item.length()).mapNotNull { j ->
-                                item.optString(j)
-                            }.joinToString(", ")
-                            else -> item.toString()
-                        }
-                    }.joinToString("; ")
-                } else "N/A"
-
-                val result = "stat=$stat, tracker_count=$trackerCount, trackers=[$trackerUrls]"
-                Log.d(TAG, "verifyTrackerState for $hash: $result")
-                result
+                val body = response.body?.string() ?: ""
+                Log.d(TAG, "tryAddMagnetViaUpload: HTTP ${response.code}, body=${body.take(300)}")
+                response.isSuccessful
             }
         } catch (e: Exception) {
-            Log.e(TAG, "verifyTrackerState error: ${e.message}")
-            "error: ${e.message}"
+            Log.w(TAG, "tryAddMagnetViaUpload error: ${e.message}")
+            false
         }
     }
 
