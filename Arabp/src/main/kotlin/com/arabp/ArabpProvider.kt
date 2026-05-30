@@ -1215,11 +1215,11 @@ class Arabp : MainAPI() {
      * This must be done before downloading non-free torrents to avoid the
      * daily download limit ("لقد تجاوزت الحد المسموح به من التحميلات بيوم واحد").
      *
-     * Strategy:
-     * 1. Fetch the torrent detail page
-     * 2. Look for a thank link/button (href contains "thank", or text contains "اشكر")
-     * 3. If found, send a GET request to that URL
-     * 4. If not found (already thanked), return true — no action needed
+     * The arabp2p website uses an AJAX mechanism (sack library) that sends a
+     * request to thanks.php?tid=TORRENT_ID&thanks=1 when the "اشكر الرافع"
+     * button (id="ty") is clicked. We replicate this by:
+     * 1. Fetching the detail page first (to establish session/referrer)
+     * 2. Sending a GET request to thanks.php?tid=TORRENT_ID&thanks=1
      *
      * Returns true if the thank was sent or already done, false on error.
      */
@@ -1230,61 +1230,55 @@ class Arabp : MainAPI() {
             val pageUrl = if (detailUrl.isNotBlank()) toAbsoluteUrl(detailUrl)
                 else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
 
-            // Step 1: Fetch the detail page to find the thank button
-            val request = Request.Builder()
+            // Step 1: Fetch the detail page (establishes session context)
+            val detailRequest = Request.Builder()
                 .url(pageUrl)
                 .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
                 .build()
 
-            var thankHref: String? = null
+            var alreadyThanked = false
 
-            authClient.newCall(request).execute().use { response ->
+            authClient.newCall(detailRequest).execute().use { response ->
                 val body = response.body?.string() ?: return false
                 val doc = Jsoup.parse(body, pageUrl)
 
-                // Look for the "thank the uploader" link/button on the page
-                // Multiple selector strategies for robustness:
-                //   1. <a href="...&thank=1">  (standard xbtit pattern)
-                //   2. <a> containing "اشكر"     (Arabic text)
-                //   3. <input>/<button> with thank-related attributes
-                val thankLink = doc.selectFirst("a[href*=thank]")
-                    ?: doc.selectFirst("a:contains(اشكر)")
-                    ?: doc.selectFirst("a:contains(Thank)")
-                    ?: doc.selectFirst("button[onclick*=thank]")
-
-                if (thankLink != null) {
-                    val href = thankLink.attr("href")
-                    if (href.isNotBlank()) {
-                        thankHref = toAbsoluteUrl(href)
-                        Log.d(TAG, "Found thank link: $thankHref")
-                    } else {
-                        // Might be a JS button with onclick
-                        val onclick = thankLink.attr("onclick")
-                        val urlMatch = Regex("['\"]([^'\"]*thank[^'\"]*)['\"]").find(onclick)
-                        if (urlMatch != null) {
-                            thankHref = toAbsoluteUrl(urlMatch.groupValues[1])
-                            Log.d(TAG, "Found thank onclick URL: $thankHref")
-                        }
+                // Check if the thank button exists and is enabled (id="ty")
+                // If the button is disabled or missing, user already thanked
+                val thankButton = doc.selectFirst("#ty")
+                if (thankButton != null) {
+                    val disabled = thankButton.hasAttr("disabled")
+                    Log.d(TAG, "Thank button found: disabled=$disabled, text=${thankButton.text()}")
+                    if (disabled) {
+                        alreadyThanked = true
                     }
                 } else {
-                    Log.d(TAG, "No thank button found on page (may have already thanked)")
+                    // No thank button at all — might already be thanked or page layout changed
+                    Log.d(TAG, "No #ty button found on page (may have already thanked)")
+                    alreadyThanked = true
                 }
             }
 
-            // If no thank link found, the user may have already thanked — that's OK
-            if (thankHref.isNullOrBlank()) {
-                Log.d(TAG, "Thank not needed (already thanked or button not found)")
+            if (alreadyThanked) {
+                Log.d(TAG, "Already thanked uploader for torrent $torrentId, skipping")
                 return true
             }
 
-            // Step 2: Send the thank request
+            // Step 2: Send the thank AJAX request
+            // The website JS does: at.requestFile='thanks.php'; at.setVar('tid',ia); at.setVar('thanks',1);
+            // sack library sends this as a GET request with query parameters
+            val thankUrl = "$mainUrl/thanks.php?tid=$torrentId&thanks=1"
+            Log.d(TAG, "Sending thank request: $thankUrl")
+
             val thankRequest = Request.Builder()
-                .url(thankHref)
+                .url(thankUrl)
                 .headers(getAuthHeaders(referer = pageUrl).toOkHttpHeaders())
                 .build()
 
             authClient.newCall(thankRequest).execute().use { response ->
-                Log.d(TAG, "Thank uploader: HTTP ${response.code}")
+                val responseBody = response.body?.string() ?: ""
+                Log.d(TAG, "Thank uploader: HTTP ${response.code}, response: ${responseBody.take(200)}")
+                // The AJAX response contains updated thank count HTML + enabled/disabled flag
+                // A successful thank returns some HTML content
                 response.isSuccessful
             }
         } catch (e: Exception) {
