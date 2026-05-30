@@ -921,6 +921,14 @@ class Arabp : MainAPI() {
             }
         }
 
+        // Step 1.5: Thank the uploader for non-free torrents to bypass daily download limit
+        if (!isFree) {
+            val thankDetailUrl = if (detailUrl.isNotBlank()) detailUrl
+                else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
+            val thanked = thankUploader(torrentId, thankDetailUrl)
+            Log.d(TAG, "tryResolveTorrent: thank uploader result = $thanked for torrent $torrentId")
+        }
+
         // Step 2: Download .torrent file
         if (resolvedDownloadUrl.isBlank() || !resolvedDownloadUrl.contains("&f=")) {
             Log.w(TAG, "tryResolveTorrent: no valid download URL for torrent $torrentId")
@@ -939,8 +947,23 @@ class Arabp : MainAPI() {
                 return null
             }
             is TorrentDownloadResult.DailyLimitExceeded -> {
-                Log.e(TAG, "tryResolveTorrent: daily download limit exceeded")
-                return null
+                // Retry: thank the uploader and try downloading again
+                Log.w(TAG, "tryResolveTorrent: daily limit hit, thanking uploader and retrying...")
+                val thankDetailUrl = if (detailUrl.isNotBlank()) detailUrl
+                    else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
+                thankUploader(torrentId, thankDetailUrl)
+                val retryResult = downloadTorrentFile(resolvedDownloadUrl)
+                when (retryResult) {
+                    is TorrentDownloadResult.Success -> {
+                        val entries = uploadToTorrServe(retryResult.bytes, torrentId)
+                        if (entries != null && entries.isNotEmpty()) return entries
+                        return null
+                    }
+                    else -> {
+                        Log.e(TAG, "tryResolveTorrent: download still failed after thank + retry")
+                        return null
+                    }
+                }
             }
             is TorrentDownloadResult.NotLoggedIn -> {
                 isLoggedIn = false
@@ -1073,6 +1096,14 @@ class Arabp : MainAPI() {
                 }
             }
 
+            // Step 1.5: Thank the uploader for non-free torrents to bypass daily download limit
+            if (!isFree) {
+                val thankDetailUrl = if (detailUrl.isNotBlank()) detailUrl
+                    else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
+                val thanked = thankUploader(torrentId, thankDetailUrl)
+                Log.d(TAG, "loadLinks: thank uploader result = $thanked for torrent $torrentId")
+            }
+
             // Step 2: Download .torrent → upload to TorrServe → get ALL video files
             if (resolvedDownloadUrl.isNotBlank() && resolvedDownloadUrl.contains("&f=")) {
                 try {
@@ -1110,16 +1141,52 @@ class Arabp : MainAPI() {
                             }
                         }
                         is TorrentDownloadResult.DailyLimitExceeded -> {
-                            Log.e(TAG, "DAILY DOWNLOAD LIMIT EXCEEDED for torrent id=$torrentId")
-                            callback(
-                                newExtractorLink(
-                                    source = this.name,
-                                    name = "\u274C تجاوزت الحد اليومي للتحميل",
-                                    url = "$mainUrl/",
-                                    type = ExtractorLinkType.VIDEO
-                                )
-                            )
-                            foundLink = true
+                            // Retry: thank the uploader and try downloading again
+                            Log.w(TAG, "DAILY DOWNLOAD LIMIT EXCEEDED for torrent id=$torrentId, thanking and retrying...")
+                            val thankDetailUrl = if (detailUrl.isNotBlank()) detailUrl
+                                else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
+                            thankUploader(torrentId, thankDetailUrl)
+                            val retryResult = downloadTorrentFile(resolvedDownloadUrl)
+                            when (retryResult) {
+                                is TorrentDownloadResult.Success -> {
+                                    Log.d(TAG, "Retry succeeded! Downloaded .torrent: ${retryResult.bytes.size} bytes")
+                                    val retryEntries = uploadToTorrServe(retryResult.bytes, torrentId)
+                                    if (retryEntries != null && retryEntries.isNotEmpty()) {
+                                        val groups = computeShowGroups(retryEntries)
+                                        val distinctShows = groups.map { it.showName }.filter { it.isNotEmpty() }.distinct()
+                                        val isMultiShow = distinctShows.size > 1
+                                        for (entry in retryEntries) {
+                                            val group = groups.find { it.path == entry.filePath }
+                                            val linkName = when {
+                                                retryEntries.size == 1 -> "${this.name} (TorrServe)"
+                                                isMultiShow && group != null && group.showName.isNotEmpty() -> "[${group.showName}] ${entry.fileName}"
+                                                else -> entry.fileName
+                                            }
+                                            callback(
+                                                newExtractorLink(
+                                                    source = this.name,
+                                                    name = linkName,
+                                                    url = entry.streamUrl,
+                                                    type = ExtractorLinkType.VIDEO
+                                                )
+                                            )
+                                        }
+                                        foundLink = true
+                                    }
+                                }
+                                else -> {
+                                    Log.e(TAG, "Download still failed after thank + retry for torrent id=$torrentId")
+                                    callback(
+                                        newExtractorLink(
+                                            source = this.name,
+                                            name = "\u274C تجاوزت الحد اليومي للتحميل",
+                                            url = "$mainUrl/",
+                                            type = ExtractorLinkType.VIDEO
+                                        )
+                                    )
+                                    foundLink = true
+                                }
+                            }
                         }
                         is TorrentDownloadResult.NotLoggedIn -> {
                             isLoggedIn = false
@@ -1137,6 +1204,91 @@ class Arabp : MainAPI() {
             foundLink
         } catch (e: Exception) {
             Log.e(TAG, "loadLinks Error: ${e.message}")
+            false
+        }
+    }
+
+    // ==================== THANK UPLOADER ====================
+
+    /**
+     * Click "اشكر الرافع" (thank the uploader) on the torrent detail page.
+     * This must be done before downloading non-free torrents to avoid the
+     * daily download limit ("لقد تجاوزت الحد المسموح به من التحميلات بيوم واحد").
+     *
+     * Strategy:
+     * 1. Fetch the torrent detail page
+     * 2. Look for a thank link/button (href contains "thank", or text contains "اشكر")
+     * 3. If found, send a GET request to that URL
+     * 4. If not found (already thanked), return true — no action needed
+     *
+     * Returns true if the thank was sent or already done, false on error.
+     */
+    private fun thankUploader(torrentId: String, detailUrl: String): Boolean {
+        if (!ensureLogin()) return false
+
+        return try {
+            val pageUrl = if (detailUrl.isNotBlank()) toAbsoluteUrl(detailUrl)
+                else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
+
+            // Step 1: Fetch the detail page to find the thank button
+            val request = Request.Builder()
+                .url(pageUrl)
+                .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
+                .build()
+
+            var thankHref: String? = null
+
+            authClient.newCall(request).execute().use { response ->
+                val body = response.body?.string() ?: return false
+                val doc = Jsoup.parse(body, pageUrl)
+
+                // Look for the "thank the uploader" link/button on the page
+                // Multiple selector strategies for robustness:
+                //   1. <a href="...&thank=1">  (standard xbtit pattern)
+                //   2. <a> containing "اشكر"     (Arabic text)
+                //   3. <input>/<button> with thank-related attributes
+                val thankLink = doc.selectFirst("a[href*=thank]")
+                    ?: doc.selectFirst("a:contains(اشكر)")
+                    ?: doc.selectFirst("a:contains(Thank)")
+                    ?: doc.selectFirst("button[onclick*=thank]")
+
+                if (thankLink != null) {
+                    val href = thankLink.attr("href")
+                    if (href.isNotBlank()) {
+                        thankHref = toAbsoluteUrl(href)
+                        Log.d(TAG, "Found thank link: $thankHref")
+                    } else {
+                        // Might be a JS button with onclick
+                        val onclick = thankLink.attr("onclick")
+                        val urlMatch = Regex("['\"]([^'\"]*thank[^'\"]*)['\"]").find(onclick)
+                        if (urlMatch != null) {
+                            thankHref = toAbsoluteUrl(urlMatch.groupValues[1])
+                            Log.d(TAG, "Found thank onclick URL: $thankHref")
+                        }
+                    }
+                } else {
+                    Log.d(TAG, "No thank button found on page (may have already thanked)")
+                }
+            }
+
+            // If no thank link found, the user may have already thanked — that's OK
+            if (thankHref.isNullOrBlank()) {
+                Log.d(TAG, "Thank not needed (already thanked or button not found)")
+                return true
+            }
+
+            // Step 2: Send the thank request
+            val thankRequest = Request.Builder()
+                .url(thankHref)
+                .headers(getAuthHeaders(referer = pageUrl).toOkHttpHeaders())
+                .build()
+
+            authClient.newCall(thankRequest).execute().use { response ->
+                Log.d(TAG, "Thank uploader: HTTP ${response.code}")
+                response.isSuccessful
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "thankUploader error: ${e.message}")
             false
         }
     }
