@@ -1068,31 +1068,55 @@ class Arabp : MainAPI() {
                         }
                     }
                     // Wait for the tracker to connect and find peers,
-                    // then re-upload the .torrent with trackers stripped.
-                    // Same info hash → TorrServe updates in place, peers stay connected.
+                    // then delete the torrent and re-add with trackers stripped.
+                    // Same info hash → TorrServe re-checks existing data and resumes.
+                    // No tracker URLs = no announce = website stops counting.
                     Thread.sleep(TRACKER_STRIP_DELAY)
                     val originalBytes = torrentBytesCache[hash]
                     if (originalBytes != null) {
-                        val strippedBytes = stripTrackersFromTorrent(originalBytes)
-                        // Re-upload stripped .torrent (same info hash, no announce/announce-list)
-                        val replaceBody = MultipartBody.Builder()
-                            .setType(MultipartBody.FORM)
-                            .addFormDataPart(
-                                "file", "stripped.torrent",
-                                strippedBytes.toRequestBody("application/x-bittorrent".toMediaType())
-                            )
-                            .addFormDataPart("save", "1")
-                            .build()
-                        val replaceRequest = okhttp3.Request.Builder()
-                            .url("$TORRSERVE_HOST/torrent/upload")
-                            .post(replaceBody)
-                            .build()
-                        torrServeClient.newCall(replaceRequest).execute().use { resp ->
-                            if (resp.isSuccessful) {
-                                Log.d(TAG, "TorrServe: re-uploaded stripped torrent for $hash (trackers removed)")
-                            } else {
-                                Log.w(TAG, "TorrServe: re-upload stripped torrent failed, HTTP ${resp.code}")
+                        // Step 1: Delete torrent from TorrServe (keep downloaded data on disk)
+                        try {
+                            val deleteBody = JSONObject().apply {
+                                put("action", "delete")
+                                put("hash", hash)
+                                put("save", true)  // keep downloaded data
                             }
+                            val deleteRequest = okhttp3.Request.Builder()
+                                .url("$TORRSERVE_HOST/torrents")
+                                .post(deleteBody.toString().toRequestBody("application/json".toMediaType()))
+                                .header("Content-Type", "application/json")
+                                .build()
+                            torrServeClient.newCall(deleteRequest).execute().use { delResp ->
+                                Log.d(TAG, "TorrServe: delete torrent $hash → HTTP ${delResp.code}")
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "TorrServe: delete torrent failed: ${e.message}")
+                        }
+
+                        // Step 2: Re-upload stripped .torrent (same info hash, no trackers)
+                        val strippedBytes = stripTrackersFromTorrent(originalBytes)
+                        try {
+                            val replaceBody = MultipartBody.Builder()
+                                .setType(MultipartBody.FORM)
+                                .addFormDataPart(
+                                    "file", "stripped.torrent",
+                                    strippedBytes.toRequestBody("application/x-bittorrent".toMediaType())
+                                )
+                                .addFormDataPart("save", "1")
+                                .build()
+                            val replaceRequest = okhttp3.Request.Builder()
+                                .url("$TORRSERVE_HOST/torrent/upload")
+                                .post(replaceBody)
+                                .build()
+                            torrServeClient.newCall(replaceRequest).execute().use { resp ->
+                                if (resp.isSuccessful) {
+                                    Log.d(TAG, "TorrServe: re-added stripped torrent for $hash (no trackers)")
+                                } else {
+                                    Log.w(TAG, "TorrServe: re-add stripped torrent failed, HTTP ${resp.code}")
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "TorrServe: re-add stripped torrent failed: ${e.message}")
                         }
                         torrentBytesCache.remove(hash)
                     } else {
