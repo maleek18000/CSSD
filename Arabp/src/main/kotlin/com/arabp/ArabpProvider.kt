@@ -1029,16 +1029,8 @@ class Arabp : MainAPI() {
             val streamUrl = if (pipeIndex >= 0) afterPrefix.substring(0, pipeIndex) else afterPrefix
             val fileName = if (pipeIndex >= 0) afterPrefix.substring(pipeIndex + 1) else "Video"
 
-            // Resume only this file, pause all others to save bandwidth
-            val parsed = parseTorrServeUrl(streamUrl)
-            if (parsed != null) {
-                val (hash, activeIndex) = parsed
-                val allIndices = getTorrServeFileIndices(hash)
-                if (allIndices.isNotEmpty()) {
-                    pauseAllExceptOne(hash, activeIndex, allIndices)
-                }
-            }
-
+            // Return the link FIRST so playback starts immediately,
+            // then adjust priorities in the background (don't block playback).
             Log.d(TAG, "loadLinks: pre-resolved stream → $fileName")
             callback(
                 newExtractorLink(
@@ -1048,6 +1040,29 @@ class Arabp : MainAPI() {
                     type = ExtractorLinkType.VIDEO
                 )
             )
+
+            // Resume only this file, pause all others to save bandwidth.
+            // This is best-effort — if it fails, playback still works.
+            try {
+                val parsed = parseTorrServeUrl(streamUrl)
+                if (parsed != null) {
+                    val (hash, activeIndex) = parsed
+                    // First, resume the active file
+                    setTorrServeFilePriority(hash, activeIndex, 1)
+                    // Then pause all other files
+                    val allIndices = getTorrServeFileIndices(hash)
+                    if (allIndices.isNotEmpty()) {
+                        for (idx in allIndices) {
+                            if (idx != activeIndex) {
+                                setTorrServeFilePriority(hash, idx, 0)
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "TorrServe priority adjustment failed (non-fatal): ${e.message}")
+            }
+
             return true
         }
 
@@ -1438,10 +1453,15 @@ class Arabp : MainAPI() {
 
             // Pause all files after upload so only the episode the user watches gets downloaded.
             // TorrServe will auto-resume a paused file when it's accessed via the stream URL,
-            // and loadLinks() explicitly calls pauseAllExceptOne() for ts:// URLs.
-            if (videoEntries.size > 1) {
-                val allIndices = videoEntries.map { it.fileIndex }
-                pauseAllFiles(hash, allIndices)
+            // and loadLinks() explicitly resumes the active file for ts:// URLs.
+            // Best-effort: don't let priority failures break the upload.
+            try {
+                if (videoEntries.size > 1) {
+                    val allIndices = videoEntries.map { it.fileIndex }
+                    pauseAllFiles(hash, allIndices)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "TorrServe pauseAllFiles failed (non-fatal): ${e.message}")
             }
 
             if (videoEntries.isEmpty()) {
