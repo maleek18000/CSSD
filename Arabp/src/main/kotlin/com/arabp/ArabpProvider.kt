@@ -45,7 +45,15 @@ class Arabp : MainAPI() {
         private const val TORRSERVE_POLL_ATTEMPTS = 20
         // Delay between polls (ms)
         private const val TORRSERVE_POLL_DELAY = 2000L
+
+        // How long to wait before stripping trackers (ms)
+        // The tracker needs time to connect and find peers first.
+        private const val TRACKER_STRIP_DELAY = 10000L
     }
+
+    // Cache of original .torrent bytes keyed by hash,
+    // used to re-upload stripped versions after peers connect.
+    private val torrentBytesCache = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
 
     // Images require Referer header to avoid 403
     private val imageHeaders = mapOf(
@@ -1042,7 +1050,7 @@ class Arabp : MainAPI() {
             )
 
             // Resume only this file, pause all others to save bandwidth.
-            // Then remove trackers AFTER playback has started (peers connected).
+            // Then strip trackers AFTER the tracker has connected and found peers.
             // This is best-effort — if it fails, playback still works.
             try {
                 val parsed = parseTorrServeUrl(streamUrl)
@@ -1059,10 +1067,38 @@ class Arabp : MainAPI() {
                             }
                         }
                     }
-                    // Wait 20 seconds for the tracker to connect and find peers,
-                    // then remove trackers so the private tracker stops counting.
-                    Thread.sleep(20000)
-                    removeTrackers(hash)
+                    // Wait for the tracker to connect and find peers,
+                    // then re-upload the .torrent with trackers stripped.
+                    // Same info hash → TorrServe updates in place, peers stay connected.
+                    Thread.sleep(TRACKER_STRIP_DELAY)
+                    val originalBytes = torrentBytesCache[hash]
+                    if (originalBytes != null) {
+                        val strippedBytes = stripTrackersFromTorrent(originalBytes)
+                        // Re-upload stripped .torrent (same info hash, no announce/announce-list)
+                        val replaceBody = MultipartBody.Builder()
+                            .setType(MultipartBody.FORM)
+                            .addFormDataPart(
+                                "file", "stripped.torrent",
+                                strippedBytes.toRequestBody("application/x-bittorrent".toMediaType())
+                            )
+                            .addFormDataPart("save", "1")
+                            .build()
+                        val replaceRequest = okhttp3.Request.Builder()
+                            .url("$TORRSERVE_HOST/torrent/upload")
+                            .post(replaceBody)
+                            .build()
+                        torrServeClient.newCall(replaceRequest).execute().use { resp ->
+                            if (resp.isSuccessful) {
+                                Log.d(TAG, "TorrServe: re-uploaded stripped torrent for $hash (trackers removed)")
+                            } else {
+                                Log.w(TAG, "TorrServe: re-upload stripped torrent failed, HTTP ${resp.code}")
+                            }
+                        }
+                        torrentBytesCache.remove(hash)
+                    } else {
+                        Log.w(TAG, "No cached torrent bytes for $hash, trying API removal")
+                        removeTrackers(hash)
+                    }
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "TorrServe priority/tracker adjustment failed (non-fatal): ${e.message}")
@@ -1462,36 +1498,30 @@ class Arabp : MainAPI() {
     /**
      * Strip tracker URLs from a .torrent file.
      * Removes `announce` and `announce-list` keys from the top-level dictionary.
-     * The `info` dict is kept unchanged (same info hash → peers can still find each other via DHT).
-     * Also removes the `private` flag from `info` so DHT/PEX are enabled.
+     * The `info` dict is kept UNCHANGED (same info hash → TorrServe recognizes
+     * it as the same torrent and updates it in place).
      *
-     * Without trackers, TorrServe uses DHT for peer discovery.
-     * The private tracker cannot count your download/upload since no announce happens.
+     * IMPORTANT: We do NOT remove the `private` flag from the info dict because
+     * that would CHANGE the info hash, making it a completely different torrent.
+     * The existing peer connections persist regardless of the private flag.
+     *
+     * Without tracker URLs, no announce happens → the private tracker
+     * cannot count your download/upload. Existing peer connections continue.
      */
     private fun stripTrackersFromTorrent(torrentBytes: ByteArray): ByteArray {
         return try {
             val (root, _) = decodeBencode(torrentBytes, 0)
             val dict = root as? BencodeValue.BDict ?: return torrentBytes
 
-            val announceKey = BencodeValue.BString("announce".toByteArray())
-            val announceListKey = BencodeValue.BString("announce-list".toByteArray())
-            val privateKey = BencodeValue.BString("private".toByteArray())
-
-            // Remove announce and announce-list from top-level dict
+            // Remove announce and announce-list from top-level dict ONLY.
+            // Do NOT touch the info dict — that would change the info hash!
             dict.entries.removeAll { (k, _) ->
                 k.bytes.contentEquals("announce".toByteArray()) ||
                 k.bytes.contentEquals("announce-list".toByteArray())
             }
 
-            // Remove private flag from info dict so DHT/PEX work
-            val infoEntry = dict.entries.find { (k, _) -> k.bytes.contentEquals("info".toByteArray()) }
-            val infoDict = infoEntry?.second as? BencodeValue.BDict
-            infoDict?.entries?.removeAll { (k, _) ->
-                k.bytes.contentEquals("private".toByteArray())
-            }
-
             val result = encodeBencode(dict)
-            Log.d(TAG, "stripTrackersFromTorrent: ${torrentBytes.size} → ${result.size} bytes (trackers removed)")
+            Log.d(TAG, "stripTrackersFromTorrent: ${torrentBytes.size} → ${result.size} bytes (trackers removed, info hash preserved)")
             result
         } catch (e: Exception) {
             Log.w(TAG, "stripTrackersFromTorrent failed, using original: ${e.message}")
@@ -1542,6 +1572,9 @@ class Arabp : MainAPI() {
                     }
 
                 Log.d(TAG, "TorrServe hash: $hash")
+
+                // Cache original torrent bytes so we can strip and re-upload later
+                torrentBytesCache[hash] = torrentBytes
 
                 // Try to parse file_stats from the upload response
                 fileStats = parseFileStatsFromResponse(responseBody)
