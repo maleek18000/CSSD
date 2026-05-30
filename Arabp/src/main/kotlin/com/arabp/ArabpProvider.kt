@@ -1193,10 +1193,10 @@ class Arabp : MainAPI() {
      * daily download limit ("لقد تجاوزت الحد المسموح به من التحميلات بيوم واحد").
      *
      * The arabp2p website uses an AJAX mechanism (sack library) that sends a
-     * request to thanks.php?tid=TORRENT_ID&thanks=1 when the "اشكر الرافع"
-     * button (id="ty") is clicked. We replicate this by:
-     * 1. Fetching the detail page first (to establish session/referrer)
-     * 2. Sending a GET request to thanks.php?tid=TORRENT_ID&thanks=1
+     * POST request to thanks.php with form data tid=TORRENT_ID&thanks=1 when
+     * the "اشكر الرافع" button (id="ty", class="btn thanks_btn",
+     * onclick="thank_you(ID)") is clicked. We replicate this by:
+     * 1. Sending a POST request to thanks.php with tid and thanks parameters
      *
      * Returns true if the thank was sent or already done, false on error.
      */
@@ -1204,58 +1204,27 @@ class Arabp : MainAPI() {
         if (!ensureLogin()) return false
 
         return try {
+            // Send the thank POST request — same as the sack AJAX call:
+            // at.requestFile='thanks.php'; at.setVar('tid',ia); at.setVar('thanks',1);
+            // sack library uses POST method by default with form-encoded body
+            val thankFormBody = FormBody.Builder()
+                .add("tid", torrentId)
+                .add("thanks", "1")
+                .build()
+
             val pageUrl = if (detailUrl.isNotBlank()) toAbsoluteUrl(detailUrl)
                 else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
 
-            // Step 1: Fetch the detail page (establishes session context)
-            val detailRequest = Request.Builder()
-                .url(pageUrl)
-                .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
-                .build()
-
-            var alreadyThanked = false
-
-            authClient.newCall(detailRequest).execute().use { response ->
-                val body = response.body?.string() ?: return false
-                val doc = Jsoup.parse(body, pageUrl)
-
-                // Check if the thank button exists and is enabled (id="ty")
-                // If the button is disabled or missing, user already thanked
-                val thankButton = doc.selectFirst("#ty")
-                if (thankButton != null) {
-                    val disabled = thankButton.hasAttr("disabled")
-                    Log.d(TAG, "Thank button found: disabled=$disabled, text=${thankButton.text()}")
-                    if (disabled) {
-                        alreadyThanked = true
-                    }
-                } else {
-                    // No thank button at all — might already be thanked or page layout changed
-                    Log.d(TAG, "No #ty button found on page (may have already thanked)")
-                    alreadyThanked = true
-                }
-            }
-
-            if (alreadyThanked) {
-                Log.d(TAG, "Already thanked uploader for torrent $torrentId, skipping")
-                return true
-            }
-
-            // Step 2: Send the thank AJAX request
-            // The website JS does: at.requestFile='thanks.php'; at.setVar('tid',ia); at.setVar('thanks',1);
-            // sack library sends this as a GET request with query parameters
-            val thankUrl = "$mainUrl/thanks.php?tid=$torrentId&thanks=1"
-            Log.d(TAG, "Sending thank request: $thankUrl")
-
             val thankRequest = Request.Builder()
-                .url(thankUrl)
+                .url("$mainUrl/thanks.php")
+                .post(thankFormBody)
                 .headers(getAuthHeaders(referer = pageUrl).toOkHttpHeaders())
+                .header("X-Requested-With", "XMLHttpRequest")
                 .build()
 
             authClient.newCall(thankRequest).execute().use { response ->
                 val responseBody = response.body?.string() ?: ""
                 Log.d(TAG, "Thank uploader: HTTP ${response.code}, response: ${responseBody.take(200)}")
-                // The AJAX response contains updated thank count HTML + enabled/disabled flag
-                // A successful thank returns some HTML content
                 response.isSuccessful
             }
         } catch (e: Exception) {
