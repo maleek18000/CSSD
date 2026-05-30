@@ -1069,135 +1069,247 @@ class Arabp : MainAPI() {
                         }
                     }
                     // ===== STOP TRACKER COUNTING =====
-                    // Strategy: Pause the torrent, replace trackers, then resume.
                     //
-                    // Key insight: We MUST NOT delete the torrent (breaks playback).
-                    // Instead:
-                    // 1. PAUSE the torrent → TorrServe sends event=stopped to tracker
-                    // 2. REPLACE trackers with dummy URL via API
-                    // 3. RESUME the torrent → re-announce goes to dummy (not real tracker)
-                    // 4. Send event=stopped directly as backup
-                    // 5. Background reaper re-sends event=stopped every 30s for 30min
+                    // Previous approaches all FAILED:
+                    // - set-trackers API: TorrServe accepts the call but ignores it
+                    // - Re-upload stripped .torrent: TorrServe doesn't update trackers
+                    // - event=stopped with random peer_id: tracker doesn't recognize it
+                    // - Delete + re-add: breaks playback
                     //
-                    // All of this runs in a background thread so it doesn't block playback.
+                    // NEW APPROACH: Discover TorrServe's actual API by probing endpoints,
+                    // then use the working method. Also try to get peer_id from web UI.
+                    //
+                    // Strategy:
+                    // 1. Probe TorrServe API endpoints to find working tracker management
+                    // 2. Send event=stopped using TorrServe's actual peer_id
+                    // 3. Try to remove trackers via every possible API format
+                    // 4. Background reaper keeps sending event=stopped
 
                     val originalBytes = torrentBytesCache[hash]
                     Thread {
                         try {
                             Thread.sleep(TRACKER_STRIP_DELAY)
 
-                            // Query TorrServe for session properties
-                            val torrentProps = getTorrServeTorrentProps(hash)
+                            // === DISCOVERY: Probe TorrServe API ===
+                            var discoveredPeerId: String? = null
+                            var discoveredPort = 6881
 
-                            // Step 1: Pause the torrent — TorrServe should send
-                            // event=stopped to the tracker when paused
+                            // Method 1: Query the torrent via POST /torrents action=get
                             try {
-                                val pauseBody = JSONObject().apply {
-                                    put("action", "pause")
+                                val getBody = JSONObject().apply {
+                                    put("action", "get")
                                     put("hash", hash)
                                 }
-                                val pauseRequest = okhttp3.Request.Builder()
+                                val getRequest = okhttp3.Request.Builder()
                                     .url("$TORRSERVE_HOST/torrents")
-                                    .post(pauseBody.toString().toRequestBody("application/json".toMediaType()))
+                                    .post(getBody.toString().toRequestBody("application/json".toMediaType()))
                                     .header("Content-Type", "application/json")
                                     .build()
-                                torrServeClient.newCall(pauseRequest).execute().use { resp ->
-                                    Log.d(TAG, "Tracker: pause torrent → HTTP ${resp.code}")
-                                }
-                            } catch (e: Exception) {
-                                Log.w(TAG, "Tracker: pause failed: ${e.message}")
-                            }
+                                torrServeClient.newCall(getRequest).execute().use { resp ->
+                                    val body = resp.body?.string() ?: ""
+                                    Log.d(TAG, "Tracker: GET torrent response (${body.length} chars): ${body.take(3000)}")
 
-                            // Wait for the pause to take effect and event=stopped to be sent
-                            Thread.sleep(3000)
-
-                            // Step 2: Send event=stopped directly to the tracker
-                            // (backup in case TorrServe's pause doesn't send it)
-                            if (originalBytes != null) {
-                                try {
-                                    val infoHash = computeInfoHash(originalBytes)
-                                    val announceUrl = extractAnnounceUrl(originalBytes)
-                                    if (infoHash != null && announceUrl != null) {
-                                        val peerId = torrentProps?.peerId
-                                        val port = torrentProps?.listenPort ?: 6881
-                                        Log.d(TAG, "Tracker: sending direct event=stopped (peerId=$peerId, port=$port)")
-                                        sendTrackerStopped(announceUrl, infoHash, peerId, port)
+                                    // Try to extract peer_id from ALL possible locations
+                                    val json = JSONObject(body)
+                                    for (key in json.keys()) {
+                                        val value = json.get(key)
+                                        val valueStr = value.toString()
+                                        // Peer IDs are typically 20 bytes, often start with -
+                                        if (key.contains("peer", ignoreCase = true) ||
+                                            key.contains("id", ignoreCase = true) ||
+                                            key.contains("session", ignoreCase = true)) {
+                                            Log.d(TAG, "Tracker: found key '$key' = $valueStr")
+                                        }
+                                        if (key.equals("peer_id", ignoreCase = true) && valueStr.isNotEmpty()) {
+                                            discoveredPeerId = valueStr
+                                        }
                                     }
-                                } catch (e: Exception) {
-                                    Log.w(TAG, "Tracker: direct stopped event failed: ${e.message}")
-                                }
-                            }
 
-                            // Step 3: Replace trackers with dummy URL
-                            try {
-                                val replaced = replaceTrackersWithDummy(hash)
-                                Log.d(TAG, "Tracker: replaceTrackersWithDummy result=$replaced")
+                                    // Check nested data object
+                                    val dataObj = json.optJSONObject("data")
+                                    if (dataObj != null) {
+                                        for (key in dataObj.keys()) {
+                                            val value = dataObj.get(key).toString()
+                                            if (key.contains("peer", ignoreCase = true) ||
+                                                key.contains("id", ignoreCase = true)) {
+                                                Log.d(TAG, "Tracker: found data.$key = $value")
+                                            }
+                                            if (key.equals("peer_id", ignoreCase = true) && value.isNotEmpty()) {
+                                                discoveredPeerId = value
+                                            }
+                                        }
+                                    }
+
+                                    // Check for tracker info
+                                    val trackersArr = json.optJSONArray("trackers")
+                                    Log.d(TAG, "Tracker: trackers array = ${trackersArr?.toString()?.take(500) ?: "null"}")
+                                }
                             } catch (e: Exception) {
-                                Log.w(TAG, "Tracker: replaceTrackersWithDummy failed: ${e.message}")
+                                Log.w(TAG, "Tracker: GET probe error: ${e.message}")
                             }
 
-                            // Step 4: Verify tracker state after replacement
+                            // Method 2: Try RESTful endpoints
                             try {
-                                val verifyProps = getTorrServeTorrentProps(hash)
-                                if (verifyProps != null) {
-                                    Log.d(TAG, "Tracker: after replacement, trackers=${verifyProps.trackerUrls.size}, urls=${verifyProps.trackerUrls}")
+                                // GET /torrents/{hash}
+                                val restGet = okhttp3.Request.Builder()
+                                    .url("$TORRSERVE_HOST/torrents/$hash")
+                                    .get()
+                                    .build()
+                                torrServeClient.newCall(restGet).execute().use { resp ->
+                                    val body = resp.body?.string() ?: ""
+                                    Log.d(TAG, "Tracker: REST GET /torrents/$hash → HTTP ${resp.code}, body=${body.take(1000)}")
                                 }
-                            } catch (_: Exception) {}
+                            } catch (e: Exception) {
+                                Log.d(TAG, "Tracker: REST GET probe: ${e.message}")
+                            }
 
-                            // Step 5: Resume the torrent — if set-trackers worked,
-                            // the re-announce goes to the dummy URL instead of real tracker
+                            // Method 3: Try /torrents/{hash}/trackers
                             try {
-                                val resumeBody = JSONObject().apply {
-                                    put("action", "resume")
+                                val trackersGet = okhttp3.Request.Builder()
+                                    .url("$TORRSERVE_HOST/torrents/$hash/trackers")
+                                    .get()
+                                    .build()
+                                torrServeClient.newCall(trackersGet).execute().use { resp ->
+                                    val body = resp.body?.string() ?: ""
+                                    Log.d(TAG, "Tracker: GET /torrents/$hash/trackers → HTTP ${resp.code}, body=${body.take(1000)}")
+                                }
+                            } catch (e: Exception) {
+                                Log.d(TAG, "Tracker: trackers GET probe: ${e.message}")
+                            }
+
+                            // Method 4: Try DELETE /torrents/{hash}/trackers
+                            try {
+                                val trackersDelete = okhttp3.Request.Builder()
+                                    .url("$TORRSERVE_HOST/torrents/$hash/trackers")
+                                    .delete()
+                                    .build()
+                                torrServeClient.newCall(trackersDelete).execute().use { resp ->
+                                    val body = resp.body?.string() ?: ""
+                                    Log.d(TAG, "Tracker: DELETE /torrents/$hash/trackers → HTTP ${resp.code}, body=${body.take(500)}")
+                                }
+                            } catch (e: Exception) {
+                                Log.d(TAG, "Tracker: trackers DELETE probe: ${e.message}")
+                            }
+
+                            // Method 5: Try PUT /torrents/{hash} with empty trackers
+                            try {
+                                val putBody = JSONObject().apply {
+                                    put("trackers", JSONArray())
+                                }
+                                val putRequest = okhttp3.Request.Builder()
+                                    .url("$TORRSERVE_HOST/torrents/$hash")
+                                    .put(putBody.toString().toRequestBody("application/json".toMediaType()))
+                                    .header("Content-Type", "application/json")
+                                    .build()
+                                torrServeClient.newCall(putRequest).execute().use { resp ->
+                                    val body = resp.body?.string() ?: ""
+                                    Log.d(TAG, "Tracker: PUT /torrents/$hash with empty trackers → HTTP ${resp.code}, body=${body.take(500)}")
+                                }
+                            } catch (e: Exception) {
+                                Log.d(TAG, "Tracker: PUT probe: ${e.message}")
+                            }
+
+                            // Method 6: Try action=set-trackers with newline-separated format
+                            // (some TorrServe versions expect this specific format)
+                            try {
+                                val setTrackersBody = JSONObject().apply {
+                                    put("action", "set-trackers")
+                                    put("hash", hash)
+                                    put("trackers", "\n")  // newline = empty tracker list
+                                }
+                                val setTrackersReq = okhttp3.Request.Builder()
+                                    .url("$TORRSERVE_HOST/torrents")
+                                    .post(setTrackersBody.toString().toRequestBody("application/json".toMediaType()))
+                                    .header("Content-Type", "application/json")
+                                    .build()
+                                torrServeClient.newCall(setTrackersReq).execute().use { resp ->
+                                    val body = resp.body?.string() ?: ""
+                                    Log.d(TAG, "Tracker: set-trackers newline format → HTTP ${resp.code}, body=${body.take(500)}")
+                                }
+                            } catch (e: Exception) {
+                                Log.d(TAG, "Tracker: set-trackers newline: ${e.message}")
+                            }
+
+                            // Method 7: Try action=set-trackers with dummy URL
+                            try {
+                                val dummyBody = JSONObject().apply {
+                                    put("action", "set-trackers")
+                                    put("hash", hash)
+                                    put("trackers", "http://127.0.0.1:1/announce\n")
+                                }
+                                val dummyReq = okhttp3.Request.Builder()
+                                    .url("$TORRSERVE_HOST/torrents")
+                                    .post(dummyBody.toString().toRequestBody("application/json".toMediaType()))
+                                    .header("Content-Type", "application/json")
+                                    .build()
+                                torrServeClient.newCall(dummyReq).execute().use { resp ->
+                                    val body = resp.body?.string() ?: ""
+                                    Log.d(TAG, "Tracker: set-trackers dummy URL → HTTP ${resp.code}, body=${body.take(500)}")
+                                }
+                            } catch (e: Exception) {
+                                Log.d(TAG, "Tracker: set-trackers dummy: ${e.message}")
+                            }
+
+                            // === VERIFY: Check if any of the above actually changed the trackers ===
+                            try {
+                                Thread.sleep(2000)
+                                val verifyBody = JSONObject().apply {
+                                    put("action", "get")
                                     put("hash", hash)
                                 }
-                                val resumeRequest = okhttp3.Request.Builder()
+                                val verifyReq = okhttp3.Request.Builder()
                                     .url("$TORRSERVE_HOST/torrents")
-                                    .post(resumeBody.toString().toRequestBody("application/json".toMediaType()))
+                                    .post(verifyBody.toString().toRequestBody("application/json".toMediaType()))
                                     .header("Content-Type", "application/json")
                                     .build()
-                                torrServeClient.newCall(resumeRequest).execute().use { resp ->
-                                    Log.d(TAG, "Tracker: resume torrent → HTTP ${resp.code}")
+                                torrServeClient.newCall(verifyReq).execute().use { resp ->
+                                    val body = resp.body?.string() ?: ""
+                                    val json = JSONObject(body)
+                                    val trackersArr = json.optJSONArray("trackers")
+                                    val trackersStr = trackersArr?.toString() ?: "null"
+                                    Log.d(TAG, "Tracker: AFTER all attempts, trackers = $trackersStr")
                                 }
                             } catch (e: Exception) {
-                                Log.w(TAG, "Tracker: resume failed: ${e.message}")
+                                Log.w(TAG, "Tracker: verify error: ${e.message}")
                             }
 
-                            // Wait for any re-announce, then send stopped again
-                            Thread.sleep(5000)
-
-                            // Step 6: Send event=stopped again after resume
-                            // (in case TorrServe re-announced with event=started)
+                            // === Send event=stopped directly to tracker ===
+                            // Try with discovered peer_id, and also try WITHOUT peer_id
+                            // (some trackers only need info_hash + passkey)
                             if (originalBytes != null) {
                                 try {
                                     val infoHash = computeInfoHash(originalBytes)
                                     val announceUrl = extractAnnounceUrl(originalBytes)
                                     if (infoHash != null && announceUrl != null) {
-                                        val peerId = torrentProps?.peerId
-                                        val port = torrentProps?.listenPort ?: 6881
-                                        sendTrackerStopped(announceUrl, infoHash, peerId, port)
-                                        Log.d(TAG, "Tracker: second event=stopped sent after resume")
+                                        Log.d(TAG, "Tracker: discoveredPeerId=$discoveredPeerId, discoveredPort=$discoveredPort")
+
+                                        // Send with discovered peer_id
+                                        sendTrackerStopped(announceUrl, infoHash, discoveredPeerId, discoveredPort)
+
+                                        // Also send WITHOUT peer_id — just info_hash + passkey
+                                        // The passkey in the URL identifies the user, not the peer_id
+                                        sendTrackerStoppedNoPeerId(announceUrl, infoHash)
                                     }
                                 } catch (e: Exception) {
-                                    Log.w(TAG, "Tracker: second stopped failed: ${e.message}")
+                                    Log.w(TAG, "Tracker: event=stopped error: ${e.message}")
                                 }
                             }
 
-                            // Step 7: Start background reaper — re-sends event=stopped
-                            // every 30s for 30 minutes to counter any re-announces
+                            // === Background reaper: send event=stopped every 30s for 30 min ===
                             if (originalBytes != null) {
                                 try {
                                     val infoHash = computeInfoHash(originalBytes)
                                     val announceUrl = extractAnnounceUrl(originalBytes)
                                     if (infoHash != null && announceUrl != null) {
-                                        val reaperPeerId = torrentProps?.peerId
-                                        val reaperPort = torrentProps?.listenPort ?: 6881
+                                        val reaperPeerId = discoveredPeerId
+                                        val reaperPort = discoveredPort
                                         Thread {
                                             for (i in 1..60) {
                                                 try {
                                                     Thread.sleep(30000)
-                                                    Log.d(TAG, "Tracker reaper: event=stopped ($i/60)")
+                                                    Log.d(TAG, "Tracker reaper: stopped ($i/60)")
                                                     sendTrackerStopped(announceUrl, infoHash, reaperPeerId, reaperPort)
+                                                    sendTrackerStoppedNoPeerId(announceUrl, infoHash)
                                                 } catch (e: InterruptedException) {
                                                     break
                                                 } catch (e: Exception) {
@@ -1207,12 +1319,12 @@ class Arabp : MainAPI() {
                                         }.start()
                                     }
                                 } catch (e: Exception) {
-                                    Log.w(TAG, "Tracker reaper: failed to start: ${e.message}")
+                                    Log.w(TAG, "Tracker reaper: ${e.message}")
                                 }
                                 torrentBytesCache.remove(hash)
                             }
                         } catch (e: Exception) {
-                            Log.w(TAG, "Tracker removal background thread error: ${e.message}")
+                            Log.w(TAG, "Tracker removal error: ${e.message}")
                         }
                     }.start()
                 }
@@ -2252,6 +2364,58 @@ class Arabp : MainAPI() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "sendTrackerStopped error: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Send event=stopped to the tracker WITHOUT a peer_id.
+     * For private trackers that use passkey authentication, the passkey
+     * in the announce URL identifies the user. The tracker may accept
+     * event=stopped based on just info_hash + passkey, without peer_id.
+     */
+    private fun sendTrackerStoppedNoPeerId(announceUrl: String, infoHashHex: String): Boolean {
+        return try {
+            // Convert hex info_hash to URL-encoded binary format
+            val infoHashBytes = ByteArray(20)
+            for (i in 0 until 20) {
+                infoHashBytes[i] = infoHashHex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+            }
+
+            val encodedInfoHash = infoHashBytes.joinToString("") { byte ->
+                "%${String.format("%02x", byte.toInt() and 0xFF)}"
+            }
+
+            // Build announce URL with ONLY info_hash + passkey (no peer_id)
+            val separator = if ("?" in announceUrl) "&" else "?"
+            val stoppedUrl = buildString {
+                append(announceUrl)
+                append(separator)
+                append("info_hash=").append(encodedInfoHash)
+                append("&peer_id=")  // empty peer_id
+                append("&port=0")
+                append("&uploaded=0")
+                append("&downloaded=0")
+                append("&left=0")
+                append("&compact=1")
+                append("&event=stopped")
+                append("&numwant=0")
+            }
+
+            Log.d(TAG, "sendTrackerStoppedNoPeerId: sending to $announceUrl")
+
+            val request = Request.Builder()
+                .url(stoppedUrl)
+                .header("User-Agent", "libtorrent/1.2.19.0")
+                .build()
+
+            torrServeClient.newCall(request).execute().use { response ->
+                val body = response.body?.string() ?: ""
+                Log.d(TAG, "sendTrackerStoppedNoPeerId: HTTP ${response.code}, body=${body.take(300)}")
+                response.isSuccessful
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "sendTrackerStoppedNoPeerId error: ${e.message}")
             false
         }
     }
