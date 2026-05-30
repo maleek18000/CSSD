@@ -369,6 +369,28 @@ class Arabp : MainAPI() {
         return results
     }
 
+    /**
+     * Fetch the poster URL from a torrent's detail page.
+     * Returns the absolute poster URL or empty string on failure.
+     */
+    private fun fetchPosterFromDetail(detailUrl: String): String {
+        return try {
+            val request = Request.Builder()
+                .url(toAbsoluteUrl(detailUrl))
+                .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
+                .build()
+            authClient.newCall(request).execute().use { response ->
+                val body = response.body?.string() ?: return ""
+                val doc = Jsoup.parse(body, toAbsoluteUrl(detailUrl))
+                val posterSrc = doc.selectFirst("img.listing_poster")?.attr("src") ?: ""
+                toAbsoluteUrl(posterSrc)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchPosterFromDetail error for $detailUrl: ${e.message}")
+            ""
+        }
+    }
+
     private fun isFreeTorrent(row: Element): Boolean {
         if (row.selectFirst("span.free") != null) return true
         if (row.selectFirst("span.tor_free_link") != null) return true
@@ -412,8 +434,22 @@ class Arabp : MainAPI() {
                 if (seeders.isNotEmpty()) append(" | ▲$seeders")
             }
 
+            // Try to get poster from the row element first (no extra request)
+            val rowPoster = row.selectFirst("img.listing_poster")?.attr("src")
+                ?: row.selectFirst("img[src*=upload]")?.attr("src")
+                ?: row.selectFirst("img[src*=poster]")?.attr("src")
+                ?: ""
+            val posterUrl = if (rowPoster.isNotBlank()) {
+                toAbsoluteUrl(rowPoster)
+            } else {
+                fetchPosterFromDetail(detailHref)
+            }
+
             val epData = "$torrentId|$detailHref|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
-            newAnimeSearchResponse(displayName, epData, tvType) { this.posterUrl = "" }
+            newAnimeSearchResponse(displayName, epData, tvType) {
+                this.posterUrl = posterUrl
+                this.posterHeaders = imageHeaders
+            }
         } catch (e: Exception) {
             Log.e(TAG, "torrentRowToSearchResult Error: ${e.message}")
             null
@@ -442,8 +478,22 @@ class Arabp : MainAPI() {
                 if (isFree) append(" ✅مجاني")
             }
 
+            // Try to get poster from the row element first (no extra request)
+            val rowPoster = row.selectFirst("img.listing_poster")?.attr("src")
+                ?: row.selectFirst("img[src*=upload]")?.attr("src")
+                ?: row.selectFirst("img[src*=poster]")?.attr("src")
+                ?: ""
+            val posterUrl = if (rowPoster.isNotBlank()) {
+                toAbsoluteUrl(rowPoster)
+            } else {
+                fetchPosterFromDetail(detailHref)
+            }
+
             val epData = "$torrentId|$detailHref|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
-            newAnimeSearchResponse(displayName, epData, tvType) { this.posterUrl = "" }
+            newAnimeSearchResponse(displayName, epData, tvType) {
+                this.posterUrl = posterUrl
+                this.posterHeaders = imageHeaders
+            }
         } catch (e: Exception) {
             Log.e(TAG, "modernTorrentRowToSearchResult Error: ${e.message}")
             null
