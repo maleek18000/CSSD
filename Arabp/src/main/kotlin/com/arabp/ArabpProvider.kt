@@ -13,6 +13,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.json.JSONArray
 import org.json.JSONObject
@@ -28,7 +29,7 @@ class Arabp : MainAPI() {
     override var name = "Arabp"
     override val hasMainPage = true
     override var lang = "ar"
-    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
+    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA, TvType.TvSeries, TvType.Movie)
 
     companion object {
         private const val TAG = "Arabp_Log"
@@ -186,19 +187,53 @@ class Arabp : MainAPI() {
         }
     }
 
+    // ==================== AUTH-AWARE DOCUMENT FETCHING ====================
+
+    private fun requiresAuth(url: String): Boolean {
+        return url.contains("tv-listing") || url.contains("movies-listing")
+    }
+
+    private fun fetchDocWithAuth(url: String): Document? {
+        if (!ensureLogin()) return null
+        return try {
+            val request = Request.Builder()
+                .url(url)
+                .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
+                .build()
+            authClient.newCall(request).execute().use { response ->
+                val body = response.body?.string() ?: return null
+                Jsoup.parse(body, url)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchDocWithAuth error for $url: ${e.message}")
+            null
+        }
+    }
+
+    private suspend fun fetchDoc(url: String): Document? {
+        return if (requiresAuth(url)) {
+            fetchDocWithAuth(url)
+        } else {
+            app.get(url).document
+        }
+    }
+
     // ==================== HOME PAGE ====================
 
     override val mainPage = mainPageOf(
-        "$mainUrl/index.php?page=anime-listing" to "قائمة الانمي"
+        "$mainUrl/index.php?page=anime-listing" to "قائمة الانمي",
+        "$mainUrl/index.php?page=tv-listing" to "مسلسلات عربية",
+        "$mainUrl/index.php?page=movies-listing" to "أفلام عربية"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val url = if (page > 1) "${request.data}&pages=$page" else request.data
-        val doc = app.get(url).document
+        val doc = fetchDoc(url) ?: return newHomePageResponse(mutableListOf())
         val homeSets = mutableListOf<HomePageList>()
 
         try {
-            val items = doc.select("div.listing_div1").mapNotNull { toSearchResult(it) }
+            val tvType = tvTypeFromPage(request.data)
+            val items = doc.select("div.listing_div1").mapNotNull { toSearchResult(it, tvType) }
             if (items.isNotEmpty()) {
                 homeSets.add(HomePageList(request.name, items))
             }
@@ -209,10 +244,39 @@ class Arabp : MainAPI() {
         return newHomePageResponse(homeSets)
     }
 
-    private fun toSearchResult(element: Element): SearchResponse? {
+    private fun tvTypeFromPage(pageUrl: String): TvType {
+        return when {
+            pageUrl.contains("movies-listing") -> TvType.Movie
+            pageUrl.contains("tv-listing") -> TvType.TvSeries
+            else -> TvType.Anime
+        }
+    }
+
+    private fun tvTypeFromTitle(title: String): TvType {
+        return when {
+            title.contains("فيلم", ignoreCase = true) || title.contains("Movie", ignoreCase = true) -> TvType.Movie
+            else -> TvType.TvSeries
+        }
+    }
+
+    private fun TvType.toMovieType(): TvType = when (this) {
+        TvType.Movie -> TvType.Movie
+        TvType.Anime -> TvType.AnimeMovie
+        else -> TvType.Movie
+    }
+
+    private fun TvType.toSeriesType(): TvType = when (this) {
+        TvType.TvSeries -> TvType.TvSeries
+        TvType.Anime -> TvType.Anime
+        else -> TvType.TvSeries
+    }
+
+    private fun toSearchResult(element: Element, fallbackTvType: TvType = TvType.Anime): SearchResponse? {
         return try {
             val linkEl = element.selectFirst("div.listing_div2 a")
                 ?: element.selectFirst("a[href*=anime-listing]")
+                ?: element.selectFirst("a[href*=tv-listing]")
+                ?: element.selectFirst("a[href*=movies-listing]")
                 ?: return null
 
             val href = toAbsoluteUrl(linkEl.attr("href"))
@@ -224,12 +288,25 @@ class Arabp : MainAPI() {
                 ?: element.selectFirst("img")?.attr("src") ?: ""
 
             val tvType = when {
-                title.contains("فيلم", ignoreCase = true) || title.contains("Movie", ignoreCase = true) -> TvType.AnimeMovie
-                else -> TvType.Anime
+                title.contains("فيلم", ignoreCase = true) || title.contains("Movie", ignoreCase = true) -> {
+                    if (fallbackTvType == TvType.Anime) TvType.AnimeMovie else TvType.Movie
+                }
+                else -> fallbackTvType
             }
 
-            newAnimeSearchResponse(title, href, tvType) {
-                this.addPoster(toAbsoluteUrl(posterUrl), headers = imageHeaders)
+            when (tvType) {
+                TvType.Movie, TvType.AnimeMovie -> newMovieSearchResponse(title, href, tvType) {
+                    this.posterUrl = toAbsoluteUrl(posterUrl)
+                    this.posterHeaders = imageHeaders
+                }
+                TvType.TvSeries -> newTvSeriesSearchResponse(title, href, tvType) {
+                    this.posterUrl = toAbsoluteUrl(posterUrl)
+                    this.posterHeaders = imageHeaders
+                }
+                else -> newAnimeSearchResponse(title, href, tvType) {
+                    this.posterUrl = toAbsoluteUrl(posterUrl)
+                    this.posterHeaders = imageHeaders
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "toSearchResult Error: ${e.message}")
@@ -243,15 +320,22 @@ class Arabp : MainAPI() {
         val encoded = URLEncoder.encode(query, "UTF-8")
         val results = mutableListOf<SearchResponse>()
 
-        // Source 1: PUBLIC anime listing
-        try {
-            val animeUrl = "$mainUrl/index.php?page=anime-listing&search=$encoded"
-            val animeDoc = app.get(animeUrl).document
-            val animeResults = animeDoc.select("div.listing_div1").mapNotNull { toSearchResult(it) }
-            Log.d(TAG, "Anime listing search: found ${animeResults.size} results")
-            results.addAll(animeResults)
-        } catch (e: Exception) {
-            Log.e(TAG, "Anime listing search error: ${e.message}")
+        // Source 1: LISTINGS (anime=public, tv/movies=require auth)
+        val listingPages = listOf(
+            Triple("$mainUrl/index.php?page=anime-listing&search=$encoded", "anime", TvType.Anime),
+            Triple("$mainUrl/index.php?page=tv-listing&search=$encoded", "tv", TvType.TvSeries),
+            Triple("$mainUrl/index.php?page=movies-listing&search=$encoded", "movies", TvType.Movie)
+        )
+
+        for ((listingUrl, label, tvType) in listingPages) {
+            try {
+                val doc = fetchDoc(listingUrl)
+                val listingResults = doc?.select("div.listing_div1")?.mapNotNull { toSearchResult(it, tvType) } ?: emptyList()
+                Log.d(TAG, "$label listing search: found ${listingResults.size} results")
+                results.addAll(listingResults)
+            } catch (e: Exception) {
+                Log.e(TAG, "$label listing search error: ${e.message}")
+            }
         }
 
         // Source 2: PRIVATE torrents page
@@ -559,7 +643,7 @@ class Arabp : MainAPI() {
         if (url.contains("|")) return loadFromTorrentData(url)
 
         val fullUrl = toAbsoluteUrl(url)
-        val doc = app.get(fullUrl).document
+        val doc = fetchDoc(fullUrl) ?: return null
 
         return try {
             val h1 = doc.selectFirst("div.listing_div_id h1")
@@ -667,13 +751,15 @@ class Arabp : MainAPI() {
                 }
             }
 
+            val pageTvType = tvTypeFromPage(fullUrl)
+
             if (episodes.isEmpty()) {
-                newMovieLoadResponse(title, fullUrl, TvType.Anime, "0|$fullUrl|||0|0") {
+                newMovieLoadResponse(title, fullUrl, pageTvType.toMovieType(), "0|$fullUrl|||0|0") {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
                 }
             } else {
-                newTvSeriesLoadResponse(title, fullUrl, TvType.Anime, episodes) {
+                newTvSeriesLoadResponse(title, fullUrl, pageTvType.toSeriesType(), episodes) {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
                     this.seasonNames = seasonNamesList
@@ -739,9 +825,15 @@ class Arabp : MainAPI() {
 
         val absPosterUrl = toAbsoluteUrl(posterUrl)
 
+        // Determine TvType from detail URL
+        val pageTvType = if (detailUrl.contains("movies-listing")) TvType.Movie
+            else if (detailUrl.contains("tv-listing")) TvType.TvSeries
+            else if (detailUrl.contains("anime-listing")) TvType.Anime
+            else tvTypeFromTitle(title)
+
         // === EXTERNAL TORRENTS (magnet links): can't pre-resolve, fall back to movie ===
         if (isExternal && magnetUrl.startsWith("magnet:")) {
-            return newMovieLoadResponse(title, data, TvType.Anime, data) {
+            return newMovieLoadResponse(title, data, pageTvType.toMovieType(), data) {
                 this.posterUrl = absPosterUrl
                 this.posterHeaders = imageHeaders
             }
@@ -754,7 +846,7 @@ class Arabp : MainAPI() {
             // Failed to pre-resolve — fall back to TV series with one episode.
             // loadLinks() will try again when the user clicks play.
             Log.w(TAG, "Pre-resolve failed for torrent $torrentId, falling back to single-episode format")
-            return newTvSeriesLoadResponse(title, data, TvType.Anime, listOf(
+            return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), listOf(
                 newEpisode(data, fix = false, initializer = {
                     name = title
                     season = 1
@@ -772,7 +864,7 @@ class Arabp : MainAPI() {
             val entry = streamEntries.first()
             val epData = "ts://${entry.streamUrl}|${entry.fileName}"
             val tvType = if (title.contains("فيلم", ignoreCase = true) || title.contains("Movie", ignoreCase = true))
-                TvType.AnimeMovie else TvType.Anime
+                pageTvType.toMovieType() else pageTvType.toSeriesType()
             return newMovieLoadResponse(title, data, tvType, epData) {
                 this.posterUrl = absPosterUrl
                 this.posterHeaders = imageHeaders
@@ -782,7 +874,7 @@ class Arabp : MainAPI() {
         // Multiple video files → TV Series with smart show grouping
         val (episodes, seasonNames) = buildEpisodesFromEntries(streamEntries, absPosterUrl)
 
-        return newTvSeriesLoadResponse(title, data, TvType.Anime, episodes) {
+        return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), episodes) {
             this.posterUrl = absPosterUrl
             this.posterHeaders = imageHeaders
             this.seasonNames = seasonNames
