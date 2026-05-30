@@ -13,7 +13,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.jsoup.Jsoup
-import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.json.JSONArray
 import org.json.JSONObject
@@ -29,10 +28,7 @@ class Arabp : MainAPI() {
     override var name = "Arabp"
     override val hasMainPage = true
     override var lang = "ar"
-    override val supportedTypes = setOf(
-        TvType.Anime, TvType.AnimeMovie, TvType.OVA,
-        TvType.TvSeries, TvType.Movie
-    )
+    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
     companion object {
         private const val TAG = "Arabp_Log"
@@ -45,9 +41,9 @@ class Arabp : MainAPI() {
         private const val TORRSERVE_HOST = "http://127.0.0.1:8090"
 
         // How many times to poll TorrServe for file list after upload
-        private const val TORRSERVE_POLL_ATTEMPTS = 6
+        private const val TORRSERVE_POLL_ATTEMPTS = 20
         // Delay between polls (ms)
-        private const val TORRSERVE_POLL_DELAY = 1000L
+        private const val TORRSERVE_POLL_DELAY = 2000L
     }
 
     // Images require Referer header to avoid 403
@@ -190,122 +186,22 @@ class Arabp : MainAPI() {
         }
     }
 
-    // ==================== TV TYPE HELPERS ====================
-
-    /**
-     * Determine the appropriate TvType from a listing page URL.
-     * - anime-listing → Anime
-     * - tv-listing → TvSeries
-     * - movies-listing → Movie
-     */
-    private fun tvTypeFromPage(pageUrl: String): TvType {
-        return when {
-            pageUrl.contains("movies-listing") -> TvType.Movie
-            pageUrl.contains("tv-listing") -> TvType.TvSeries
-            else -> TvType.Anime
-        }
-    }
-
-    /**
-     * Determine TvType from a title string.
-     * Checks for Arabic/English movie keywords.
-     */
-    private fun tvTypeFromTitle(title: String): TvType {
-        return when {
-            title.contains("فيلم", ignoreCase = true) || title.contains("Movie", ignoreCase = true) -> TvType.Movie
-            else -> TvType.TvSeries
-        }
-    }
-
-    /**
-     * Get the search response constructor for a given TvType.
-     * CloudStream requires specific search response types for each TvType.
-     */
-    private fun buildSearchResponse(
-        title: String,
-        url: String,
-        tvType: TvType,
-        posterUrl: String = "",
-        posterHeaders: Map<String, String> = imageHeaders
-    ): SearchResponse {
-        return when (tvType) {
-            TvType.Movie, TvType.AnimeMovie -> newMovieSearchResponse(title, url, tvType) {
-                this.posterUrl = posterUrl
-                this.posterHeaders = posterHeaders
-            }
-            TvType.TvSeries -> newTvSeriesSearchResponse(title, url, tvType) {
-                this.posterUrl = posterUrl
-                this.posterHeaders = posterHeaders
-            }
-            else -> newAnimeSearchResponse(title, url, tvType) {
-                this.posterUrl = posterUrl
-                this.posterHeaders = posterHeaders
-            }
-        }
-    }
-
-    // ==================== AUTH-AWARE DOCUMENT FETCHING ====================
-
-    /**
-     * Whether a page URL requires authentication to view its content.
-     * Anime listing is public; tv-listing and movies-listing require login.
-     */
-    private fun requiresAuth(url: String): Boolean {
-        return url.contains("tv-listing") || url.contains("movies-listing")
-    }
-
-    /**
-     * Fetch an HTML document using authenticated OkHttp + Jsoup.
-     * Used for pages that require login (tv-listing, movies-listing).
-     */
-    private fun fetchDocWithAuth(url: String): Document? {
-        if (!ensureLogin()) return null
-        return try {
-            val request = Request.Builder()
-                .url(url)
-                .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
-                .build()
-            authClient.newCall(request).execute().use { response ->
-                val body = response.body?.string() ?: return null
-                Jsoup.parse(body, url)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "fetchDocWithAuth error for $url: ${e.message}")
-            null
-        }
-    }
-
-    /**
-     * Fetch a document with auth if needed, otherwise use CloudStream's app.get().
-     */
-    private suspend fun fetchDoc(url: String): Document? {
-        return if (requiresAuth(url)) {
-            fetchDocWithAuth(url)
-        } else {
-            app.get(url).document
-        }
-    }
-
     // ==================== HOME PAGE ====================
 
     override val mainPage = mainPageOf(
-        "$mainUrl/index.php?page=anime-listing" to "قائمة الانمي",
-        "$mainUrl/index.php?page=tv-listing" to "مسلسلات عربية",
-        "$mainUrl/index.php?page=movies-listing" to "أفلام عربية"
+        "$mainUrl/index.php?page=anime-listing" to "قائمة الانمي"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val url = if (page > 1) "${request.data}&pages=$page" else request.data
-        val doc = fetchDoc(url) ?: return newHomePageResponse(mutableListOf())
+        val doc = app.get(url).document
         val homeSets = mutableListOf<HomePageList>()
 
         try {
-            val tvType = tvTypeFromPage(request.data)
-            val items = doc.select("div.listing_div1").mapNotNull { toSearchResult(it, tvType) }
+            val items = doc.select("div.listing_div1").mapNotNull { toSearchResult(it) }
             if (items.isNotEmpty()) {
                 homeSets.add(HomePageList(request.name, items))
             }
-            Log.d(TAG, "MainPage ${request.name} page $page: found ${items.size} items")
             return newHomePageResponse(homeSets, items.isNotEmpty())
         } catch (e: Exception) {
             Log.e(TAG, "MainPage Error: ${e.message}")
@@ -313,13 +209,10 @@ class Arabp : MainAPI() {
         return newHomePageResponse(homeSets)
     }
 
-    private fun toSearchResult(element: Element, fallbackTvType: TvType = TvType.Anime): SearchResponse? {
+    private fun toSearchResult(element: Element): SearchResponse? {
         return try {
-            // Find the listing link - could be anime-listing, tv-listing, or movies-listing
             val linkEl = element.selectFirst("div.listing_div2 a")
                 ?: element.selectFirst("a[href*=anime-listing]")
-                ?: element.selectFirst("a[href*=tv-listing]")
-                ?: element.selectFirst("a[href*=movies-listing]")
                 ?: return null
 
             val href = toAbsoluteUrl(linkEl.attr("href"))
@@ -331,13 +224,13 @@ class Arabp : MainAPI() {
                 ?: element.selectFirst("img")?.attr("src") ?: ""
 
             val tvType = when {
-                title.contains("فيلم", ignoreCase = true) || title.contains("Movie", ignoreCase = true) -> {
-                    if (fallbackTvType == TvType.Anime) TvType.AnimeMovie else TvType.Movie
-                }
-                else -> fallbackTvType
+                title.contains("فيلم", ignoreCase = true) || title.contains("Movie", ignoreCase = true) -> TvType.AnimeMovie
+                else -> TvType.Anime
             }
 
-            buildSearchResponse(title, href, tvType, toAbsoluteUrl(posterUrl), imageHeaders)
+            newAnimeSearchResponse(title, href, tvType) {
+                this.addPoster(toAbsoluteUrl(posterUrl), headers = imageHeaders)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "toSearchResult Error: ${e.message}")
             null
@@ -350,22 +243,15 @@ class Arabp : MainAPI() {
         val encoded = URLEncoder.encode(query, "UTF-8")
         val results = mutableListOf<SearchResponse>()
 
-        // Source 1: LISTINGS (anime=public, tv/movies=require auth)
-        val listingPages = listOf(
-            Triple("$mainUrl/index.php?page=anime-listing&search=$encoded", "anime", TvType.Anime),
-            Triple("$mainUrl/index.php?page=tv-listing&search=$encoded", "tv", TvType.TvSeries),
-            Triple("$mainUrl/index.php?page=movies-listing&search=$encoded", "movies", TvType.Movie)
-        )
-
-        for ((listingUrl, label, tvType) in listingPages) {
-            try {
-                val doc = fetchDoc(listingUrl)
-                val listingResults = doc?.select("div.listing_div1")?.mapNotNull { toSearchResult(it, tvType) } ?: emptyList()
-                Log.d(TAG, "$label listing search: found ${listingResults.size} results")
-                results.addAll(listingResults)
-            } catch (e: Exception) {
-                Log.e(TAG, "$label listing search error: ${e.message}")
-            }
+        // Source 1: PUBLIC anime listing
+        try {
+            val animeUrl = "$mainUrl/index.php?page=anime-listing&search=$encoded"
+            val animeDoc = app.get(animeUrl).document
+            val animeResults = animeDoc.select("div.listing_div1").mapNotNull { toSearchResult(it) }
+            Log.d(TAG, "Anime listing search: found ${animeResults.size} results")
+            results.addAll(animeResults)
+        } catch (e: Exception) {
+            Log.e(TAG, "Anime listing search error: ${e.message}")
         }
 
         // Source 2: PRIVATE torrents page
@@ -431,10 +317,8 @@ class Arabp : MainAPI() {
             val isExternal = isExternalTorrent(row)
             val tvType = when {
                 categoryName.contains("فيلم", ignoreCase = true) || categoryName.contains("Movie", ignoreCase = true) ||
-                        name.contains("فيلم", ignoreCase = true) -> TvType.Movie
-                categoryName.contains("مسلسل", ignoreCase = true) || categoryName.contains("Series", ignoreCase = true) -> TvType.TvSeries
-                categoryName.contains("انمي", ignoreCase = true) || categoryName.contains("Anime", ignoreCase = true) -> TvType.Anime
-                else -> tvTypeFromTitle(name)
+                        name.contains("فيلم", ignoreCase = true) -> TvType.AnimeMovie
+                else -> TvType.Anime
             }
 
             val displayName = buildString {
@@ -445,7 +329,7 @@ class Arabp : MainAPI() {
             }
 
             val epData = "$torrentId|$detailHref|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
-            buildSearchResponse(displayName, epData, tvType)
+            newAnimeSearchResponse(displayName, epData, tvType) { this.posterUrl = "" }
         } catch (e: Exception) {
             Log.e(TAG, "torrentRowToSearchResult Error: ${e.message}")
             null
@@ -464,7 +348,10 @@ class Arabp : MainAPI() {
 
             val isFree = isFreeTorrent(row)
             val isExternal = isExternalTorrent(row)
-            val tvType = tvTypeFromTitle(name)
+            val tvType = when {
+                name.contains("فيلم", ignoreCase = true) || name.contains("Movie", ignoreCase = true) -> TvType.AnimeMovie
+                else -> TvType.Anime
+            }
 
             val displayName = buildString {
                 append(name)
@@ -472,136 +359,195 @@ class Arabp : MainAPI() {
             }
 
             val epData = "$torrentId|$detailHref|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
-            buildSearchResponse(displayName, epData, tvType)
+            newAnimeSearchResponse(displayName, epData, tvType) { this.posterUrl = "" }
         } catch (e: Exception) {
             Log.e(TAG, "modernTorrentRowToSearchResult Error: ${e.message}")
             null
         }
     }
 
-    // ==================== NATURAL SORT FOR EPISODE ORDERING ====================
+    // ==================== SMART FOLDER GROUPING ====================
+    //
+    // The key problem: simple extractFolderName() only takes the FIRST path
+    // component, but many torrents have a wrapper folder like:
+    //   "RootFolder/Show1/E01.mkv"
+    //   "RootFolder/Show2/E01.mkv"
+    // extractFolderName returns "RootFolder" for both → hasMultipleShows=false!
+    //
+    // Solution: analyze ALL paths together and find the grouping level
+    // where there are MULTIPLE distinct values.
 
     /**
-     * Natural sort key: pads digit sequences so that "E01" < "E02" < "E10"
-     * (not lexicographic "E01" < "E10" < "E02").
-     * Ensures Episode 1 appears at the top (ascending order).
+     * Represents a file's path split into components, with the computed
+     * "show name" (the grouping key at the diversity level).
      */
-    private fun naturalSortKey(str: String): String {
-        return str.replace(Regex("\\d+")) { match ->
-            match.value.padStart(6, '0')
-        }.lowercase()
+    data class PathGroup(
+        val path: String,           // Full normalized path
+        val fileName: String,       // Just the filename
+        val showName: String,       // Computed show/group name
+        val showDepth: Int          // How deep the show level is (0=root, 1=first folder, etc.)
+    )
+
+    /**
+     * Analyze all file paths together to find the correct grouping level.
+     *
+     * Algorithm:
+     * 1. Split every path into components
+     * 2. Find the shallowest level where there are 2+ distinct values
+     * 3. Group files by their value at that level
+     *
+     * Examples:
+     *   ["Show1/E01.mkv", "Show2/E01.mkv"]
+     *     → Level 0: {"Show1","Show2"} → 2 values → shows at level 0
+     *
+     *   ["Root/Show1/E01.mkv", "Root/Show2/E01.mkv"]
+     *     → Level 0: {"Root","Root"} → 1 value → skip
+     *     → Level 1: {"Show1","Show2"} → 2 values → shows at level 1
+     *
+     *   ["Show1/E01.mkv", "Show1/E02.mkv"]
+     *     → Level 0: {"Show1","Show1"} → 1 value → single show
+     */
+    private fun computeShowGroups(entries: List<TorrServeStreamEntry>): List<PathGroup> {
+        if (entries.isEmpty()) return emptyList()
+
+        // Split each entry's filePath into components
+        val pathParts = entries.map { entry ->
+            val parts = entry.filePath.split("/").filter { it.isNotEmpty() }
+            // Last component is the filename, rest are folders
+            Pair(entry, if (parts.isNotEmpty()) parts.dropLast(1) else emptyList())
+        }
+
+        // Find the maximum folder depth
+        val maxDepth = pathParts.maxOf { it.second.size }
+
+        // Find the shallowest level with 2+ distinct values
+        var showLevel = -1
+        for (level in 0 until maxDepth) {
+            val valuesAtLevel = pathParts.mapNotNull { it.second.getOrNull(level) }.toSet()
+            if (valuesAtLevel.size >= 2) {
+                showLevel = level
+                break
+            }
+        }
+
+        // Build PathGroup for each entry
+        return pathParts.map { (entry, parts) ->
+            val showName = if (showLevel >= 0 && showLevel < parts.size) {
+                parts[showLevel]
+            } else if (parts.isNotEmpty()) {
+                // All files share the same path prefix — single show
+                // Use the last folder component as the show name (or empty if only root)
+                if (parts.size > 1) parts.last() else parts.first()
+            } else {
+                "" // No folder at all
+            }
+
+            PathGroup(
+                path = entry.filePath,
+                fileName = entry.fileName,
+                showName = showName,
+                showDepth = showLevel
+            )
+        }
+    }
+
+    /**
+     * Check if the entries represent multiple shows based on smart grouping.
+     */
+    private fun hasMultipleShowsSmart(entries: List<TorrServeStreamEntry>): Boolean {
+        val groups = computeShowGroups(entries)
+        val distinctShows = groups.map { it.showName }.filter { it.isNotEmpty() }.toSet()
+        return distinctShows.size > 1
     }
 
     // ==================== BUILD EPISODES FROM STREAM ENTRIES ====================
+    //
+    // Shared logic for both load() and loadFromTorrentData().
+    // Creates per-file episodes with ts:// data, grouped by show/season.
 
     /**
-     * Build episodes and season data from a list of TorrServe stream entries.
+     * Build a list of Episodes from pre-resolved stream entries.
+     * Each video file becomes its own Episode with a ts:// data URL,
+     * so loadLinks() returns exactly ONE source (not a flat list of all files).
      *
-     * For multi-show torrents (multiple folders), each folder becomes a season
-     * with the folder name as the season name. Episodes are naturally sorted
-     * within each season so Episode 1 appears first.
-     *
-     * Returns Pair<episodes, seasonNames> where seasonNames is a List<SeasonData>.
+     * For multi-show torrents, each show becomes a SEASON with a readable name.
      */
     private fun buildEpisodesFromEntries(
-        entries: List<TorrServeStreamEntry>
+        streamEntries: List<TorrServeStreamEntry>,
+        absPosterUrl: String
     ): Pair<List<Episode>, List<SeasonData>> {
-        val sortedEntries = entries.sortedBy { naturalSortKey(it.fileName) }
-        val folderGroups = sortedEntries.groupBy { it.folderName }
-        val distinctFolders = folderGroups.keys.filter { it.isNotEmpty() }.sortedBy { naturalSortKey(it) }
+        val groups = computeShowGroups(streamEntries)
+        val distinctShows = groups.map { it.showName }.filter { it.isNotEmpty() }.distinct()
+        val isMultiShow = distinctShows.size > 1
 
         val episodes = mutableListOf<Episode>()
         val seasonNamesList = mutableListOf<SeasonData>()
-        val addedSeasons = mutableSetOf<Int>()
 
-        if (distinctFolders.size > 1) {
-            // MULTI-SHOW: each folder = one season
-            for ((folderIndex, folder) in distinctFolders.withIndex()) {
-                val seasonNum = folderIndex + 1
-                val folderEntries = folderGroups[folder] ?: continue
+        if (isMultiShow) {
+            // MULTI-SHOW: each show = one season
+            var seasonNum = 1
 
-                // Add season name (only once per season)
-                if (!addedSeasons.contains(seasonNum)) {
-                    seasonNamesList.add(SeasonData(seasonNum, folder))
-                    addedSeasons.add(seasonNum)
-                }
+            for (showName in distinctShows) {
+                seasonNamesList.add(SeasonData(season = seasonNum, name = showName))
 
-                // Create one episode per file in this folder
-                for ((epIndex, entry) in folderEntries.withIndex()) {
+                // Find all entries belonging to this show
+                val showEntries = groups.filter { it.showName == showName }
+                for ((epIndex, group) in showEntries.withIndex()) {
+                    // Find the original TorrServeStreamEntry for this file
+                    val entry = streamEntries.find { it.filePath == group.path } ?: continue
                     val epData = "ts://${entry.streamUrl}|${entry.fileName}"
+
                     episodes.add(
-                        newEpisode(epData) {
+                        newEpisode(epData, fix = false, initializer = {
                             name = entry.fileName
                             season = seasonNum
                             episode = epIndex + 1
-                        }
+                            this.posterUrl = absPosterUrl
+                        })
                     )
                 }
+                seasonNum++
             }
 
-            // Files without a folder → "Other" season
-            val otherEntries = folderGroups[""]
-            if (otherEntries != null && otherEntries.isNotEmpty()) {
-                val otherSeasonNum = distinctFolders.size + 1
-                if (!addedSeasons.contains(otherSeasonNum)) {
-                    seasonNamesList.add(SeasonData(otherSeasonNum, "أخرى"))
-                    addedSeasons.add(otherSeasonNum)
-                }
-                for ((epIndex, entry) in otherEntries.withIndex()) {
+            // Files without a show name → put in next season
+            val noShowEntries = groups.filter { it.showName.isEmpty() }
+            if (noShowEntries.isNotEmpty()) {
+                seasonNamesList.add(SeasonData(season = seasonNum, name = "أخرى"))
+                for ((epIndex, group) in noShowEntries.withIndex()) {
+                    val entry = streamEntries.find { it.filePath == group.path } ?: continue
                     val epData = "ts://${entry.streamUrl}|${entry.fileName}"
+
                     episodes.add(
-                        newEpisode(epData) {
+                        newEpisode(epData, fix = false, initializer = {
                             name = entry.fileName
-                            season = otherSeasonNum
+                            season = seasonNum
                             episode = epIndex + 1
-                        }
+                            this.posterUrl = absPosterUrl
+                        })
                     )
                 }
             }
-        } else if (distinctFolders.size == 1) {
-            // SINGLE folder: one season named after the folder
-            val folder = distinctFolders.first()
-            val folderEntries = folderGroups[folder] ?: emptyList()
-            seasonNamesList.add(SeasonData(1, folder))
 
-            for ((epIndex, entry) in folderEntries.withIndex()) {
-                val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-                episodes.add(
-                    newEpisode(epData) {
-                        name = entry.fileName
-                        season = 1
-                        episode = epIndex + 1
-                    }
-                )
-            }
-
-            // Also handle root-level files if any
-            val rootEntries = folderGroups[""]
-            if (rootEntries != null && rootEntries.isNotEmpty()) {
-                for ((epIndex, entry) in rootEntries.withIndex()) {
-                    val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-                    episodes.add(
-                        newEpisode(epData) {
-                            name = entry.fileName
-                            season = 1
-                            episode = folderEntries.size + epIndex + 1
-                        }
-                    )
-                }
-            }
+            Log.d(TAG, "buildEpisodes: MULTI-SHOW → ${episodes.size} episodes in ${seasonNamesList.size} seasons")
         } else {
-            // NO folders: all files in root, single season
-            seasonNamesList.add(SeasonData(1, "الموسم 1"))
-            for ((epIndex, entry) in sortedEntries.withIndex()) {
+            // SINGLE-SHOW: all files in season 1
+            val showLabel = distinctShows.firstOrNull() ?: ""
+            val sName = if (showLabel.isNotEmpty()) showLabel else "مواسم" // "Seasons"
+            seasonNamesList.add(SeasonData(season = 1, name = sName))
+
+            for ((epIndex, entry) in streamEntries.withIndex()) {
                 val epData = "ts://${entry.streamUrl}|${entry.fileName}"
                 episodes.add(
-                    newEpisode(epData) {
+                    newEpisode(epData, fix = false, initializer = {
                         name = entry.fileName
                         season = 1
                         episode = epIndex + 1
-                    }
+                        this.posterUrl = absPosterUrl
+                    })
                 )
             }
+
+            Log.d(TAG, "buildEpisodes: SINGLE-SHOW → ${episodes.size} episodes")
         }
 
         return Pair(episodes, seasonNamesList)
@@ -613,7 +559,7 @@ class Arabp : MainAPI() {
         if (url.contains("|")) return loadFromTorrentData(url)
 
         val fullUrl = toAbsoluteUrl(url)
-        val doc = fetchDoc(fullUrl) ?: return null
+        val doc = app.get(fullUrl).document
 
         return try {
             val h1 = doc.selectFirst("div.listing_div_id h1")
@@ -625,14 +571,10 @@ class Arabp : MainAPI() {
                 ?: doc.selectFirst("img.listing_poster")?.attr("src") ?: ""
 
             val absPosterUrl = toAbsoluteUrl(posterUrl)
-
-            // Determine TvType from the URL
-            val pageTvType = tvTypeFromPage(fullUrl)
-
             val rows = doc.select("table#listing_table tr")
-            val allEpisodes = mutableListOf<Episode>()
-            val allSeasonNames = mutableListOf<SeasonData>()
-            val addedSeasons = mutableSetOf<Int>()
+            val episodes = mutableListOf<Episode>()
+            val seasonNamesList = mutableListOf<SeasonData>()
+            var globalSeasonNum = 1
 
             for (row in rows) {
                 val nameLink = row.selectFirst("a[href*=torrent-details]") ?: continue
@@ -659,66 +601,83 @@ class Arabp : MainAPI() {
                 )
 
                 if (streamEntries == null || streamEntries.isEmpty()) {
-                    // Pre-resolve failed — fall back to legacy data
+                    // Pre-resolve failed — fall back to legacy data (one episode = one torrent)
                     val epData = "$torrentId|${toAbsoluteUrl(detailHref)}|${toAbsoluteUrl(downloadHref)}||${if (isFree) "1" else "0"}|0"
-                    allEpisodes.add(
-                        newEpisode(epData) {
+                    seasonNamesList.add(SeasonData(season = globalSeasonNum, name = displayName))
+                    episodes.add(
+                        newEpisode(epData, fix = false, initializer = {
                             name = displayName
-                        }
+                            season = globalSeasonNum
+                            episode = 1
+                            this.posterUrl = absPosterUrl
+                        })
                     )
+                    globalSeasonNum++
                     continue
                 }
 
+                // Pre-resolve succeeded — build per-file episodes
                 if (streamEntries.size == 1) {
-                    // Single file → one episode
+                    // Single file → one episode in its own season
                     val entry = streamEntries.first()
                     val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-                    allEpisodes.add(
-                        newEpisode(epData) {
+                    seasonNamesList.add(SeasonData(season = globalSeasonNum, name = displayName))
+                    episodes.add(
+                        newEpisode(epData, fix = false, initializer = {
                             name = displayName
-                        }
+                            season = globalSeasonNum
+                            episode = 1
+                            this.posterUrl = absPosterUrl
+                        })
                     )
+                    globalSeasonNum++
                 } else {
-                    // Multiple files → use buildEpisodesFromEntries with seasons
-                    val (eps, seasonNames) = buildEpisodesFromEntries(streamEntries)
+                    // Multiple files — use smart grouping for seasons
+                    val (fileEpisodes, fileSeasonNames) = buildEpisodesFromEntries(streamEntries, absPosterUrl)
 
-                    // Offset season numbers so they don't collide with previous torrents
-                    val seasonOffset = allSeasonNames.size
-                    for (ep in eps) {
-                        val origSeason = ep.season ?: 1
-                        val newSeason = seasonOffset + origSeason
-                        allEpisodes.add(
-                            newEpisode(ep.data ?: "") {
-                                name = ep.name
-                                season = newSeason
+                    // Build a lookup map from the SeasonData list for easy access
+                    val fileSeasonMap = fileSeasonNames.associate { it.season to (it.name ?: "") }
+
+                    // Add one SeasonData per unique remapped season (not per episode!)
+                    for ((localSeason, showName) in fileSeasonMap) {
+                        val remappedSeason = globalSeasonNum + localSeason - 1
+                        val seasonDisplay = if (fileSeasonMap.size > 1) {
+                            "$displayName — $showName"
+                        } else {
+                            displayName
+                        }
+                        seasonNamesList.add(SeasonData(season = remappedSeason, name = seasonDisplay))
+                    }
+
+                    // Remap season numbers in episodes to our global numbering
+                    for (ep in fileEpisodes) {
+                        val localSeason = ep.season ?: 1
+                        val remappedSeason = globalSeasonNum + localSeason - 1
+
+                        episodes.add(
+                            newEpisode(ep.data ?: "", fix = false, initializer = {
+                                name = ep.name ?: ""
+                                season = remappedSeason
                                 episode = ep.episode
-                            }
+                                this.posterUrl = absPosterUrl
+                            })
                         )
                     }
-                    // Add season names with offset
-                    for (sd in seasonNames) {
-                        val newSeasonNum = seasonOffset + sd.season
-                        if (!addedSeasons.contains(newSeasonNum)) {
-                            allSeasonNames.add(SeasonData(newSeasonNum, sd.name))
-                            addedSeasons.add(newSeasonNum)
-                        }
-                    }
+                    globalSeasonNum += fileSeasonMap.size
                 }
             }
 
-            if (allEpisodes.isEmpty()) {
-                newMovieLoadResponse(title, fullUrl, pageTvType.toMovieType(), "0|$fullUrl|||0|0") {
+            if (episodes.isEmpty()) {
+                newMovieLoadResponse(title, fullUrl, TvType.Anime, "0|$fullUrl|||0|0") {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
                 }
             } else {
-                val response = newTvSeriesLoadResponse(title, fullUrl, pageTvType.toSeriesType(), allEpisodes) {
+                newTvSeriesLoadResponse(title, fullUrl, TvType.Anime, episodes) {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
-                    seasonNames = allSeasonNames.ifEmpty { null }
+                    this.seasonNames = seasonNamesList
                 }
-                Log.d(TAG, "load: returning TvSeriesLoadResponse with ${allEpisodes.size} episodes, seasonNames=${allSeasonNames.map { "S${it.season}=${it.name}" }}")
-                response
             }
         } catch (e: Exception) {
             Log.e(TAG, "Load Error: ${e.message}")
@@ -728,17 +687,24 @@ class Arabp : MainAPI() {
 
     // ==================== LOAD FROM TORRENT DATA ====================
     //
-    // PRE-RESOLVE STRATEGY:
-    // Instead of waiting for loadLinks() to download/upload the torrent,
-    // we do it right here in load() so we can create proper episode entries.
+    // Called when the URL contains "|" (pipe-delimited torrent data
+    // from search results). This is a SINGLE torrent, so we CAN
+    // pre-resolve it via TorrServe to detect multi-show structure.
     //
-    // For MULTI-SHOW torrents (multiple folders), each show/folder
-    // becomes its own season in CloudStream's UI, with episodes nested
-    // under each season.
+    // Strategy:
+    // - Pre-resolve the torrent (download .torrent → upload to TorrServe)
+    // - If torrent has MULTIPLE shows (detected via smart grouping):
+    //   Each show becomes a SEASON with a readable name. User picks a
+    //   season (show) first, then sees only that show's episodes.
+    // - If torrent has ONE show:
+    //   Each video file becomes one Episode. All in season 1.
+    // - If pre-resolve fails:
+    //   Fall back to one episode with legacy data; loadLinks() will
+    //   try again and show all files with folder-based naming.
     //
-    // Episode data format:
-    //   ts://STREAM_URL|FILENAME
-    //   (loadLinks detects the ts:// prefix and creates ExtractorLink)
+    // Episode data formats:
+    //   ts://STREAM_URL|FILENAME  — pre-resolved direct stream (one source)
+    //   pipe-delimited            — legacy fallback (all files as sources)
 
     private suspend fun loadFromTorrentData(data: String): LoadResponse? {
         val parts = data.split("|", limit = 6)
@@ -773,15 +739,9 @@ class Arabp : MainAPI() {
 
         val absPosterUrl = toAbsoluteUrl(posterUrl)
 
-        // Determine TvType from title and detail URL
-        val pageTvType = if (detailUrl.contains("movies-listing")) TvType.Movie
-            else if (detailUrl.contains("tv-listing")) TvType.TvSeries
-            else if (detailUrl.contains("anime-listing")) TvType.Anime
-            else tvTypeFromTitle(title)
-
         // === EXTERNAL TORRENTS (magnet links): can't pre-resolve, fall back to movie ===
         if (isExternal && magnetUrl.startsWith("magnet:")) {
-            return newMovieLoadResponse(title, data, pageTvType.toMovieType(), data) {
+            return newMovieLoadResponse(title, data, TvType.Anime, data) {
                 this.posterUrl = absPosterUrl
                 this.posterHeaders = imageHeaders
             }
@@ -791,47 +751,42 @@ class Arabp : MainAPI() {
         val streamEntries = tryResolveTorrent(torrentId, detailUrl, downloadUrl, isFree)
 
         if (streamEntries.isNullOrEmpty()) {
-            // Failed to pre-resolve — fall back to movie format.
+            // Failed to pre-resolve — fall back to TV series with one episode.
             // loadLinks() will try again when the user clicks play.
-            Log.w(TAG, "Pre-resolve failed for torrent $torrentId, falling back to movie format")
-            return newMovieLoadResponse(title, data, pageTvType.toMovieType(), data) {
+            Log.w(TAG, "Pre-resolve failed for torrent $torrentId, falling back to single-episode format")
+            return newTvSeriesLoadResponse(title, data, TvType.Anime, listOf(
+                newEpisode(data, fix = false, initializer = {
+                    name = title
+                    season = 1
+                    episode = 1
+                    this.posterUrl = absPosterUrl
+                })
+            )) {
                 this.posterUrl = absPosterUrl
                 this.posterHeaders = imageHeaders
             }
         }
 
-        // Sort entries naturally (Episode 1 first)
-        val sortedEntries = streamEntries.sortedBy { naturalSortKey(it.fileName) }
-
         // Single video file → Movie
-        if (sortedEntries.size == 1) {
-            val entry = sortedEntries.first()
+        if (streamEntries.size == 1) {
+            val entry = streamEntries.first()
             val epData = "ts://${entry.streamUrl}|${entry.fileName}"
             val tvType = if (title.contains("فيلم", ignoreCase = true) || title.contains("Movie", ignoreCase = true))
-                pageTvType.toMovieType() else pageTvType.toSeriesType()
+                TvType.AnimeMovie else TvType.Anime
             return newMovieLoadResponse(title, data, tvType, epData) {
                 this.posterUrl = absPosterUrl
                 this.posterHeaders = imageHeaders
             }
         }
 
-        // Multiple video files → TV Series with seasons (using buildEpisodesFromEntries)
-        val (episodes, seasonData) = buildEpisodesFromEntries(sortedEntries)
+        // Multiple video files → TV Series with smart show grouping
+        val (episodes, seasonNames) = buildEpisodesFromEntries(streamEntries, absPosterUrl)
 
-        Log.d(TAG, "loadFromTorrentData: ${episodes.size} episodes, ${seasonData.size} seasons")
-        for (sd in seasonData) {
-            Log.d(TAG, "  Season ${sd.season}: ${sd.name}")
-        }
-        for (ep in episodes) {
-            Log.d(TAG, "  S${ep.season}E${ep.episode}: ${ep.name}")
-        }
-
-        val response = newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), episodes) {
+        return newTvSeriesLoadResponse(title, data, TvType.Anime, episodes) {
             this.posterUrl = absPosterUrl
             this.posterHeaders = imageHeaders
-            seasonNames = seasonData.ifEmpty { null }
+            this.seasonNames = seasonNames
         }
-        return response
     }
 
     /**
@@ -909,21 +864,20 @@ class Arabp : MainAPI() {
 
     // ==================== LOAD LINKS ====================
     //
-    // Data formats handled:
+    // Two data formats handled:
     //
     // 1. Pre-resolved stream (ts://...):
     //    Format: ts://STREAM_URL|FILENAME
     //    The torrent was already uploaded to TorrServe in load().
-    //    We create one ExtractorLink directly.
-    //    This is now used for ALL pre-resolved episodes (including multi-show).
+    //    We create ONE ExtractorLink directly — the user sees exactly
+    //    one source, not a flat list of all episodes.
     //
-    // 2. Legacy folder (tsfolder://...) — DEPRECATED, kept for cached data:
-    //    Format: tsfolder://FOLDER_NAME|FILE_COUNT|ts://URL1|FILE1;;ts://URL2|FILE2;;...
-    //
-    // 3. Legacy (pipe-delimited):
+    // 2. Legacy (pipe-delimited):
     //    Format: torrentId|detailUrl|downloadUrl|magnetUrl|isFree|isExternal
     //    The full download/upload cycle runs here.
     //    Used as fallback when pre-resolve failed.
+    //    For multi-folder torrents, folder names are added to link names
+    //    so the user can identify which show each file belongs to.
 
     override suspend fun loadLinks(
         data: String,
@@ -931,65 +885,10 @@ class Arabp : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // === PRE-RESOLVED FOLDER: show with multiple episodes ===
-        // Handle both clean "tsfolder://..." and fixUrl-corrupted versions
-        val folderData = if (data.startsWith("tsfolder://")) {
-            data
-        } else if (data.contains("tsfolder://")) {
-            data.substring(data.indexOf("tsfolder://"))
-        } else {
-            null
-        }
-
-        if (folderData != null) {
-            val afterPrefix = folderData.substringAfter("tsfolder://")
-            // Format: FOLDER_NAME|FILE_COUNT|ts://URL1|FILE1;;ts://URL2|FILE2;;...
-            val firstPipe = afterPrefix.indexOf('|')
-            if (firstPipe < 0) return false
-            val folderName = afterPrefix.substring(0, firstPipe)
-
-            val afterFolder = afterPrefix.substring(firstPipe + 1)
-            val secondPipe = afterFolder.indexOf('|')
-            if (secondPipe < 0) return false
-            val fileCountStr = afterFolder.substring(0, secondPipe)
-            val filesPart = afterFolder.substring(secondPipe + 1)
-
-            // Parse each ts:// entry separated by ;;
-            val fileEntries = filesPart.split(";;")
-            Log.d(TAG, "loadLinks: folder '$folderName' with $fileCountStr files, parsed ${fileEntries.size} entries")
-
-            for (entry in fileEntries) {
-                if (!entry.startsWith("ts://")) continue
-                val afterTs = entry.substringAfter("ts://")
-                val pipeIdx = afterTs.indexOf('|')
-                val streamUrl = if (pipeIdx >= 0) afterTs.substring(0, pipeIdx) else afterTs
-                val fileName = if (pipeIdx >= 0) afterTs.substring(pipeIdx + 1) else "Video"
-
-                callback(
-                    newExtractorLink(
-                        source = this.name,
-                        name = fileName,
-                        url = streamUrl,
-                        type = ExtractorLinkType.VIDEO
-                    )
-                )
-            }
-            return fileEntries.isNotEmpty()
-        }
-
-        // === PRE-RESOLVED STREAM: single direct link from load() ===
-        // Handle both clean "ts://..." and fixUrl-corrupted "https://www.arabp2p.net/ts://..."
-        val tsData = if (data.startsWith("ts://")) {
-            data
-        } else if (data.contains("ts://")) {
-            // fixUrl may have prepended mainUrl, extract the ts:// part
-            data.substring(data.indexOf("ts://"))
-        } else {
-            null
-        }
-
-        if (tsData != null) {
-            val afterPrefix = tsData.substringAfter("ts://")
+        // === PRE-RESOLVED STREAM: direct link from load() ===
+        // Each episode has its own ts:// URL, so the user sees ONE source.
+        if (data.startsWith("ts://")) {
+            val afterPrefix = data.substringAfter("ts://")
             val pipeIndex = afterPrefix.indexOf('|')
             val streamUrl = if (pipeIndex >= 0) afterPrefix.substring(0, pipeIndex) else afterPrefix
             val fileName = if (pipeIndex >= 0) afterPrefix.substring(pipeIndex + 1) else "Video"
@@ -1091,15 +990,19 @@ class Arabp : MainAPI() {
                             Log.d(TAG, "Downloaded .torrent: ${result.bytes.size} bytes, uploading to TorrServe...")
                             val streamEntries = uploadToTorrServe(result.bytes, torrentId)
                             if (streamEntries != null && streamEntries.isNotEmpty()) {
-                                // Sort entries naturally (Episode 1 first)
-                                val sortedEntries = streamEntries.sortedBy { naturalSortKey(it.fileName) }
-                                for ((index, entry) in sortedEntries.withIndex()) {
-                                    val linkName = if (sortedEntries.size == 1) {
-                                        "${this.name} (TorrServe)"
-                                    } else {
-                                        entry.fileName
+                                // Use smart grouping for better naming
+                                val groups = computeShowGroups(streamEntries)
+                                val distinctShows = groups.map { it.showName }.filter { it.isNotEmpty() }.distinct()
+                                val isMultiShow = distinctShows.size > 1
+
+                                for (entry in streamEntries) {
+                                    val group = groups.find { it.path == entry.filePath }
+                                    val linkName = when {
+                                        streamEntries.size == 1 -> "${this.name} (TorrServe)"
+                                        isMultiShow && group != null && group.showName.isNotEmpty() -> "[${group.showName}] ${entry.fileName}"
+                                        else -> entry.fileName
                                     }
-                                    Log.d(TAG, "TorrServe link [$index]: ${entry.fileName} → ${entry.streamUrl}")
+                                    Log.d(TAG, "TorrServe link: ${entry.fileName} → ${entry.streamUrl} (show: ${group?.showName})")
                                     callback(
                                         newExtractorLink(
                                             source = this.name,
@@ -1120,28 +1023,25 @@ class Arabp : MainAPI() {
                                 newExtractorLink(
                                     source = this.name,
                                     name = "\u274C تجاوزت الحد اليومي للتحميل",
-                                    url = "error://daily-limit-exceeded",
+                                    url = "$mainUrl/",
                                     type = ExtractorLinkType.VIDEO
                                 )
                             )
                             foundLink = true
                         }
                         is TorrentDownloadResult.NotLoggedIn -> {
-                            Log.e(TAG, "Session expired — resetting login state")
                             isLoggedIn = false
+                            Log.e(TAG, "Session expired for torrent id=$torrentId")
                         }
                         is TorrentDownloadResult.Error -> {
-                            Log.e(TAG, "Failed to download .torrent: ${result.message}")
+                            Log.e(TAG, "Download error for torrent id=$torrentId: ${result.message}")
                         }
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "TorrServe integration error: ${e.message}")
+                    Log.e(TAG, "TorrServe processing error: ${e.message}")
                 }
             }
 
-            if (!foundLink) {
-                Log.e(TAG, "No links found for torrent id=$torrentId")
-            }
             foundLink
         } catch (e: Exception) {
             Log.e(TAG, "loadLinks Error: ${e.message}")
@@ -1208,19 +1108,13 @@ class Arabp : MainAPI() {
     data class TorrServeStreamEntry(
         val fileName: String,      // Just the filename (e.g. "Episode01.mkv")
         val filePath: String,      // Full path within torrent (e.g. "ShowName/Episode01.mkv")
-        val folderName: String,    // Parent folder / show name (e.g. "ShowName"), empty if in root
+        val folderName: String,    // Legacy: first folder component (for backward compat)
         val fileIndex: Int,        // TorrServe file index (1-based)
         val streamUrl: String      // Full stream URL with correct index
     )
 
     /**
      * Upload .torrent to TorrServe, then poll for file list.
-     *
-     * Flow:
-     * 1. POST /torrent/upload with .torrent file → get hash
-     * 2. Try to parse file_stats from upload response
-     * 3. If empty, poll POST /torrents {"action":"get","hash":...} with retries
-     * 4. Filter to video files, group by folder, return stream entries
      */
     private fun uploadToTorrServe(torrentBytes: ByteArray, torrentId: String): List<TorrServeStreamEntry>? {
         return try {
@@ -1285,7 +1179,7 @@ class Arabp : MainAPI() {
                 )
             }
 
-            // Filter to only video files and create stream entries with folder info
+            // Filter to only video files and create stream entries
             val videoEntries = fileStats
                 .filter { (path, _) -> isVideoFile(path) }
                 .map { (path, id) ->
@@ -1318,8 +1212,8 @@ class Arabp : MainAPI() {
                     )
                 )
             } else {
-                // Sort naturally by filename (Episode 1 before Episode 10)
-                videoEntries.sortedBy { naturalSortKey(it.fileName) }
+                // Sort: by full path for consistent ordering
+                videoEntries.sortedBy { it.filePath }
             }
         } catch (e: java.net.ConnectException) {
             Log.e(TAG, "TorrServe connection refused — is TorrServe running on $TORRSERVE_HOST?")
@@ -1332,9 +1226,6 @@ class Arabp : MainAPI() {
 
     /**
      * Poll TorrServe's POST /torrents API to get file_stats.
-     * The torrent may need time to resolve its metadata (stat=1 → stat=3).
-     *
-     * Returns list of (path, id) pairs, or empty list if polling fails.
      */
     private fun pollTorrServeFileList(hash: String): List<Pair<String, Int>> {
         for (attempt in 1..TORRSERVE_POLL_ATTEMPTS) {
@@ -1349,6 +1240,7 @@ class Arabp : MainAPI() {
                 val request = Request.Builder()
                     .url("$TORRSERVE_HOST/torrents")
                     .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
+                    .header("Content-Type", "application/json")
                     .build()
 
                 torrServeClient.newCall(request).execute().use { response ->
@@ -1358,150 +1250,151 @@ class Arabp : MainAPI() {
                     }
 
                     val responseBody = response.body?.string() ?: return@use
-                    Log.d(TAG, "TorrServe poll attempt $attempt: ${responseBody.take(300)}")
+                    val resultJson = JSONObject(responseBody)
 
-                    val fileStats = parseFileStatsFromResponse(responseBody)
-                    if (fileStats.isNotEmpty()) {
-                        Log.d(TAG, "TorrServe poll SUCCESS on attempt $attempt: ${fileStats.size} files")
-                        return fileStats
-                    }
+                    // Check if torrent is ready (stat=3 means metadata resolved)
+                    val stat = resultJson.optInt("stat", 0)
+                    Log.d(TAG, "TorrServe poll attempt $attempt: stat=$stat")
 
-                    // Check torrent status
-                    try {
-                        val json = JSONObject(responseBody)
-                        val stat = json.optInt("stat", -1)
-                        val statString = json.optString("stat_string", "")
-                        Log.d(TAG, "TorrServe torrent stat=$stat ($statString)")
-
-                        // stat=4 means closed/errored — no point polling further
-                        if (stat == 4) {
-                            Log.e(TAG, "TorrServe torrent closed/errored, stopping polls")
-                            return emptyList()
+                    if (stat == 3 || stat == 4) {
+                        val stats = parseFileStatsFromJsonObj(resultJson)
+                        if (stats.isNotEmpty()) {
+                            Log.d(TAG, "TorrServe poll SUCCESS: ${stats.size} files after $attempt attempts")
+                            return stats
                         }
-                    } catch (_: Exception) {}
+                    }
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "TorrServe poll attempt $attempt error: ${e.message}")
             }
         }
 
-        Log.w(TAG, "TorrServe polling exhausted after $TORRSERVE_POLL_ATTEMPTS attempts")
+        Log.e(TAG, "TorrServe polling exhausted after $TORRSERVE_POLL_ATTEMPTS attempts")
         return emptyList()
     }
 
-    // ==================== JSON PARSING (using JSONObject for reliability) ====================
+    // ==================== TORRSERVE RESPONSE PARSING ====================
 
-    /**
-     * Parse hash from TorrServe JSON response using JSONObject.
-     */
-    private fun parseHashFromResponse(json: String): String? {
+    private fun parseHashFromResponse(body: String): String? {
         return try {
-            val obj = JSONObject(json)
-            val hashValue = obj.optString("hash", "")
-            if (hashValue.isNotEmpty()) hashValue.lowercase() else null
+            val json = JSONObject(body)
+            json.optString("hash", null)
+                ?: json.optJSONObject("data")?.optString("hash", null)
+                ?: run {
+                    val dataArr = json.optJSONArray("data")
+                    if (dataArr != null && dataArr.length() > 0) {
+                        dataArr.getJSONObject(0).optString("hash", null)
+                    } else null
+                }
         } catch (e: Exception) {
-            // Fallback to regex if JSONObject fails
-            Log.w(TAG, "JSONObject hash parsing failed, trying regex: ${e.message}")
-            val hashPattern = """"hash"\s*:\s*"([a-fA-F0-9]{40})"""".toRegex()
-            hashPattern.find(json)?.groupValues?.getOrNull(1)?.lowercase()
+            Log.w(TAG, "parseHashFromResponse error: ${e.message}")
+            null
         }
     }
 
-    /**
-     * Parse file_stats from TorrServe JSON response using JSONObject/JSONArray.
-     * Returns list of (path, id) pairs.
-     */
-    private fun parseFileStatsFromResponse(json: String): List<Pair<String, Int>> {
-        val results = mutableListOf<Pair<String, Int>>()
-
+    private fun parseFileStatsFromResponse(body: String): List<Pair<String, Int>> {
+        val stats = mutableListOf<Pair<String, Int>>()
         try {
-            val jsonObj = JSONObject(json)
-            parseFileStatsFromObject(jsonObj, results)
-        } catch (_: Exception) {
-            try {
-                val jsonArr = JSONArray(json)
-                for (i in 0 until jsonArr.length()) {
-                    parseFileStatsFromObject(jsonArr.getJSONObject(i), results)
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "parseFileStatsFromResponse: both object and array parsing failed: ${e.message}")
+            val json = JSONObject(body)
+            val fileStatsArr = json.optJSONArray("file_stats")
+            if (fileStatsArr != null) {
+                parseFileStatsArray(fileStatsArr, stats)
+                if (stats.isNotEmpty()) return stats
             }
+            val dataObj = json.optJSONObject("data")
+            if (dataObj != null) {
+                val innerStats = dataObj.optJSONArray("file_stats")
+                if (innerStats != null) {
+                    parseFileStatsArray(innerStats, stats)
+                    if (stats.isNotEmpty()) return stats
+                }
+            }
+            val dataArr = json.optJSONArray("data")
+            if (dataArr != null && dataArr.length() > 0) {
+                val firstObj = dataArr.getJSONObject(0)
+                val innerStats = firstObj.optJSONArray("file_stats")
+                if (innerStats != null) {
+                    parseFileStatsArray(innerStats, stats)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "parseFileStatsFromResponse error: ${e.message}")
         }
-
-        return results
+        return stats
     }
 
-    private fun parseFileStatsFromObject(obj: JSONObject, results: MutableList<Pair<String, Int>>) {
-        val fileStats = obj.optJSONArray("file_stats") ?: return
+    private fun parseFileStatsFromJsonObj(json: JSONObject): List<Pair<String, Int>> {
+        val stats = mutableListOf<Pair<String, Int>>()
+        try {
+            val fileStatsArr = json.optJSONArray("file_stats")
+            if (fileStatsArr != null) {
+                parseFileStatsArray(fileStatsArr, stats)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "parseFileStatsFromJsonObj error: ${e.message}")
+        }
+        return stats
+    }
 
-        for (i in 0 until fileStats.length()) {
+    private fun parseFileStatsArray(arr: JSONArray, stats: MutableList<Pair<String, Int>>) {
+        for (i in 0 until arr.length()) {
             try {
-                val fileObj = fileStats.getJSONObject(i)
-                val id = fileObj.optInt("id", -1)
-                val path = fileObj.optString("path", "")
-                if (id > 0 && path.isNotEmpty()) {
-                    results.add(path to id)
+                val item = arr.getJSONObject(i)
+                val id = item.optInt("id", i + 1)
+                val path = item.optString("path", "")
+                    .ifEmpty { item.optString("name", "") }
+                    .ifEmpty { item.optString("file", "") }
+                if (path.isNotEmpty()) {
+                    stats.add(Pair(path, id))
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "Error parsing file_stats entry $i: ${e.message}")
+                // Skip malformed entries
             }
         }
     }
 
-    // ==================== PATH HELPERS ====================
+    // ==================== UTILITY FUNCTIONS ====================
 
     private fun normalizePath(path: String): String {
-        return path.replace("\\", "/")
+        return path.replace("\\", "/").trim('/')
     }
 
+    /**
+     * Extract the first folder name from a path.
+     * NOTE: This is used for the TorrServeStreamEntry.folderName field
+     * for backward compatibility, but the ACTUAL multi-show detection
+     * uses computeShowGroups() which handles nested folders correctly.
+     */
     private fun extractFolderName(normalizedPath: String): String {
-        val slashIndex = normalizedPath.indexOf('/')
-        return if (slashIndex > 0) normalizedPath.substring(0, slashIndex) else ""
+        val parts = normalizedPath.split("/")
+        return if (parts.size > 1) parts.first() else ""
     }
 
     private fun isVideoFile(fileName: String): Boolean {
-        val videoExtensions = listOf(
-            ".mkv", ".mp4", ".avi", ".wmv", ".flv", ".mov", ".webm",
-            ".m4v", ".ts", ".mpg", ".mpeg", ".ogv", ".rmvb", ".rm",
-            ".vob", ".m2ts", ".mts", ".3gp", ".divx"
-        )
         val lower = fileName.lowercase()
-        return videoExtensions.any { lower.endsWith(it) }
-    }
-
-    // ==================== HELPERS ====================
-
-    private fun Map<String, String>.toOkHttpHeaders(): okhttp3.Headers {
-        val builder = okhttp3.Headers.Builder()
-        this.forEach { (key, value) -> builder.add(key, value) }
-        return builder.build()
+        return lower.endsWith(".mkv") || lower.endsWith(".mp4") || lower.endsWith(".avi") ||
+                lower.endsWith(".mov") || lower.endsWith(".wmv") || lower.endsWith(".flv") ||
+                lower.endsWith(".webm") || lower.endsWith(".ts") || lower.endsWith(".m4v")
     }
 
     private fun cleanTitleText(text: String): String {
-        return text.replace("\\n", " ").replace("\n", " ").replace(Regex("\\s+"), " ").trim()
+        return text
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#039;", "'")
+            .replace("&nbsp;", " ")
+            .trim()
     }
 
-    /**
-     * Convert TvType to its series equivalent for TV series responses.
-     * Anime → Anime, TvSeries → TvSeries, Movie → TvSeries
-     */
-    private fun TvType.toSeriesType(): TvType {
-        return when (this) {
-            TvType.Anime, TvType.AnimeMovie, TvType.OVA -> TvType.Anime
-            TvType.Movie -> TvType.TvSeries
-            else -> this
-        }
-    }
+    // ==================== OKHTTP HELPERS ====================
 
-    /**
-     * Convert TvType to its movie equivalent for movie responses.
-     * Anime → AnimeMovie, TvSeries → Movie, Movie → Movie
-     */
-    private fun TvType.toMovieType(): TvType {
-        return when (this) {
-            TvType.Anime, TvType.AnimeMovie, TvType.OVA -> TvType.AnimeMovie
-            TvType.TvSeries -> TvType.Movie
-            else -> this
+    private fun Map<String, String>.toOkHttpHeaders(): okhttp3.Headers {
+        val builder = okhttp3.Headers.Builder()
+        for ((key, value) in this) {
+            builder.add(key, value)
         }
+        return builder.build()
     }
 }
