@@ -11,7 +11,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.jsoup.nodes.Element
-import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
@@ -30,8 +29,6 @@ class Arabmagnet : MainAPI() {
         private const val CATEGORY_ID = 100
         private const val MAX_PAGES = 30
         private const val TORRSERVE = "http://127.0.0.1:8090"
-        private const val TORRSERVE_POLL_ATTEMPTS = 15
-        private const val TORRSERVE_POLL_DELAY = 2000L
     }
 
     private val imageHeaders = mapOf(
@@ -41,8 +38,9 @@ class Arabmagnet : MainAPI() {
 
     private val okHttp by lazy {
         OkHttpClient.Builder()
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(10, TimeUnit.SECONDS)
             .build()
     }
 
@@ -69,111 +67,162 @@ class Arabmagnet : MainAPI() {
         else -> TvType.Anime
     }
 
-    /** Strip base URL that CloudStream's fixUrl() prepends to magnet: URLs */
     private fun fixMagnet(url: String): String {
         if (url.startsWith("magnet:")) return url
         val i = url.indexOf("magnet:")
         return if (i > 0) url.substring(i) else url
     }
 
-    /** Extract info hash from magnet URI (supports both v1 and v2) */
     private fun hashFromMagnet(magnet: String): String? {
-        // xt=urn:btih:HEX or xt=urn:btmh:HEX
-        val xt = Regex("""xt=urn:bt(?:ih|mh):([a-fA-F0-9]{40,})""").find(magnet)
+        val match = Regex("""xt=urn:btih:([a-fA-F0-9]{40})""").find(magnet)
             ?: Regex("""xt=urn:btih:([A-Z2-7]{32})""").find(magnet)
-            ?: return null
-        return xt.groupValues[1].lowercase()
+        return match?.groupValues?.get(1)?.lowercase()
     }
 
     // ==================== TORRSERVE ====================
 
     /**
-     * Add a magnet to TorrServe, poll until torrent is ready,
-     * and return a list of (fileName, streamUrl) for video files.
-     * Returns null if TorrServe is not running or fails.
+     * Check if TorrServe is reachable by hitting its root endpoint.
      */
-    private fun torrServeStream(magnet: String): List<Pair<String, String>>? {
+    private fun isTorrServeRunning(): Boolean {
         return try {
+            val req = Request.Builder().url(TORRSERVE).build()
+            okHttp.newCall(req).execute().use { resp ->
+                Log.d(TAG, "TorrServe ping: HTTP ${resp.code}")
+                resp.isSuccessful || resp.code == 302 || resp.code == 200
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "TorrServe not reachable: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Add magnet to TorrServe and return the torrent hash.
+     * Tries multiple API formats since TorrServe versions differ.
+     */
+    private fun torrServeAddMagnet(magnet: String): String? {
+        // Try format 1: POST /torrents with JSON body (TorrServe Matrix)
+        try {
             val body = JSONObject().apply {
                 put("action", "add")
                 put("link", magnet)
                 put("save", true)
             }
-
             val req = Request.Builder()
                 .url("$TORRSERVE/torrents")
                 .post(body.toString().toRequestBody("application/json".toMediaType()))
                 .build()
 
-            val hash: String
-            var fileStats: List<Pair<String, Int>>
+            okHttp.newCall(req).execute().use { resp ->
+                val json = resp.body?.string() ?: ""
+                Log.d(TAG, "TorrServe add (format 1): HTTP ${resp.code}, body=${json.take(500)}")
+
+                if (resp.isSuccessful && json.isNotEmpty()) {
+                    val hash = parseHash(json)
+                    if (hash != null) return hash
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "TorrServe add format 1 error: ${e.message}")
+        }
+
+        // Try format 2: POST /torrents with "link" as form data
+        try {
+            val formBody = "action=add&link=${URLEncoder.encode(magnet, "UTF-8")}&save=true"
+            val req = Request.Builder()
+                .url("$TORRSERVE/torrents")
+                .post(formBody.toRequestBody("application/x-www-form-urlencoded".toMediaType()))
+                .build()
 
             okHttp.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) {
-                    Log.w(TAG, "TorrServe add: HTTP ${resp.code}")
-                    return null
+                val json = resp.body?.string() ?: ""
+                Log.d(TAG, "TorrServe add (format 2): HTTP ${resp.code}, body=${json.take(500)}")
+
+                if (resp.isSuccessful && json.isNotEmpty()) {
+                    val hash = parseHash(json)
+                    if (hash != null) return hash
                 }
-                val json = resp.body?.string() ?: return null
-                Log.d(TAG, "TorrServe add response: ${json.take(300)}")
-
-                hash = try {
-                    JSONObject(json).optString("hash", "")
-                } catch (_: Exception) {
-                    Regex(""""hash"\s*:\s*"([a-fA-F0-9]{40})"""")
-                        .find(json)?.groupValues?.getOrNull(1) ?: ""
-                }
-                if (hash.isBlank()) return null
-
-                fileStats = parseFileStats(json)
             }
-
-            // Poll if file list is empty (torrent still loading metadata)
-            if (fileStats.isEmpty()) {
-                fileStats = pollTorrServeFiles(hash)
-            }
-
-            if (fileStats.isEmpty()) {
-                // No files found — return a single default stream (index=1)
-                return listOf(
-                    "Video" to "$TORRSERVE/stream/fname?link=${hash.lowercase()}&index=1&play"
-                )
-            }
-
-            // Filter to video files only
-            val videoExts = listOf(".mkv", ".mp4", ".avi", ".wmv", ".flv", ".mov", ".webm", ".m4v", ".ts", ".mpg", ".mpeg", ".rmvb", ".rm", ".m2ts")
-            val videos = fileStats.filter { (path, _) ->
-                videoExts.any { path.lowercase().endsWith(it) }
-            }
-
-            if (videos.isEmpty()) {
-                // No video files? Use first file anyway
-                val (path, id) = fileStats.first()
-                val name = path.replace("\\", "/").substringAfterLast("/")
-                return listOf(name to "$TORRSERVE/stream/fname?link=${hash.lowercase()}&index=$id&play")
-            }
-
-            // Sort naturally (episode 1 before episode 10)
-            videos.sortedBy { (path, _) ->
-                path.replace("\\", "/").substringAfterLast("/")
-                    .replace(Regex("\\d+")) { it.value.padStart(6, '0') }
-                    .lowercase()
-            }.map { (path, id) ->
-                val name = path.replace("\\", "/").substringAfterLast("/")
-                name to "$TORRSERVE/stream/fname?link=${hash.lowercase()}&index=$id&play"
-            }
-        } catch (_: java.net.ConnectException) {
-            Log.w(TAG, "TorrServe not running on $TORRSERVE")
-            null
         } catch (e: Exception) {
-            Log.w(TAG, "TorrServe error: ${e.message}")
-            null
+            Log.w(TAG, "TorrServe add format 2 error: ${e.message}")
         }
+
+        // Try format 3: GET /torrents/add?link=MAGNET (some older versions)
+        try {
+            val req = Request.Builder()
+                .url("$TORRSERVE/torrents/add?link=${URLEncoder.encode(magnet, "UTF-8")}")
+                .get()
+                .build()
+
+            okHttp.newCall(req).execute().use { resp ->
+                val json = resp.body?.string() ?: ""
+                Log.d(TAG, "TorrServe add (format 3): HTTP ${resp.code}, body=${json.take(500)}")
+
+                if (resp.isSuccessful && json.isNotEmpty()) {
+                    val hash = parseHash(json)
+                    if (hash != null) return hash
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "TorrServe add format 3 error: ${e.message}")
+        }
+
+        // Try format 4: If we can extract hash from magnet, try streaming directly
+        // Some TorrServe versions auto-add and stream
+        val magnetHash = hashFromMagnet(magnet)
+        if (magnetHash != null) {
+            try {
+                // Check if TorrServe already has this torrent
+                val req = Request.Builder()
+                    .url("$TORRSERVE/stream/fname?link=$magnetHash&index=1&play")
+                    .head()
+                    .build()
+                okHttp.newCall(req).execute().use { resp ->
+                    Log.d(TAG, "TorrServe direct stream check: HTTP ${resp.code}")
+                    if (resp.isSuccessful) return magnetHash
+                }
+            } catch (_: Exception) { }
+        }
+
+        return null
     }
 
-    private fun pollTorrServeFiles(hash: String): List<Pair<String, Int>> {
-        for (attempt in 1..TORRSERVE_POLL_ATTEMPTS) {
+    private fun parseHash(json: String): String? {
+        // Try JSONObject
+        try {
+            val obj = JSONObject(json)
+            val h = obj.optString("hash", "")
+            if (h.isNotEmpty() && h.length >= 32) return h.lowercase()
+        } catch (_: Exception) { }
+
+        // Try regex
+        val match = Regex(""""hash"\s*:\s*"([a-fA-F0-9]{32,})"""").find(json)
+        if (match != null) return match.groupValues[1].lowercase()
+
+        // Try array format
+        try {
+            val obj = JSONObject(json)
+            val data = obj.optJSONObject("data")
+            if (data != null) {
+                val h = data.optString("hash", "")
+                if (h.isNotEmpty()) return h.lowercase()
+            }
+        } catch (_: Exception) { }
+
+        return null
+    }
+
+    /**
+     * Get file list from TorrServe for a given hash.
+     * Polls multiple times since the torrent may still be loading metadata.
+     */
+    private fun torrServeGetFiles(hash: String): List<Pair<String, Int>> {
+        // Try up to 10 times with 2s delay
+        for (attempt in 1..10) {
             try {
-                Thread.sleep(TORRSERVE_POLL_DELAY)
+                Thread.sleep(2000)
+
                 val body = JSONObject().apply {
                     put("action", "get")
                     put("hash", hash)
@@ -184,12 +233,11 @@ class Arabmagnet : MainAPI() {
                     .build()
 
                 okHttp.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) continue
                     val json = resp.body?.string() ?: continue
-                    val stats = parseFileStats(json)
-                    if (stats.isNotEmpty()) {
-                        Log.d(TAG, "TorrServe poll OK on attempt $attempt: ${stats.size} files")
-                        return stats
+                    val files = parseFileStats(json)
+                    if (files.isNotEmpty()) {
+                        Log.d(TAG, "TorrServe got ${files.size} files on attempt $attempt")
+                        return files
                     }
                 }
             } catch (_: Exception) { }
@@ -288,50 +336,10 @@ class Arabmagnet : MainAPI() {
 
         val tvType = tvTypeFromTitle(title)
 
-        // Try TorrServe first — if it's running, we get video files
-        val tsFiles = torrServeStream(magnet)
-
-        if (tsFiles != null && tsFiles.size > 1) {
-            // Multi-file torrent → show as TvSeries with episodes
-            val episodes = tsFiles.mapIndexed { idx, (name, _) ->
-                newEpisode(name) {
-                    this.name = name
-                    this.episode = idx + 1
-                    this.season = 1
-                }
-            }
-
-            // Store the magnet in url field, episode data = "ts|index|hash"
-            // We'll reconstruct stream URLs in loadLinks
-            val hash = hashFromMagnet(magnet) ?: ""
-            val epDataList = tsFiles.mapIndexed { idx, (name, _) ->
-                "ts|$hash|${idx + 1}|$name"
-            }
-
-            return newTvSeriesLoadResponse(title, url, TvType.Anime,
-                epDataList.mapIndexed { idx, epData ->
-                    newEpisode(epData) {
-                        this.name = tsFiles[idx].first
-                        this.episode = idx + 1
-                        this.season = 1
-                    }
-                }
-            ) {
-                this.posterUrl = posterUrl
-                this.posterHeaders = imageHeaders
-            }
-        }
-
-        if (tsFiles != null && tsFiles.size == 1) {
-            // Single file → Movie with TorrServe stream
-            return newMovieLoadResponse(title, url, tvType, "tsdirect|${tsFiles[0].second}") {
-                this.posterUrl = posterUrl
-                this.posterHeaders = imageHeaders
-            }
-        }
-
-        // No TorrServe — fall back to Movie with raw magnet
-        return newMovieLoadResponse(title, url, tvType, "amm|$magnet") {
+        // Don't try TorrServe here — do it in loadLinks() instead.
+        // This keeps load() fast and prevents timeouts.
+        // Just pass the magnet URL as data.
+        return newMovieLoadResponse(title, url, tvType, magnet) {
             this.posterUrl = posterUrl
             this.posterHeaders = imageHeaders
         }
@@ -345,90 +353,83 @@ class Arabmagnet : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        Log.d(TAG, "loadLinks: data=${data.take(100)}")
+        val magnet = fixMagnet(data)
+        if (!magnet.startsWith("magnet:")) return false
 
-        // TorrServe direct stream: tsdirect|HTTP_URL
-        if (data.startsWith("tsdirect|")) {
-            val streamUrl = data.substringAfter("tsdirect|")
-            callback(
-                newExtractorLink(
-                    source = "$name (TorrServe)",
-                    name = name,
-                    url = streamUrl,
-                    type = ExtractorLinkType.VIDEO
-                )
-            )
-            return true
-        }
+        val title = titleFromMagnet(magnet) ?: name
+        var foundAny = false
 
-        // TorrServe episode: ts|HASH|INDEX|FILENAME
-        if (data.startsWith("ts|")) {
-            val parts = data.split("|", limit = 4)
-            val hash = parts.getOrNull(1) ?: return false
-            val index = parts.getOrNull(2) ?: "1"
-            val fileName = parts.getOrNull(3) ?: "Video"
-            val streamUrl = "$TORRSERVE/stream/fname?link=$hash&index=$index&play"
+        // ===== SOURCE 1: TorrServe (direct HTTP stream) =====
+        // This is the ONLY reliable way to stream these magnets in CloudStream.
+        // WebTorrent (SOURCE 2) cannot connect to regular BitTorrent seeders.
+        if (isTorrServeRunning()) {
+            Log.d(TAG, "TorrServe is running, adding magnet...")
+            val hash = torrServeAddMagnet(magnet)
 
-            callback(
-                newExtractorLink(
-                    source = "$name (TorrServe)",
-                    name = fileName,
-                    url = streamUrl,
-                    type = ExtractorLinkType.VIDEO
-                )
-            )
-            return true
-        }
+            if (hash != null) {
+                Log.d(TAG, "TorrServe added magnet, hash=$hash, getting file list...")
 
-        // Raw magnet: amm|MAGNET_URL
-        if (data.startsWith("amm|")) {
-            val magnet = fixMagnet(data.substringAfter("amm|"))
-            if (magnet.startsWith("magnet:")) {
-                // Try TorrServe one more time (maybe it started since load())
-                val tsFiles = torrServeStream(magnet)
-                if (tsFiles != null) {
-                    for ((name, streamUrl) in tsFiles) {
+                // Get file list (polls until metadata is ready)
+                val files = torrServeGetFiles(hash)
+
+                val videoExts = listOf(".mkv", ".mp4", ".avi", ".wmv", ".flv", ".mov", ".webm", ".m4v", ".ts", ".mpg", ".mpeg", ".rmvb", ".m2ts")
+                val videoFiles = files.filter { (path, _) ->
+                    videoExts.any { path.lowercase().endsWith(it) }
+                }
+
+                val entries = if (videoFiles.isNotEmpty()) videoFiles else files
+
+                if (entries.isNotEmpty()) {
+                    for ((path, id) in entries) {
+                        val fileName = path.replace("\\", "/").substringAfterLast("/")
+                        val streamUrl = "$TORRSERVE/stream/fname?link=$hash&index=$id&play"
+
+                        Log.d(TAG, "TorrServe source: $fileName (index=$id)")
                         callback(
                             newExtractorLink(
                                 source = "$name (TorrServe)",
-                                name = name,
+                                name = fileName,
                                 url = streamUrl,
                                 type = ExtractorLinkType.VIDEO
                             )
                         )
+                        foundAny = true
                     }
-                    return true
-                }
-
-                // TorrServe not available — pass magnet to CloudStream
-                // NOTE: This uses WebTorrent which rarely works for regular torrents.
-                // User needs TorrServe for reliable playback.
-                callback(
-                    newExtractorLink(
-                        source = "$name (Magnet)",
-                        name = name,
-                        url = magnet,
-                        type = ExtractorLinkType.MAGNET
+                } else {
+                    // No file list — try streaming index=1 directly
+                    val streamUrl = "$TORRSERVE/stream/fname?link=$hash&index=1&play"
+                    Log.d(TAG, "TorrServe source: default index=1")
+                    callback(
+                        newExtractorLink(
+                            source = "$name (TorrServe)",
+                            name = title,
+                            url = streamUrl,
+                            type = ExtractorLinkType.VIDEO
+                        )
                     )
-                )
-                return true
+                    foundAny = true
+                }
+            } else {
+                Log.w(TAG, "TorrServe is running but failed to add magnet")
             }
+        } else {
+            Log.w(TAG, "TorrServe is NOT running on $TORRSERVE")
         }
 
-        // Direct magnet fallback
-        val magnet = fixMagnet(data)
-        if (magnet.startsWith("magnet:")) {
-            callback(
-                newExtractorLink(
-                    source = "$name (Magnet)",
-                    name = name,
-                    url = magnet,
-                    type = ExtractorLinkType.MAGNET
-                )
+        // ===== SOURCE 2: Raw magnet (WebTorrent) =====
+        // This rarely works because CloudStream's WebTorrent uses WebRTC
+        // which cannot connect to regular BitTorrent seeders.
+        // Only shown as a last resort.
+        callback(
+            newExtractorLink(
+                source = "$name (Magnet - may not work)",
+                name = title,
+                url = magnet,
+                type = ExtractorLinkType.MAGNET
             )
-            return true
-        }
+        )
+        foundAny = true
 
-        return false
+        return foundAny
     }
 }
