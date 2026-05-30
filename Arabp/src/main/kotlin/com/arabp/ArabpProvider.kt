@@ -1042,6 +1042,7 @@ class Arabp : MainAPI() {
             )
 
             // Resume only this file, pause all others to save bandwidth.
+            // Then remove trackers AFTER playback has started (peers connected).
             // This is best-effort — if it fails, playback still works.
             try {
                 val parsed = parseTorrServeUrl(streamUrl)
@@ -1058,9 +1059,13 @@ class Arabp : MainAPI() {
                             }
                         }
                     }
+                    // Wait 20 seconds for the tracker to connect and find peers,
+                    // then remove trackers so the private tracker stops counting.
+                    Thread.sleep(20000)
+                    removeTrackers(hash)
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "TorrServe priority adjustment failed (non-fatal): ${e.message}")
+                Log.w(TAG, "TorrServe priority/tracker adjustment failed (non-fatal): ${e.message}")
             }
 
             return true
@@ -1499,18 +1504,16 @@ class Arabp : MainAPI() {
      */
     private fun uploadToTorrServe(torrentBytes: ByteArray, torrentId: String): List<TorrServeStreamEntry>? {
         return try {
-            // Strip trackers from .torrent before uploading to TorrServe.
-            // This removes announce/announce-list and the private flag,
-            // so TorrServe uses DHT for peer discovery instead of trackers.
-            // The private tracker won't be able to count your download/upload.
-            val cleanedBytes = stripTrackersFromTorrent(torrentBytes)
+            // Upload the ORIGINAL .torrent with trackers/passkey so TorrServe
+            // can connect to the tracker and find peers. Trackers will be removed
+            // AFTER the download starts (once peers are connected via DHT/PEX).
 
             // Step 1: Upload .torrent file
             val requestBody = MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
                 .addFormDataPart(
                     "file", "arabp_$torrentId.torrent",
-                    cleanedBytes.toRequestBody("application/x-bittorrent".toMediaType())
+                    torrentBytes.toRequestBody("application/x-bittorrent".toMediaType())
                 )
                 .addFormDataPart("save", "1")
                 .build()
@@ -1585,17 +1588,16 @@ class Arabp : MainAPI() {
 
             Log.d(TAG, "Created ${videoEntries.size} video stream entries (from ${fileStats.size} total files)")
 
-            // Pause all files after upload so only the episode the user watches gets downloaded.
-            // TorrServe will auto-resume a paused file when it's accessed via the stream URL,
-            // and loadLinks() explicitly resumes the active file for ts:// URLs.
-            // Best-effort: don't let priority failures break the upload.
+            // Post-upload: pause files.
+            // Don't remove trackers here — the tracker is still needed to find peers!
+            // Trackers will be removed in loadLinks() AFTER the video starts playing
+            // and peers are connected via DHT/PEX.
+            // Best-effort: don't let these fail the upload.
             try {
                 if (videoEntries.size > 1) {
                     val allIndices = videoEntries.map { it.fileIndex }
                     pauseAllFiles(hash, allIndices)
                 }
-                // Trackers already stripped from .torrent before upload,
-                // so no need to remove them via API.
             } catch (e: Exception) {
                 Log.w(TAG, "TorrServe post-upload setup failed (non-fatal): ${e.message}")
             }
