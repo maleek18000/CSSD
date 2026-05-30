@@ -679,10 +679,16 @@ class Arabp : MainAPI() {
                     if (seeders.isNotEmpty()) append(" | ▲$seeders")
                 }
 
-                // Try to pre-resolve via TorrServe to detect multi-show torrents
-                val streamEntries = tryResolveTorrent(
-                    torrentId, toAbsoluteUrl(detailHref), toAbsoluteUrl(downloadHref), isFree
-                )
+                // For non-free torrents, skip pre-resolve (it would hit the daily limit).
+                // The thank + download will happen in loadLinks() when user clicks play.
+                // For free torrents, pre-resolve to detect multi-show structure.
+                val streamEntries = if (isFree) {
+                    tryResolveTorrent(
+                        torrentId, toAbsoluteUrl(detailHref), toAbsoluteUrl(downloadHref), isFree
+                    )
+                } else {
+                    null
+                }
 
                 if (streamEntries == null || streamEntries.isEmpty()) {
                     // Pre-resolve failed — fall back to legacy data (one episode = one torrent)
@@ -840,7 +846,13 @@ class Arabp : MainAPI() {
         }
 
         // === INTERNAL TORRENTS: try to pre-resolve via TorrServe ===
-        val streamEntries = tryResolveTorrent(torrentId, detailUrl, downloadUrl, isFree)
+        // For non-free torrents, skip pre-resolve (would hit daily limit).
+        // The thank + download will happen in loadLinks() when user clicks play.
+        val streamEntries = if (isFree) {
+            tryResolveTorrent(torrentId, detailUrl, downloadUrl, isFree)
+        } else {
+            null
+        }
 
         if (streamEntries.isNullOrEmpty()) {
             // Failed to pre-resolve — fall back to TV series with one episode.
