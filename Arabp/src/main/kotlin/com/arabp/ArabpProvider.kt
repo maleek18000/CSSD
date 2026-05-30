@@ -1029,6 +1029,16 @@ class Arabp : MainAPI() {
             val streamUrl = if (pipeIndex >= 0) afterPrefix.substring(0, pipeIndex) else afterPrefix
             val fileName = if (pipeIndex >= 0) afterPrefix.substring(pipeIndex + 1) else "Video"
 
+            // Resume only this file, pause all others to save bandwidth
+            val parsed = parseTorrServeUrl(streamUrl)
+            if (parsed != null) {
+                val (hash, activeIndex) = parsed
+                val allIndices = getTorrServeFileIndices(hash)
+                if (allIndices.isNotEmpty()) {
+                    pauseAllExceptOne(hash, activeIndex, allIndices)
+                }
+            }
+
             Log.d(TAG, "loadLinks: pre-resolved stream → $fileName")
             callback(
                 newExtractorLink(
@@ -1426,6 +1436,14 @@ class Arabp : MainAPI() {
 
             Log.d(TAG, "Created ${videoEntries.size} video stream entries (from ${fileStats.size} total files)")
 
+            // Pause all files after upload so only the episode the user watches gets downloaded.
+            // TorrServe will auto-resume a paused file when it's accessed via the stream URL,
+            // and loadLinks() explicitly calls pauseAllExceptOne() for ts:// URLs.
+            if (videoEntries.size > 1) {
+                val allIndices = videoEntries.map { it.fileIndex }
+                pauseAllFiles(hash, allIndices)
+            }
+
             if (videoEntries.isEmpty()) {
                 // If no video files detected, use first file as fallback
                 val first = fileStats.first()
@@ -1499,6 +1517,126 @@ class Arabp : MainAPI() {
 
         Log.e(TAG, "TorrServe polling exhausted after $TORRSERVE_POLL_ATTEMPTS attempts")
         return emptyList()
+    }
+
+    // ==================== TORRSERVE FILE PRIORITY (PAUSE/RESUME) ====================
+    //
+    // TorrServe downloads ALL files in a torrent by default. To save bandwidth
+    // and storage, we pause all files except the one being watched. When the user
+    // clicks another episode, that file is resumed and the rest are paused.
+    //
+    // TorrServe Matrix API: POST /torrents with action=set-file-priority
+    // Priority values: 0 = Don't download (paused), 1 = Normal, 2 = High, 3 = Maximum
+
+    /**
+     * Set download priority for a single file in TorrServe.
+     * @param hash Torrent hash
+     * @param fileIndex 1-based file index
+     * @param priority 0=paused, 1=normal, 2=high, 3=max
+     */
+    private fun setTorrServeFilePriority(hash: String, fileIndex: Int, priority: Int): Boolean {
+        return try {
+            val jsonBody = JSONObject().apply {
+                put("action", "set-file-priority")
+                put("hash", hash)
+                put("file_id", fileIndex)
+                put("priority", priority)
+            }
+
+            val request = Request.Builder()
+                .url("$TORRSERVE_HOST/torrents")
+                .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
+                .header("Content-Type", "application/json")
+                .build()
+
+            torrServeClient.newCall(request).execute().use { response ->
+                val success = response.isSuccessful
+                if (success) {
+                    Log.d(TAG, "TorrServe: set file $fileIndex priority=$priority for $hash")
+                } else {
+                    Log.w(TAG, "TorrServe: set priority failed, HTTP ${response.code}")
+                }
+                success
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "TorrServe setFilePriority error: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Pause all files in a torrent except the one being watched.
+     * The active file gets normal priority (1), all others get paused (0).
+     *
+     * @param hash Torrent hash
+     * @param activeFileIndex 1-based index of the file to resume
+     * @param totalFileIndices All file indices in the torrent
+     */
+    private fun pauseAllExceptOne(hash: String, activeFileIndex: Int, totalFileIndices: List<Int>) {
+        var successCount = 0
+        for (idx in totalFileIndices) {
+            val priority = if (idx == activeFileIndex) 1 else 0
+            if (setTorrServeFilePriority(hash, idx, priority)) {
+                successCount++
+            }
+        }
+        Log.d(TAG, "pauseAllExceptOne: set priorities for $successCount/${totalFileIndices.size} files (active=$activeFileIndex)")
+    }
+
+    /**
+     * Pause all files in a torrent after upload (before user selects any episode).
+     */
+    private fun pauseAllFiles(hash: String, totalFileIndices: List<Int>) {
+        for (idx in totalFileIndices) {
+            setTorrServeFilePriority(hash, idx, 0)
+        }
+        Log.d(TAG, "pauseAllFiles: paused ${totalFileIndices.size} files for $hash")
+    }
+
+    /**
+     * Extract hash and file index from a TorrServe stream URL.
+     * URL format: http://127.0.0.1:8090/stream/fname?link=HASH&index=INDEX&play
+     * @return Pair(hash, index) or null if parsing fails
+     */
+    private fun parseTorrServeUrl(streamUrl: String): Pair<String, Int>? {
+        return try {
+            val hash = streamUrl.substringAfter("link=").substringBefore("&")
+            val indexStr = streamUrl.substringAfter("index=").substringBefore("&")
+            val index = indexStr.toIntOrNull() ?: return null
+            if (hash.isNotBlank()) Pair(hash, index) else null
+        } catch (e: Exception) {
+            Log.w(TAG, "parseTorrServeUrl error: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Get all file indices for a torrent hash from TorrServe.
+     */
+    private fun getTorrServeFileIndices(hash: String): List<Int> {
+        return try {
+            val jsonBody = JSONObject().apply {
+                put("action", "get")
+                put("hash", hash)
+            }
+
+            val request = Request.Builder()
+                .url("$TORRSERVE_HOST/torrents")
+                .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
+                .header("Content-Type", "application/json")
+                .build()
+
+            torrServeClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return emptyList()
+                val body = response.body?.string() ?: return emptyList()
+                val json = JSONObject(body)
+                val fileStats = parseFileStatsFromJsonObj(json)
+                fileStats.map { it.second }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "getTorrServeFileIndices error: ${e.message}")
+            emptyList()
+        }
     }
 
     // ==================== TORRSERVE RESPONSE PARSING ====================
