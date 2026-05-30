@@ -1460,8 +1460,11 @@ class Arabp : MainAPI() {
                     val allIndices = videoEntries.map { it.fileIndex }
                     pauseAllFiles(hash, allIndices)
                 }
+                // Remove all trackers for privacy (they log your IP).
+                // The torrent will use DHT and PEX for peer discovery instead.
+                removeTrackers(hash)
             } catch (e: Exception) {
-                Log.w(TAG, "TorrServe pauseAllFiles failed (non-fatal): ${e.message}")
+                Log.w(TAG, "TorrServe post-upload setup failed (non-fatal): ${e.message}")
             }
 
             if (videoEntries.isEmpty()) {
@@ -1656,6 +1659,48 @@ class Arabp : MainAPI() {
         } catch (e: Exception) {
             Log.e(TAG, "getTorrServeFileIndices error: ${e.message}")
             emptyList()
+        }
+    }
+
+    // ==================== TORRSERVE TRACKER REMOVAL ====================
+    //
+    // Remove all trackers from a torrent in TorrServe for privacy.
+    // Trackers log your IP address when announcing. Without trackers,
+    // the torrent relies on DHT and PEX for peer discovery.
+    //
+    // TorrServe Matrix API: POST /torrents with action=set-trackers
+
+    /**
+     * Remove all trackers from a torrent in TorrServe.
+     * @param hash Torrent hash
+     * @return true if successful
+     */
+    private fun removeTrackers(hash: String): Boolean {
+        return try {
+            val jsonBody = JSONObject().apply {
+                put("action", "set-trackers")
+                put("hash", hash)
+                put("trackers", JSONArray())
+            }
+
+            val request = Request.Builder()
+                .url("$TORRSERVE_HOST/torrents")
+                .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
+                .header("Content-Type", "application/json")
+                .build()
+
+            torrServeClient.newCall(request).execute().use { response ->
+                val success = response.isSuccessful
+                if (success) {
+                    Log.d(TAG, "TorrServe: removed all trackers for $hash")
+                } else {
+                    Log.w(TAG, "TorrServe: remove trackers failed, HTTP ${response.code}")
+                }
+                success
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "TorrServe removeTrackers error: ${e.message}")
+            false
         }
     }
 
