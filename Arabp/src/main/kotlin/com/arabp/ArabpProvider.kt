@@ -319,8 +319,11 @@ class Arabp : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val encoded = URLEncoder.encode(query, "UTF-8")
         val results = mutableListOf<SearchResponse>()
+        val queryLower = query.lowercase().trim()
 
         // Source 1: LISTINGS (anime=public, tv/movies=require auth)
+        // NOTE: Some listing pages ignore the search parameter and return ALL items.
+        // We filter results client-side to only keep relevant ones.
         val listingPages = listOf(
             Triple("$mainUrl/index.php?page=anime-listing&search=$encoded", "anime", TvType.Anime),
             Triple("$mainUrl/index.php?page=tv-listing&search=$encoded", "tv", TvType.TvSeries),
@@ -330,7 +333,10 @@ class Arabp : MainAPI() {
         for ((listingUrl, label, tvType) in listingPages) {
             try {
                 val doc = fetchDoc(listingUrl)
-                val listingResults = doc?.select("div.listing_div1")?.mapNotNull { toSearchResult(it, tvType) } ?: emptyList()
+                val listingResults = doc?.select("div.listing_div1")
+                    ?.mapNotNull { toSearchResult(it, tvType) }
+                    ?.filter { matchesQuery(it.name, queryLower) }
+                    ?: emptyList()
                 Log.d(TAG, "$label listing search: found ${listingResults.size} results")
                 results.addAll(listingResults)
             } catch (e: Exception) {
@@ -338,7 +344,7 @@ class Arabp : MainAPI() {
             }
         }
 
-        // Source 2: PRIVATE torrents page
+        // Source 2: PRIVATE torrents page (supports search natively)
         if (ensureLogin()) {
             try {
                 val torrentsUrl = "$mainUrl/index.php?page=torrents&search=$encoded&category=0&active=0"
@@ -367,6 +373,16 @@ class Arabp : MainAPI() {
 
         Log.d(TAG, "Total search results: ${results.size}")
         return results
+    }
+
+    /**
+     * Check if a title matches the search query.
+     * Handles both Arabic and English, and partial word matching.
+     */
+    private fun matchesQuery(title: String?, queryLower: String): Boolean {
+        if (title.isNullOrBlank() || queryLower.isBlank()) return true
+        val titleLower = title.lowercase()
+        return titleLower.contains(queryLower)
     }
 
     private fun isFreeTorrent(row: Element): Boolean {
