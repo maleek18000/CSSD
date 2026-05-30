@@ -921,14 +921,6 @@ class Arabp : MainAPI() {
             }
         }
 
-        // Step 1.5: Thank the uploader for non-free torrents to bypass daily download limit
-        if (!isFree) {
-            val thankDetailUrl = if (detailUrl.isNotBlank()) detailUrl
-                else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
-            val thanked = thankUploader(torrentId, thankDetailUrl)
-            Log.d(TAG, "tryResolveTorrent: thank uploader result = $thanked for torrent $torrentId")
-        }
-
         // Step 2: Download .torrent file
         if (resolvedDownloadUrl.isBlank() || !resolvedDownloadUrl.contains("&f=")) {
             Log.w(TAG, "tryResolveTorrent: no valid download URL for torrent $torrentId")
@@ -947,23 +939,8 @@ class Arabp : MainAPI() {
                 return null
             }
             is TorrentDownloadResult.DailyLimitExceeded -> {
-                // Retry: thank the uploader and try downloading again
-                Log.w(TAG, "tryResolveTorrent: daily limit hit, thanking uploader and retrying...")
-                val thankDetailUrl = if (detailUrl.isNotBlank()) detailUrl
-                    else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
-                thankUploader(torrentId, thankDetailUrl)
-                val retryResult = downloadTorrentFile(resolvedDownloadUrl)
-                when (retryResult) {
-                    is TorrentDownloadResult.Success -> {
-                        val entries = uploadToTorrServe(retryResult.bytes, torrentId)
-                        if (entries != null && entries.isNotEmpty()) return entries
-                        return null
-                    }
-                    else -> {
-                        Log.e(TAG, "tryResolveTorrent: download still failed after thank + retry")
-                        return null
-                    }
-                }
+                Log.e(TAG, "tryResolveTorrent: daily download limit exceeded - will retry in loadLinks()")
+                return null
             }
             is TorrentDownloadResult.NotLoggedIn -> {
                 isLoggedIn = false
