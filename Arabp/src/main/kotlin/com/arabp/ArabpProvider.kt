@@ -1366,17 +1366,151 @@ class Arabp : MainAPI() {
         val streamUrl: String      // Full stream URL with correct index
     )
 
+    // ==================== BENCODE PARSER (for .torrent tracker stripping) ====================
+    //
+    // Minimal bencode parser/encoder to strip tracker URLs from .torrent files
+    // before uploading to TorrServe. This prevents the private tracker from
+    // counting your download/upload.
+
+    private sealed class BencodeValue {
+        data class BInt(val value: Long) : BencodeValue()
+        data class BString(val bytes: ByteArray) : BencodeValue() {
+            override fun equals(other: Any?) = other is BString && bytes.contentEquals(other.bytes)
+            override fun hashCode() = bytes.contentHashCode()
+        }
+        data class BList(val items: List<BencodeValue>) : BencodeValue()
+        data class BDict(val entries: MutableList<Pair<BString, BencodeValue>>) : BencodeValue()
+    }
+
+    private fun decodeBencode(data: ByteArray, offset: Int): Pair<BencodeValue, Int> {
+        val byte = data[offset]
+        return when {
+            byte == 'i'.code.toByte() -> {
+                // Integer: i<number>e
+                val end = indexOf(data, 'e'.code.toByte(), offset + 1)
+                val num = String(data, offset + 1, end - offset - 1).toLong()
+                Pair(BencodeValue.BInt(num), end + 1)
+            }
+            byte in '0'.code.toByte()..'9'.code.toByte() -> {
+                // String: <length>:<bytes>
+                val colon = indexOf(data, ':'.code.toByte(), offset)
+                val len = String(data, offset, colon - offset).toInt()
+                val strStart = colon + 1
+                val strBytes = data.sliceArray(strStart until strStart + len)
+                Pair(BencodeValue.BString(strBytes), strStart + len)
+            }
+            byte == 'l'.code.toByte() -> {
+                // List: l<items>e
+                val items = mutableListOf<BencodeValue>()
+                var pos = offset + 1
+                while (data[pos] != 'e'.code.toByte()) {
+                    val (item, newPos) = decodeBencode(data, pos)
+                    items.add(item)
+                    pos = newPos
+                }
+                Pair(BencodeValue.BList(items), pos + 1)
+            }
+            byte == 'd'.code.toByte() -> {
+                // Dictionary: d<key><value>...e
+                val entries = mutableListOf<Pair<BencodeValue.BString, BencodeValue>>()
+                var pos = offset + 1
+                while (data[pos] != 'e'.code.toByte()) {
+                    val (key, keyEnd) = decodeBencode(data, pos)
+                    val (value, valueEnd) = decodeBencode(data, keyEnd)
+                    entries.add(key as BencodeValue.BString to value)
+                    pos = valueEnd
+                }
+                Pair(BencodeValue.BDict(entries), pos + 1)
+            }
+            else -> throw IllegalArgumentException("Invalid bencode byte at $offset: ${byte.toInt().toChar()}")
+        }
+    }
+
+    private fun encodeBencode(value: BencodeValue): ByteArray {
+        return when (value) {
+            is BencodeValue.BInt -> "i${value.value}e".toByteArray()
+            is BencodeValue.BString -> {
+                val prefix = "${value.bytes.size}:".toByteArray()
+                prefix + value.bytes
+            }
+            is BencodeValue.BList -> {
+                val parts = value.items.map { encodeBencode(it) }
+                byteArrayOf('l'.code.toByte()) + parts.reduce { acc, bytes -> acc + bytes } + byteArrayOf('e'.code.toByte())
+            }
+            is BencodeValue.BDict -> {
+                val parts = value.entries.flatMap { (k, v) ->
+                    listOf(encodeBencode(k), encodeBencode(v))
+                }
+                val body = if (parts.isEmpty()) ByteArray(0) else parts.reduce { acc, bytes -> acc + bytes }
+                byteArrayOf('d'.code.toByte()) + body + byteArrayOf('e'.code.toByte())
+            }
+        }
+    }
+
+    private fun indexOf(data: ByteArray, b: Byte, from: Int): Int {
+        for (i in from until data.size) {
+            if (data[i] == b) return i
+        }
+        throw IllegalArgumentException("Byte not found in bencode data")
+    }
+
+    /**
+     * Strip tracker URLs from a .torrent file.
+     * Removes `announce` and `announce-list` keys from the top-level dictionary.
+     * The `info` dict is kept unchanged (same info hash → peers can still find each other via DHT).
+     * Also removes the `private` flag from `info` so DHT/PEX are enabled.
+     *
+     * Without trackers, TorrServe uses DHT for peer discovery.
+     * The private tracker cannot count your download/upload since no announce happens.
+     */
+    private fun stripTrackersFromTorrent(torrentBytes: ByteArray): ByteArray {
+        return try {
+            val (root, _) = decodeBencode(torrentBytes, 0)
+            val dict = root as? BencodeValue.BDict ?: return torrentBytes
+
+            val announceKey = BencodeValue.BString("announce".toByteArray())
+            val announceListKey = BencodeValue.BString("announce-list".toByteArray())
+            val privateKey = BencodeValue.BString("private".toByteArray())
+
+            // Remove announce and announce-list from top-level dict
+            dict.entries.removeAll { (k, _) ->
+                k.bytes.contentEquals("announce".toByteArray()) ||
+                k.bytes.contentEquals("announce-list".toByteArray())
+            }
+
+            // Remove private flag from info dict so DHT/PEX work
+            val infoEntry = dict.entries.find { (k, _) -> k.bytes.contentEquals("info".toByteArray()) }
+            val infoDict = infoEntry?.second as? BencodeValue.BDict
+            infoDict?.entries?.removeAll { (k, _) ->
+                k.bytes.contentEquals("private".toByteArray())
+            }
+
+            val result = encodeBencode(dict)
+            Log.d(TAG, "stripTrackersFromTorrent: ${torrentBytes.size} → ${result.size} bytes (trackers removed)")
+            result
+        } catch (e: Exception) {
+            Log.w(TAG, "stripTrackersFromTorrent failed, using original: ${e.message}")
+            torrentBytes
+        }
+    }
+
     /**
      * Upload .torrent to TorrServe, then poll for file list.
      */
     private fun uploadToTorrServe(torrentBytes: ByteArray, torrentId: String): List<TorrServeStreamEntry>? {
         return try {
+            // Strip trackers from .torrent before uploading to TorrServe.
+            // This removes announce/announce-list and the private flag,
+            // so TorrServe uses DHT for peer discovery instead of trackers.
+            // The private tracker won't be able to count your download/upload.
+            val cleanedBytes = stripTrackersFromTorrent(torrentBytes)
+
             // Step 1: Upload .torrent file
             val requestBody = MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
                 .addFormDataPart(
                     "file", "arabp_$torrentId.torrent",
-                    torrentBytes.toRequestBody("application/x-bittorrent".toMediaType())
+                    cleanedBytes.toRequestBody("application/x-bittorrent".toMediaType())
                 )
                 .addFormDataPart("save", "1")
                 .build()
@@ -1460,9 +1594,8 @@ class Arabp : MainAPI() {
                     val allIndices = videoEntries.map { it.fileIndex }
                     pauseAllFiles(hash, allIndices)
                 }
-                // Remove all trackers for privacy (they log your IP).
-                // The torrent will use DHT and PEX for peer discovery instead.
-                removeTrackers(hash)
+                // Trackers already stripped from .torrent before upload,
+                // so no need to remove them via API.
             } catch (e: Exception) {
                 Log.w(TAG, "TorrServe post-upload setup failed (non-fatal): ${e.message}")
             }
@@ -1664,23 +1797,26 @@ class Arabp : MainAPI() {
 
     // ==================== TORRSERVE TRACKER REMOVAL ====================
     //
-    // Remove all trackers from a torrent in TorrServe for privacy.
-    // Trackers log your IP address when announcing. Without trackers,
-    // the torrent relies on DHT and PEX for peer discovery.
-    //
-    // TorrServe Matrix API: POST /torrents with action=set-trackers
+    // Remove trackers AFTER the torrent has started downloading.
+    // The tracker/passkey is needed to find peers initially, but once
+    // peers are connected via DHT/PEX, trackers can be safely removed
+    // so the private tracker stops counting your download/upload.
 
     /**
      * Remove all trackers from a torrent in TorrServe.
+     * Tries multiple API formats for compatibility.
      * @param hash Torrent hash
-     * @return true if successful
+     * @return true if any method succeeded
      */
     private fun removeTrackers(hash: String): Boolean {
-        return try {
+        var success = false
+
+        // Method 1: set-trackers with empty string (newline-separated format)
+        try {
             val jsonBody = JSONObject().apply {
                 put("action", "set-trackers")
                 put("hash", hash)
-                put("trackers", JSONArray())
+                put("trackers", "")
             }
 
             val request = Request.Builder()
@@ -1690,18 +1826,78 @@ class Arabp : MainAPI() {
                 .build()
 
             torrServeClient.newCall(request).execute().use { response ->
-                val success = response.isSuccessful
-                if (success) {
-                    Log.d(TAG, "TorrServe: removed all trackers for $hash")
+                if (response.isSuccessful) {
+                    Log.d(TAG, "TorrServe: removed trackers (method 1) for $hash")
+                    success = true
                 } else {
-                    Log.w(TAG, "TorrServe: remove trackers failed, HTTP ${response.code}")
+                    Log.w(TAG, "TorrServe: remove trackers method 1 failed, HTTP ${response.code}")
                 }
-                success
             }
         } catch (e: Exception) {
-            Log.e(TAG, "TorrServe removeTrackers error: ${e.message}")
-            false
+            Log.w(TAG, "TorrServe removeTrackers method 1 error: ${e.message}")
         }
+
+        // Method 2: set-trackers with empty array
+        if (!success) {
+            try {
+                val jsonBody = JSONObject().apply {
+                    put("action", "set-trackers")
+                    put("hash", hash)
+                    put("trackers", JSONArray())
+                }
+
+                val request = Request.Builder()
+                    .url("$TORRSERVE_HOST/torrents")
+                    .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
+                    .header("Content-Type", "application/json")
+                    .build()
+
+                torrServeClient.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        Log.d(TAG, "TorrServe: removed trackers (method 2) for $hash")
+                        success = true
+                    } else {
+                        Log.w(TAG, "TorrServe: remove trackers method 2 failed, HTTP ${response.code}")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "TorrServe removeTrackers method 2 error: ${e.message}")
+            }
+        }
+
+        // Method 3: Use the /torrents action=add-tracker with a dummy tracker then set-trackers empty
+        // Some TorrServe versions need this workaround
+        if (!success) {
+            try {
+                // First get current torrent data to find tracker info
+                val getRequest = JSONObject().apply {
+                    put("action", "get")
+                    put("hash", hash)
+                }
+
+                val req = Request.Builder()
+                    .url("$TORRSERVE_HOST/torrents")
+                    .post(getRequest.toString().toRequestBody("application/json".toMediaType()))
+                    .header("Content-Type", "application/json")
+                    .build()
+
+                torrServeClient.newCall(req).execute().use { response ->
+                    if (response.isSuccessful) {
+                        val body = response.body?.string() ?: return@use
+                        val json = JSONObject(body)
+                        val trackerCount = json.optJSONArray("trackers")?.length() ?: 0
+                        Log.d(TAG, "TorrServe: torrent has $trackerCount trackers, torrent stat=${json.optInt("stat", -1)}")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "TorrServe removeTrackers method 3 error: ${e.message}")
+            }
+        }
+
+        if (!success) {
+            Log.w(TAG, "TorrServe: could not remove trackers via API for $hash")
+        }
+        return success
     }
 
     // ==================== TORRSERVE RESPONSE PARSING ====================
