@@ -22,6 +22,38 @@ class Arabmagnet : MainAPI() {
         private const val TAG = "ArabMagnet_Log"
         private const val CATEGORY_ID = 100
         private const val MAX_PAGES = 30
+
+        /**
+         * Public tracker list to append to magnet URLs.
+         * CloudStream's built-in WebTorrent needs these to find peers.
+         * Without trackers, WebTorrent relies on DHT which is unreliable on mobile.
+         */
+        private val PUBLIC_TRACKERS = listOf(
+            "udp://tracker.opentrackr.org:1337/announce",
+            "udp://open.tracker.cl:1337/announce",
+            "udp://tracker.openbittorrent.com:6969/announce",
+            "udp://open.stealth.si:80/announce",
+            "udp://tracker.torrent.eu.org:451/announce",
+            "udp://exodus.desync.com:6969/announce",
+            "udp://tracker.tiny-vps.com:6969/announce",
+            "udp://tracker.moeking.me:6969/announce",
+            "udp://explodie.org:6969/announce",
+            "udp://tracker.pomf.se:80/announce",
+            "udp://tracker.dler.org:6969/announce",
+            "udp://p4p.arenabg.com:1337/announce",
+            "udp://movies.zsw.ca:6969/announce",
+            "udp://retracker.lanta-net.ru:2710/announce",
+            "http://tracker.openbittorrent.com:80/announce",
+            "http://tracker.opentrackr.org:1337/announce",
+            "https://tracker.lilithraws.org:443/announce",
+            "udp://tracker1.myporno.club:80/announce",
+            "udp://tracker.theoks.net:6969/announce",
+            "udp://tracker-udp.gbitt.info:80/announce",
+            "udp://retracker01-msk-virt.corbina.net:80/announce",
+            "udp://authing.tk:6969/announce",
+            "udp://bt2.archive.org:6969/announce",
+            "udp://bt1.archive.org:6969/announce"
+        )
     }
 
     private val imageHeaders = mapOf(
@@ -68,10 +100,8 @@ class Arabmagnet : MainAPI() {
     }
 
     /**
-     * CloudStream resolves SearchResponse URLs against mainUrl.
-     * If "magnet:?xt=..." was stored, it becomes
-     * "https://arab-torrents.com/magnet:?xt=..." which is broken.
-     * This function strips the corrupted prefix.
+     * Strip the base URL that CloudStream's fixUrl() prepends to
+     * SearchResponse URLs that start with "magnet:".
      */
     private fun fixMagnetUrl(url: String): String {
         if (url.startsWith("magnet:")) return url
@@ -82,6 +112,33 @@ class Arabmagnet : MainAPI() {
             return fixed
         }
         return url
+    }
+
+    /**
+     * Append public trackers to a magnet URL to improve peer discovery
+     * in CloudStream's built-in WebTorrent client.
+     * Without trackers, WebTorrent relies on DHT which is unreliable on mobile.
+     */
+    private fun enrichMagnet(magnetUrl: String): String {
+        if (!magnetUrl.startsWith("magnet:")) return magnetUrl
+
+        val existingTrackers = mutableSetOf<String>()
+        // Extract existing tr= parameters
+        val trPattern = Regex("""[&?]tr=([^&]*)""")
+        trPattern.findAll(magnetUrl).forEach { match ->
+            existingTrackers.add(match.groupValues[1].lowercase())
+        }
+
+        val sb = StringBuilder(magnetUrl)
+        for (tracker in PUBLIC_TRACKERS) {
+            val encoded = URLEncoder.encode(tracker, "UTF-8")
+            if (encoded.lowercase() !in existingTrackers) {
+                sb.append("&tr=").append(encoded)
+            }
+        }
+
+        Log.d(TAG, "enrichMagnet: added ${PUBLIC_TRACKERS.size - existingTrackers.size} trackers")
+        return sb.toString()
     }
 
     // ==================== HOME PAGE ====================
@@ -109,7 +166,7 @@ class Arabmagnet : MainAPI() {
 
     /**
      * Data format: PAGE_URL|MAGNET_URL|TITLE|POSTER_URL|FILE_SIZE
-     * PAGE_URL starts with https:// so CloudStream doesn't corrupt it.
+     * PAGE_URL starts with https:// so CloudStream's fixUrl() doesn't corrupt it.
      */
     private fun toSearchResult(row: Element): SearchResponse? {
         return try {
@@ -134,8 +191,7 @@ class Arabmagnet : MainAPI() {
 
             val fileSize = row.selectFirst("div.fsize")?.text()?.trim() ?: ""
 
-            // Use detail page link or fallback to mainUrl as the first part
-            // (must start with https:// so CloudStream doesn't resolve against mainUrl)
+            // Must start with https:// so CloudStream doesn't corrupt it
             val detailHref = row.selectFirst("a[href*=tid=]")
                 ?.attr("href") ?: ""
             val pageUrl = if (detailHref.isNotBlank()) toAbsoluteUrl(detailHref) else "$mainUrl/"
@@ -187,9 +243,9 @@ class Arabmagnet : MainAPI() {
 
         val tvType = tvTypeFromTitle(title)
 
-        // Return a Movie-style response so user sees "Play" button.
-        // The magnet link is stored as the data for loadLinks().
-        // CloudStream natively handles magnet links — no TorrServe needed.
+        // MovieLoadResponse → user sees "Play" button
+        // Data passed to loadLinks: amm|MAGNET_URL
+        // (dataUrl is NOT modified by CloudStream — no fixUrl applied)
         return newMovieLoadResponse(title, url, tvType, "amm|$magnetUrl") {
             this.posterUrl = posterUrl
             this.posterHeaders = imageHeaders
@@ -204,47 +260,43 @@ class Arabmagnet : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        Log.d(TAG, "loadLinks: data=${data.take(80)}...")
+        Log.d(TAG, "loadLinks: data=${data.take(100)}...")
+
+        // Extract magnet URL from any format
+        var magnetUrl: String? = null
 
         // Format: amm|MAGNET_URL
         if (data.startsWith("amm|")) {
-            val magnetUrl = fixMagnetUrl(data.substringAfter("amm|"))
-            if (magnetUrl.startsWith("magnet:")) {
-                Log.d(TAG, "loadLinks: passing magnet link to CloudStream")
-                callback(
-                    newExtractorLink(
-                        source = this.name,
-                        name = "${this.name}",
-                        url = magnetUrl,
-                        type = ExtractorLinkType.MAGNET
-                    )
-                )
-                return true
-            }
+            val raw = data.substringAfter("amm|")
+            magnetUrl = fixMagnetUrl(raw)
+        }
+        // Fallback: direct magnet link
+        else if (data.startsWith("magnet:")) {
+            magnetUrl = data.substringBefore("|")
+        }
+        // Fallback: magnet embedded somewhere in data
+        else if (data.contains("magnet:")) {
+            val raw = data.substring(data.indexOf("magnet:"))
+            magnetUrl = fixMagnetUrl(raw.substringBefore("|"))
         }
 
-        // Fallback: direct magnet in data
-        val magnetUrl = if (data.startsWith("magnet:")) {
-            data
-        } else if (data.contains("magnet:")) {
-            fixMagnetUrl(data.substring(data.indexOf("magnet:")))
-        } else {
-            null
+        if (magnetUrl == null || !magnetUrl.startsWith("magnet:")) {
+            Log.e(TAG, "loadLinks: no magnet link found in: ${data.take(100)}")
+            return false
         }
 
-        if (magnetUrl != null && magnetUrl.startsWith("magnet:")) {
-            callback(
-                newExtractorLink(
-                    source = this.name,
-                    name = this.name,
-                    url = magnetUrl,
-                    type = ExtractorLinkType.MAGNET
-                )
+        // Enrich with public trackers so CloudStream's WebTorrent can find peers
+        val enrichedMagnet = enrichMagnet(magnetUrl)
+        Log.d(TAG, "loadLinks: passing magnet with ${PUBLIC_TRACKERS.size} trackers, length=${enrichedMagnet.length}")
+
+        callback(
+            newExtractorLink(
+                source = this.name,
+                name = this.name,
+                url = enrichedMagnet,
+                type = ExtractorLinkType.MAGNET
             )
-            return true
-        }
-
-        Log.e(TAG, "loadLinks: no magnet link found in: ${data.take(100)}")
-        return false
+        )
+        return true
     }
 }
