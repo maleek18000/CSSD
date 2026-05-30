@@ -6,8 +6,15 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.SubtitleFile
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.jsoup.nodes.Element
+import org.json.JSONArray
+import org.json.JSONObject
 import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
 
 class Arabmagnet : MainAPI() {
     override var mainUrl = "https://arab-torrents.com"
@@ -19,41 +26,12 @@ class Arabmagnet : MainAPI() {
     )
 
     companion object {
-        private const val TAG = "ArabMagnet_Log"
+        private const val TAG = "ArabMagnet"
         private const val CATEGORY_ID = 100
         private const val MAX_PAGES = 30
-
-        /**
-         * Public tracker list to append to magnet URLs.
-         * CloudStream's built-in WebTorrent needs these to find peers.
-         * Without trackers, WebTorrent relies on DHT which is unreliable on mobile.
-         */
-        private val PUBLIC_TRACKERS = listOf(
-            "udp://tracker.opentrackr.org:1337/announce",
-            "udp://open.tracker.cl:1337/announce",
-            "udp://tracker.openbittorrent.com:6969/announce",
-            "udp://open.stealth.si:80/announce",
-            "udp://tracker.torrent.eu.org:451/announce",
-            "udp://exodus.desync.com:6969/announce",
-            "udp://tracker.tiny-vps.com:6969/announce",
-            "udp://tracker.moeking.me:6969/announce",
-            "udp://explodie.org:6969/announce",
-            "udp://tracker.pomf.se:80/announce",
-            "udp://tracker.dler.org:6969/announce",
-            "udp://p4p.arenabg.com:1337/announce",
-            "udp://movies.zsw.ca:6969/announce",
-            "udp://retracker.lanta-net.ru:2710/announce",
-            "http://tracker.openbittorrent.com:80/announce",
-            "http://tracker.opentrackr.org:1337/announce",
-            "https://tracker.lilithraws.org:443/announce",
-            "udp://tracker1.myporno.club:80/announce",
-            "udp://tracker.theoks.net:6969/announce",
-            "udp://tracker-udp.gbitt.info:80/announce",
-            "udp://retracker01-msk-virt.corbina.net:80/announce",
-            "udp://authing.tk:6969/announce",
-            "udp://bt2.archive.org:6969/announce",
-            "udp://bt1.archive.org:6969/announce"
-        )
+        private const val TORRSERVE = "http://127.0.0.1:8090"
+        private const val TORRSERVE_POLL_ATTEMPTS = 15
+        private const val TORRSERVE_POLL_DELAY = 2000L
     }
 
     private val imageHeaders = mapOf(
@@ -61,84 +39,177 @@ class Arabmagnet : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
+    private val okHttp by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .build()
+    }
+
     // ==================== HELPERS ====================
 
-    private fun toAbsoluteUrl(url: String): String {
-        return when {
-            url.startsWith("http") -> url
-            url.startsWith("//") -> "https:$url"
-            url.startsWith("/") -> "$mainUrl$url"
-            else -> "$mainUrl/$url"
-        }
+    private fun toAbsoluteUrl(url: String): String = when {
+        url.startsWith("http") -> url
+        url.startsWith("//") -> "https:$url"
+        url.startsWith("/") -> "$mainUrl$url"
+        else -> "$mainUrl/$url"
     }
 
-    private fun cleanTitleText(text: String): String {
-        return text.replace("\\n", " ").replace("\n", " ").replace(Regex("\\s+"), " ").trim()
+    private fun cleanTitle(text: String): String =
+        text.replace("\\n", " ").replace("\n", " ").replace(Regex("\\s+"), " ").trim()
+            .removePrefix("تحميل ").removePrefix("تحميل").trim()
+
+    private fun titleFromMagnet(magnet: String): String? = try {
+        val dn = magnet.substringAfter("dn=", "").substringBefore("&")
+        if (dn.isNotEmpty()) java.net.URLDecoder.decode(dn, "UTF-8") else null
+    } catch (_: Exception) { null }
+
+    private fun tvTypeFromTitle(title: String): TvType = when {
+        title.contains("فيلم", ignoreCase = true) || title.contains("Movie", ignoreCase = true) -> TvType.AnimeMovie
+        else -> TvType.Anime
     }
 
-    private fun stripDownloadPrefix(title: String): String {
-        return title.removePrefix("تحميل ").removePrefix("تحميل").trim()
+    /** Strip base URL that CloudStream's fixUrl() prepends to magnet: URLs */
+    private fun fixMagnet(url: String): String {
+        if (url.startsWith("magnet:")) return url
+        val i = url.indexOf("magnet:")
+        return if (i > 0) url.substring(i) else url
     }
 
-    private fun titleFromMagnet(magnetUrl: String): String? {
+    /** Extract info hash from magnet URI (supports both v1 and v2) */
+    private fun hashFromMagnet(magnet: String): String? {
+        // xt=urn:btih:HEX or xt=urn:btmh:HEX
+        val xt = Regex("""xt=urn:bt(?:ih|mh):([a-fA-F0-9]{40,})""").find(magnet)
+            ?: Regex("""xt=urn:btih:([A-Z2-7]{32})""").find(magnet)
+            ?: return null
+        return xt.groupValues[1].lowercase()
+    }
+
+    // ==================== TORRSERVE ====================
+
+    /**
+     * Add a magnet to TorrServe, poll until torrent is ready,
+     * and return a list of (fileName, streamUrl) for video files.
+     * Returns null if TorrServe is not running or fails.
+     */
+    private fun torrServeStream(magnet: String): List<Pair<String, String>>? {
         return try {
-            val dnParam = magnetUrl.substringAfter("dn=", "")
-                .substringBefore("&")
-            if (dnParam.isNotEmpty()) {
-                java.net.URLDecoder.decode(dnParam, "UTF-8")
-            } else null
+            val body = JSONObject().apply {
+                put("action", "add")
+                put("link", magnet)
+                put("save", true)
+            }
+
+            val req = Request.Builder()
+                .url("$TORRSERVE/torrents")
+                .post(body.toString().toRequestBody("application/json".toMediaType()))
+                .build()
+
+            val hash: String
+            var fileStats: List<Pair<String, Int>>
+
+            okHttp.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    Log.w(TAG, "TorrServe add: HTTP ${resp.code}")
+                    return null
+                }
+                val json = resp.body?.string() ?: return null
+                Log.d(TAG, "TorrServe add response: ${json.take(300)}")
+
+                hash = try {
+                    JSONObject(json).optString("hash", "")
+                } catch (_: Exception) {
+                    Regex(""""hash"\s*:\s*"([a-fA-F0-9]{40})"""")
+                        .find(json)?.groupValues?.getOrNull(1) ?: ""
+                }
+                if (hash.isBlank()) return null
+
+                fileStats = parseFileStats(json)
+            }
+
+            // Poll if file list is empty (torrent still loading metadata)
+            if (fileStats.isEmpty()) {
+                fileStats = pollTorrServeFiles(hash)
+            }
+
+            if (fileStats.isEmpty()) {
+                // No files found — return a single default stream (index=1)
+                return listOf(
+                    "Video" to "$TORRSERVE/stream/fname?link=${hash.lowercase()}&index=1&play"
+                )
+            }
+
+            // Filter to video files only
+            val videoExts = listOf(".mkv", ".mp4", ".avi", ".wmv", ".flv", ".mov", ".webm", ".m4v", ".ts", ".mpg", ".mpeg", ".rmvb", ".rm", ".m2ts")
+            val videos = fileStats.filter { (path, _) ->
+                videoExts.any { path.lowercase().endsWith(it) }
+            }
+
+            if (videos.isEmpty()) {
+                // No video files? Use first file anyway
+                val (path, id) = fileStats.first()
+                val name = path.replace("\\", "/").substringAfterLast("/")
+                return listOf(name to "$TORRSERVE/stream/fname?link=${hash.lowercase()}&index=$id&play")
+            }
+
+            // Sort naturally (episode 1 before episode 10)
+            videos.sortedBy { (path, _) ->
+                path.replace("\\", "/").substringAfterLast("/")
+                    .replace(Regex("\\d+")) { it.value.padStart(6, '0') }
+                    .lowercase()
+            }.map { (path, id) ->
+                val name = path.replace("\\", "/").substringAfterLast("/")
+                name to "$TORRSERVE/stream/fname?link=${hash.lowercase()}&index=$id&play"
+            }
+        } catch (_: java.net.ConnectException) {
+            Log.w(TAG, "TorrServe not running on $TORRSERVE")
+            null
         } catch (e: Exception) {
+            Log.w(TAG, "TorrServe error: ${e.message}")
             null
         }
     }
 
-    private fun tvTypeFromTitle(title: String): TvType {
-        return when {
-            title.contains("فيلم", ignoreCase = true) || title.contains("Movie", ignoreCase = true) -> TvType.AnimeMovie
-            else -> TvType.Anime
+    private fun pollTorrServeFiles(hash: String): List<Pair<String, Int>> {
+        for (attempt in 1..TORRSERVE_POLL_ATTEMPTS) {
+            try {
+                Thread.sleep(TORRSERVE_POLL_DELAY)
+                val body = JSONObject().apply {
+                    put("action", "get")
+                    put("hash", hash)
+                }
+                val req = Request.Builder()
+                    .url("$TORRSERVE/torrents")
+                    .post(body.toString().toRequestBody("application/json".toMediaType()))
+                    .build()
+
+                okHttp.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) continue
+                    val json = resp.body?.string() ?: continue
+                    val stats = parseFileStats(json)
+                    if (stats.isNotEmpty()) {
+                        Log.d(TAG, "TorrServe poll OK on attempt $attempt: ${stats.size} files")
+                        return stats
+                    }
+                }
+            } catch (_: Exception) { }
         }
+        return emptyList()
     }
 
-    /**
-     * Strip the base URL that CloudStream's fixUrl() prepends to
-     * SearchResponse URLs that start with "magnet:".
-     */
-    private fun fixMagnetUrl(url: String): String {
-        if (url.startsWith("magnet:")) return url
-        val idx = url.indexOf("magnet:")
-        if (idx > 0) {
-            val fixed = url.substring(idx)
-            Log.d(TAG, "fixMagnetUrl: stripped prefix → ${fixed.take(60)}...")
-            return fixed
-        }
-        return url
-    }
-
-    /**
-     * Append public trackers to a magnet URL to improve peer discovery
-     * in CloudStream's built-in WebTorrent client.
-     * Without trackers, WebTorrent relies on DHT which is unreliable on mobile.
-     */
-    private fun enrichMagnet(magnetUrl: String): String {
-        if (!magnetUrl.startsWith("magnet:")) return magnetUrl
-
-        val existingTrackers = mutableSetOf<String>()
-        // Extract existing tr= parameters
-        val trPattern = Regex("""[&?]tr=([^&]*)""")
-        trPattern.findAll(magnetUrl).forEach { match ->
-            existingTrackers.add(match.groupValues[1].lowercase())
-        }
-
-        val sb = StringBuilder(magnetUrl)
-        for (tracker in PUBLIC_TRACKERS) {
-            val encoded = URLEncoder.encode(tracker, "UTF-8")
-            if (encoded.lowercase() !in existingTrackers) {
-                sb.append("&tr=").append(encoded)
+    private fun parseFileStats(json: String): List<Pair<String, Int>> {
+        val results = mutableListOf<Pair<String, Int>>()
+        try {
+            val obj = JSONObject(json)
+            val arr = obj.optJSONArray("file_stats") ?: return emptyList()
+            for (i in 0 until arr.length()) {
+                val f = arr.getJSONObject(i)
+                val id = f.optInt("id", -1)
+                val path = f.optString("path", "")
+                if (id > 0 && path.isNotEmpty()) results.add(path to id)
             }
-        }
-
-        Log.d(TAG, "enrichMagnet: added ${PUBLIC_TRACKERS.size - existingTrackers.size} trackers")
-        return sb.toString()
+        } catch (_: Exception) { }
+        return results
     }
 
     // ==================== HOME PAGE ====================
@@ -154,35 +225,27 @@ class Arabmagnet : MainAPI() {
         return try {
             val doc = app.get(url, headers = imageHeaders).document
             val items = doc.select("table#torrents tr").mapNotNull { toSearchResult(it) }
-            Log.d(TAG, "MainPage page $page: found ${items.size} items")
             newHomePageResponse(request.name, items, items.size >= 10 && page < MAX_PAGES)
-        } catch (e: Exception) {
-            Log.e(TAG, "MainPage Error: ${e.message}")
+        } catch (_: Exception) {
             newHomePageResponse(mutableListOf(), false)
         }
     }
 
-    // ==================== SEARCH RESULT BUILDER ====================
+    // ==================== SEARCH RESULT ====================
 
-    /**
-     * Data format: PAGE_URL|MAGNET_URL|TITLE|POSTER_URL|FILE_SIZE
-     * PAGE_URL starts with https:// so CloudStream's fixUrl() doesn't corrupt it.
-     */
     private fun toSearchResult(row: Element): SearchResponse? {
         return try {
             val magnetEl = row.selectFirst("a[href^=magnet:]") ?: return null
-            var magnetUrl = magnetEl.attr("href")
+            var magnet = magnetEl.attr("href")
 
-            // Jsoup may absolutify the href — strip the base URL if so
-            if (magnetUrl.contains("://") && magnetUrl.contains("magnet:")) {
-                val idx = magnetUrl.indexOf("magnet:")
-                if (idx > 0) magnetUrl = magnetUrl.substring(idx)
+            if (magnet.contains("://") && magnet.contains("magnet:")) {
+                val i = magnet.indexOf("magnet:")
+                if (i > 0) magnet = magnet.substring(i)
             }
 
-            if (magnetUrl.isBlank() || !magnetUrl.startsWith("magnet:")) return null
+            if (!magnet.startsWith("magnet:")) return null
 
-            val title = titleFromMagnet(magnetUrl)
-                ?: stripDownloadPrefix(cleanTitleText(magnetEl.text()))
+            val title = titleFromMagnet(magnet) ?: cleanTitle(magnetEl.text())
             if (title.isBlank()) return null
 
             val posterUrl = row.select("img.posterIcon")
@@ -190,24 +253,16 @@ class Arabmagnet : MainAPI() {
                 ?.parent()?.attr("href") ?: ""
 
             val fileSize = row.selectFirst("div.fsize")?.text()?.trim() ?: ""
-
-            // Must start with https:// so CloudStream doesn't corrupt it
-            val detailHref = row.selectFirst("a[href*=tid=]")
-                ?.attr("href") ?: ""
+            val detailHref = row.selectFirst("a[href*=tid=]")?.attr("href") ?: ""
             val pageUrl = if (detailHref.isNotBlank()) toAbsoluteUrl(detailHref) else "$mainUrl/"
 
             val displayName = if (fileSize.isNotEmpty()) "$title | $fileSize" else title
-            val tvType = tvTypeFromTitle(title)
-            val data = "$pageUrl|$magnetUrl|$title|$posterUrl|$fileSize"
 
-            newAnimeSearchResponse(displayName, data, tvType) {
+            newAnimeSearchResponse(displayName, "$pageUrl|$magnet|$title|$posterUrl|$fileSize", tvTypeFromTitle(title)) {
                 this.posterUrl = posterUrl
                 this.posterHeaders = imageHeaders
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "toSearchResult Error: ${e.message}")
-            null
-        }
+        } catch (_: Exception) { null }
     }
 
     // ==================== SEARCH ====================
@@ -215,38 +270,68 @@ class Arabmagnet : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         return try {
             val searchUrl = "$mainUrl/index.php?page=torrents&search=${URLEncoder.encode(query, "UTF-8")}&cat_id=ar_anime"
-            val doc = app.get(searchUrl, headers = imageHeaders).document
-            doc.select("table#torrents tr").mapNotNull { toSearchResult(it) }
+            app.get(searchUrl, headers = imageHeaders).document
+                .select("table#torrents tr").mapNotNull { toSearchResult(it) }
                 .distinctBy { it.name }
-        } catch (e: Exception) {
-            Log.e(TAG, "Search error: ${e.message}")
-            emptyList()
-        }
+        } catch (_: Exception) { emptyList() }
     }
 
-    // ==================== LOAD (Detail Page) ====================
+    // ==================== LOAD ====================
 
     override suspend fun load(url: String): LoadResponse? {
-        // Data format: pageUrl|magnetUrl|title|posterUrl|fileSize
         val parts = url.split("|", limit = 5)
-        val magnetUrl = fixMagnetUrl(parts.getOrNull(1) ?: return null)
+        val magnet = fixMagnet(parts.getOrNull(1) ?: return null)
         val title = parts.getOrNull(2) ?: "Unknown"
         val posterUrl = parts.getOrNull(3) ?: ""
-        val fileSize = parts.getOrNull(4) ?: ""
 
-        if (!magnetUrl.startsWith("magnet:")) {
-            Log.e(TAG, "load: invalid magnet URL: ${magnetUrl.take(80)}")
-            return null
-        }
-
-        Log.d(TAG, "load: title='$title', magnet=${magnetUrl.take(60)}...")
+        if (!magnet.startsWith("magnet:")) return null
 
         val tvType = tvTypeFromTitle(title)
 
-        // MovieLoadResponse → user sees "Play" button
-        // Data passed to loadLinks: amm|MAGNET_URL
-        // (dataUrl is NOT modified by CloudStream — no fixUrl applied)
-        return newMovieLoadResponse(title, url, tvType, "amm|$magnetUrl") {
+        // Try TorrServe first — if it's running, we get video files
+        val tsFiles = torrServeStream(magnet)
+
+        if (tsFiles != null && tsFiles.size > 1) {
+            // Multi-file torrent → show as TvSeries with episodes
+            val episodes = tsFiles.mapIndexed { idx, (name, _) ->
+                newEpisode(name) {
+                    this.name = name
+                    this.episode = idx + 1
+                    this.season = 1
+                }
+            }
+
+            // Store the magnet in url field, episode data = "ts|index|hash"
+            // We'll reconstruct stream URLs in loadLinks
+            val hash = hashFromMagnet(magnet) ?: ""
+            val epDataList = tsFiles.mapIndexed { idx, (name, _) ->
+                "ts|$hash|${idx + 1}|$name"
+            }
+
+            return newTvSeriesLoadResponse(title, url, TvType.Anime,
+                epDataList.mapIndexed { idx, epData ->
+                    newEpisode(epData) {
+                        this.name = tsFiles[idx].first
+                        this.episode = idx + 1
+                        this.season = 1
+                    }
+                }
+            ) {
+                this.posterUrl = posterUrl
+                this.posterHeaders = imageHeaders
+            }
+        }
+
+        if (tsFiles != null && tsFiles.size == 1) {
+            // Single file → Movie with TorrServe stream
+            return newMovieLoadResponse(title, url, tvType, "tsdirect|${tsFiles[0].second}") {
+                this.posterUrl = posterUrl
+                this.posterHeaders = imageHeaders
+            }
+        }
+
+        // No TorrServe — fall back to Movie with raw magnet
+        return newMovieLoadResponse(title, url, tvType, "amm|$magnet") {
             this.posterUrl = posterUrl
             this.posterHeaders = imageHeaders
         }
@@ -260,43 +345,90 @@ class Arabmagnet : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        Log.d(TAG, "loadLinks: data=${data.take(100)}...")
+        Log.d(TAG, "loadLinks: data=${data.take(100)}")
 
-        // Extract magnet URL from any format
-        var magnetUrl: String? = null
-
-        // Format: amm|MAGNET_URL
-        if (data.startsWith("amm|")) {
-            val raw = data.substringAfter("amm|")
-            magnetUrl = fixMagnetUrl(raw)
-        }
-        // Fallback: direct magnet link
-        else if (data.startsWith("magnet:")) {
-            magnetUrl = data.substringBefore("|")
-        }
-        // Fallback: magnet embedded somewhere in data
-        else if (data.contains("magnet:")) {
-            val raw = data.substring(data.indexOf("magnet:"))
-            magnetUrl = fixMagnetUrl(raw.substringBefore("|"))
-        }
-
-        if (magnetUrl == null || !magnetUrl.startsWith("magnet:")) {
-            Log.e(TAG, "loadLinks: no magnet link found in: ${data.take(100)}")
-            return false
-        }
-
-        // Enrich with public trackers so CloudStream's WebTorrent can find peers
-        val enrichedMagnet = enrichMagnet(magnetUrl)
-        Log.d(TAG, "loadLinks: passing magnet with ${PUBLIC_TRACKERS.size} trackers, length=${enrichedMagnet.length}")
-
-        callback(
-            newExtractorLink(
-                source = this.name,
-                name = this.name,
-                url = enrichedMagnet,
-                type = ExtractorLinkType.MAGNET
+        // TorrServe direct stream: tsdirect|HTTP_URL
+        if (data.startsWith("tsdirect|")) {
+            val streamUrl = data.substringAfter("tsdirect|")
+            callback(
+                newExtractorLink(
+                    source = "$name (TorrServe)",
+                    name = name,
+                    url = streamUrl,
+                    type = ExtractorLinkType.VIDEO
+                )
             )
-        )
-        return true
+            return true
+        }
+
+        // TorrServe episode: ts|HASH|INDEX|FILENAME
+        if (data.startsWith("ts|")) {
+            val parts = data.split("|", limit = 4)
+            val hash = parts.getOrNull(1) ?: return false
+            val index = parts.getOrNull(2) ?: "1"
+            val fileName = parts.getOrNull(3) ?: "Video"
+            val streamUrl = "$TORRSERVE/stream/fname?link=$hash&index=$index&play"
+
+            callback(
+                newExtractorLink(
+                    source = "$name (TorrServe)",
+                    name = fileName,
+                    url = streamUrl,
+                    type = ExtractorLinkType.VIDEO
+                )
+            )
+            return true
+        }
+
+        // Raw magnet: amm|MAGNET_URL
+        if (data.startsWith("amm|")) {
+            val magnet = fixMagnet(data.substringAfter("amm|"))
+            if (magnet.startsWith("magnet:")) {
+                // Try TorrServe one more time (maybe it started since load())
+                val tsFiles = torrServeStream(magnet)
+                if (tsFiles != null) {
+                    for ((name, streamUrl) in tsFiles) {
+                        callback(
+                            newExtractorLink(
+                                source = "$name (TorrServe)",
+                                name = name,
+                                url = streamUrl,
+                                type = ExtractorLinkType.VIDEO
+                            )
+                        )
+                    }
+                    return true
+                }
+
+                // TorrServe not available — pass magnet to CloudStream
+                // NOTE: This uses WebTorrent which rarely works for regular torrents.
+                // User needs TorrServe for reliable playback.
+                callback(
+                    newExtractorLink(
+                        source = "$name (Magnet)",
+                        name = name,
+                        url = magnet,
+                        type = ExtractorLinkType.MAGNET
+                    )
+                )
+                return true
+            }
+        }
+
+        // Direct magnet fallback
+        val magnet = fixMagnet(data)
+        if (magnet.startsWith("magnet:")) {
+            callback(
+                newExtractorLink(
+                    source = "$name (Magnet)",
+                    name = name,
+                    url = magnet,
+                    type = ExtractorLinkType.MAGNET
+                )
+            )
+            return true
+        }
+
+        return false
     }
 }
