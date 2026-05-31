@@ -1,6 +1,9 @@
 package com.arabp
 
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.widget.Toast
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -48,6 +51,28 @@ class Arabp : MainAPI() {
         private const val TORRSERVE_POLL_ATTEMPTS = 6
         // Delay between polls (ms)
         private const val TORRSERVE_POLL_DELAY = 1000L
+
+        // How long to wait before removing trackers (ms)
+        private const val TRACKER_STRIP_DELAY = 10000L
+    }
+
+    // Cache of original .torrent bytes keyed by hash
+    private val torrentBytesCache = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
+
+    /**
+     * Show a toast on screen. Uses `app` context from CloudStream3
+     * which works reliably in plugin classloaders.
+     */
+    private fun showToast(msg: String) {
+        try {
+            val ctx = com.lagradost.cloudstream3.AcraApplication.context
+                ?: return
+            Handler(Looper.getMainLooper()).post {
+                Toast.makeText(ctx, "Arabp: $msg", Toast.LENGTH_LONG).show()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Toast: $msg")
+        }
     }
 
     // Images require Referer header to avoid 403
@@ -1003,6 +1028,103 @@ class Arabp : MainAPI() {
                     type = ExtractorLinkType.VIDEO
                 )
             )
+
+            // File priority + tracker removal in background
+            try {
+                val parsed = parseTorrServeUrl(streamUrl)
+                if (parsed != null) {
+                    val (hash, activeIndex) = parsed
+                    // Resume the active file, pause others
+                    setTorrServeFilePriority(hash, activeIndex, 1)
+                    val allIndices = getTorrServeFileIndices(hash)
+                    for (idx in allIndices) {
+                        if (idx != activeIndex) setTorrServeFilePriority(hash, idx, 0)
+                    }
+
+                    val originalBytes = torrentBytesCache[hash]
+                    Thread {
+                        try {
+                            showToast("1/6 Buffering data...")
+                            Thread.sleep(TRACKER_STRIP_DELAY)
+
+                            val beforeState = queryTorrServeTorrentState(hash)
+                            showToast("BEFORE: $beforeState")
+
+                            // Send event=stopped while torrent is still active
+                            if (originalBytes != null) {
+                                try {
+                                    val infoHash = computeInfoHash(originalBytes)
+                                    val announceUrl = extractAnnounceUrl(originalBytes)
+                                    if (infoHash != null && announceUrl != null) {
+                                        sendTrackerStopped(announceUrl, infoHash)
+                                        sendTrackerStoppedNoPeerId(announceUrl, infoHash)
+                                    }
+                                } catch (_: Exception) {}
+                            }
+
+                            // Delete COMPLETELY
+                            showToast("2/6 Deleting torrent...")
+                            val deleted = deleteTorrServeTorrent(hash, false)
+                            if (!deleted) {
+                                val deleted2 = deleteTorrServeTorrent(hash, true)
+                                if (!deleted2) { showToast("Delete failed!"); return@Thread }
+                            }
+                            showToast("2/6 Deleted OK")
+                            Thread.sleep(2000)
+
+                            // Verify gone
+                            val afterDel = queryTorrServeTorrentState(hash)
+                            showToast("After delete: $afterDel")
+
+                            // Re-upload stripped
+                            if (originalBytes != null) {
+                                val stripped = stripTrackersFromTorrent(originalBytes)
+                                val hasAnn = String(stripped).contains("announce")
+                                showToast("3/6 Stripped (announce=$hasAnn)")
+
+                                showToast("4/6 Uploading stripped...")
+                                val newHash = uploadStrippedTorrent(stripped)
+                                if (newHash != null) {
+                                    showToast("4/6 Hash=${newHash.take(8)}")
+                                    Thread.sleep(3000)
+
+                                    val afterState = queryTorrServeTorrentState(newHash)
+                                    showToast("5/6 AFTER: $afterState")
+
+                                    if (!afterState.contains("trackers=0")) {
+                                        showToast("5/6 Still has trackers! set-trackers...")
+                                        replaceTrackersWithDummy(newHash)
+                                        Thread.sleep(2000)
+                                        val afterST = queryTorrServeTorrentState(newHash)
+                                        showToast("After set-trackers: $afterST")
+                                    }
+
+                                    val streamWorks = testStreamUrl(streamUrl)
+                                    showToast("6/6 Stream: $streamWorks")
+
+                                    // Cleanup event=stopped
+                                    try {
+                                        val infoHash = computeInfoHash(originalBytes)
+                                        val annUrl = extractAnnounceUrl(originalBytes)
+                                        if (infoHash != null && annUrl != null) {
+                                            sendTrackerStopped(annUrl, infoHash)
+                                            sendTrackerStoppedNoPeerId(annUrl, infoHash)
+                                        }
+                                    } catch (_: Exception) {}
+                                } else {
+                                    showToast("Upload failed!")
+                                }
+                            }
+                            torrentBytesCache.remove(hash)
+                        } catch (e: Exception) {
+                            showToast("Error: ${e.message}")
+                        }
+                    }.start()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Priority/tracker failed: ${e.message}")
+            }
+
             return true
         }
 
@@ -1259,6 +1381,9 @@ class Arabp : MainAPI() {
 
                 Log.d(TAG, "TorrServe hash: $hash")
 
+                // Cache original torrent bytes for tracker removal later
+                torrentBytesCache[hash] = torrentBytes
+
                 // Try to parse file_stats from the upload response
                 fileStats = parseFileStatsFromResponse(responseBody)
                 Log.d(TAG, "Parsed ${fileStats.size} files from upload response")
@@ -1503,5 +1628,387 @@ class Arabp : MainAPI() {
             TvType.TvSeries -> TvType.Movie
             else -> this
         }
+    }
+
+    // ==================== TORRSERVE URL PARSING ====================
+
+    private fun parseTorrServeUrl(url: String): Pair<String, Int>? {
+        return try {
+            // Format: http://127.0.0.1:8090/stream/fname?link=HASH&index=INDEX&play
+            val hash = url.substringAfter("link=").substringBefore("&").substringBefore(" ")
+            val index = url.substringAfter("index=").substringBefore("&").substringBefore(" ").toIntOrNull() ?: return null
+            if (hash.length >= 8) Pair(hash, index) else null
+        } catch (e: Exception) { null }
+    }
+
+    // ==================== TORRSERVE FILE PRIORITY ====================
+
+    private fun setTorrServeFilePriority(hash: String, fileIndex: Int, priority: Int): Boolean {
+        return try {
+            val jsonBody = JSONObject().apply {
+                put("action", "set-file-priority")
+                put("hash", hash)
+                put("file_id", fileIndex)
+                put("priority", priority)
+            }
+            val request = Request.Builder()
+                .url("$TORRSERVE_HOST/torrents")
+                .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
+                .header("Content-Type", "application/json")
+                .build()
+            torrServeClient.newCall(request).execute().use { resp ->
+                resp.isSuccessful
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "setFilePriority: ${e.message}")
+            false
+        }
+    }
+
+    private fun getTorrServeFileIndices(hash: String): List<Int> {
+        return try {
+            val jsonBody = JSONObject().apply {
+                put("action", "get")
+                put("hash", hash)
+            }
+            val request = Request.Builder()
+                .url("$TORRSERVE_HOST/torrents")
+                .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
+                .header("Content-Type", "application/json")
+                .build()
+            torrServeClient.newCall(request).execute().use { resp ->
+                val body = resp.body?.string() ?: return emptyList()
+                val json = JSONObject(body)
+                val fileStats = json.optJSONArray("file_stats") ?: return emptyList()
+                (0 until fileStats.length()).mapNotNull {
+                    fileStats.getJSONObject(it).optInt("id", -1).takeIf { id -> id > 0 }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "getFileIndices: ${e.message}")
+            emptyList()
+        }
+    }
+
+    // ==================== TORRSERVE TORRENT MANAGEMENT ====================
+
+    private fun queryTorrServeTorrentState(hash: String): String {
+        return try {
+            val jsonBody = JSONObject().apply {
+                put("action", "get")
+                put("hash", hash)
+            }
+            val request = Request.Builder()
+                .url("$TORRSERVE_HOST/torrents")
+                .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
+                .header("Content-Type", "application/json")
+                .build()
+            torrServeClient.newCall(request).execute().use { resp ->
+                val body = resp.body?.string() ?: "no body"
+                val json = JSONObject(body)
+                val stat = json.optInt("stat", -1)
+                val trackersArr = json.optJSONArray("trackers")
+                val trackerCount = trackersArr?.length() ?: 0
+                val dl = json.optLong("downloaded", json.optLong("total_download", 0))
+                val dlStr = if (dl > 1048576) "${dl / 1048576}MB" else if (dl > 1024) "${dl / 1024}KB" else "${dl}B"
+                "stat=$stat trackers=$trackerCount dl=$dlStr"
+            }
+        } catch (e: Exception) {
+            "error: ${e.message}"
+        }
+    }
+
+    private fun deleteTorrServeTorrent(hash: String, saveData: Boolean): Boolean {
+        return try {
+            val jsonBody = JSONObject().apply {
+                put("action", "delete")
+                put("hash", hash)
+                put("save", saveData)
+            }
+            val request = Request.Builder()
+                .url("$TORRSERVE_HOST/torrents")
+                .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
+                .header("Content-Type", "application/json")
+                .build()
+            torrServeClient.newCall(request).execute().use { resp ->
+                Log.d(TAG, "deleteTorrent: HTTP ${resp.code}")
+                resp.isSuccessful
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "deleteTorrent: ${e.message}")
+            false
+        }
+    }
+
+    private fun uploadStrippedTorrent(torrentBytes: ByteArray): String? {
+        return try {
+            val requestBody = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("file", "stripped.torrent",
+                    torrentBytes.toRequestBody("application/x-bittorrent".toMediaType()))
+                .addFormDataPart("save", "1")
+                .build()
+            val request = Request.Builder()
+                .url("$TORRSERVE_HOST/torrent/upload")
+                .post(requestBody)
+                .build()
+            torrServeClient.newCall(request).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                val body = resp.body?.string() ?: return null
+                parseHashFromResponse(body)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "uploadStripped: ${e.message}")
+            null
+        }
+    }
+
+    private fun testStreamUrl(url: String): Boolean {
+        return try {
+            val request = Request.Builder()
+                .url(url)
+                .header("Range", "bytes=0-1")
+                .build()
+            torrServeClient.newCall(request).execute().use { resp ->
+                resp.isSuccessful || resp.code == 206
+            }
+        } catch (e: Exception) { false }
+    }
+
+    private fun replaceTrackersWithDummy(hash: String): Boolean {
+        val dummy = "http://127.0.0.1:1/announce"
+        // Try all known formats
+        val bodies = listOf(
+            JSONObject().apply { put("action","set-trackers"); put("hash",hash); put("trackers",dummy) },
+            JSONObject().apply { put("action","set-trackers"); put("hash",hash); put("trackers", JSONArray().put(dummy)) },
+            JSONObject().apply { put("action","set-trackers"); put("hash",hash); put("trackers", JSONArray().put(JSONArray().put(dummy))) },
+            JSONObject().apply { put("action","set-trackers"); put("hash",hash); put("trackers","\n") }
+        )
+        for (body in bodies) {
+            try {
+                val req = Request.Builder()
+                    .url("$TORRSERVE_HOST/torrents")
+                    .post(body.toString().toRequestBody("application/json".toMediaType()))
+                    .header("Content-Type", "application/json")
+                    .build()
+                torrServeClient.newCall(req).execute().use { resp ->
+                    Log.d(TAG, "set-trackers: HTTP ${resp.code}")
+                }
+            } catch (_: Exception) {}
+        }
+        return true
+    }
+
+    // ==================== BENCODE PARSER ====================
+
+    sealed class BencodeValue {
+        data class BString(val bytes: ByteArray) : BencodeValue()
+        data class BInt(val value: Long) : BencodeValue()
+        data class BList(val items: List<BencodeValue>) : BencodeValue()
+        data class BDict(val entries: MutableList<Pair<BString, BencodeValue>>) : BencodeValue()
+    }
+
+    private fun decodeBencode(data: ByteArray, offset: Int): Pair<BencodeValue, Int> {
+        val byte = data[offset].toInt().toChar()
+        return when {
+            byte in '0'..'9' -> decodeBencodeString(data, offset)
+            byte == 'i' -> decodeBencodeInt(data, offset)
+            byte == 'l' -> decodeBencodeList(data, offset)
+            byte == 'd' -> decodeBencodeDict(data, offset)
+            else -> throw IllegalArgumentException("Invalid bencode at offset $offset: '$byte'")
+        }
+    }
+
+    private fun decodeBencodeString(data: ByteArray, offset: Int): Pair<BencodeValue.BString, Int> {
+        var colon = -1
+        for (i in offset until data.size) { if (data[i] == ':'.code.toByte()) { colon = i; break } }
+        if (colon < 0) throw IllegalArgumentException("No colon found")
+        val len = String(data, offset, colon - offset).toInt()
+        val strStart = colon + 1
+        return Pair(BencodeValue.BString(data.sliceArray(strStart until strStart + len)), strStart + len)
+    }
+
+    private fun decodeBencodeInt(data: ByteArray, offset: Int): Pair<BencodeValue.BInt, Int> {
+        var end = -1
+        for (i in offset until data.size) { if (data[i] == 'e'.code.toByte()) { end = i; break } }
+        val value = String(data, offset + 1, end - offset - 1).toLong()
+        return Pair(BencodeValue.BInt(value), end + 1)
+    }
+
+    private fun decodeBencodeList(data: ByteArray, offset: Int): Pair<BencodeValue.BList, Int> {
+        var pos = offset + 1
+        val items = mutableListOf<BencodeValue>()
+        while (data[pos].toInt().toChar() != 'e') {
+            val (item, newPos) = decodeBencode(data, pos)
+            items.add(item)
+            pos = newPos
+        }
+        return Pair(BencodeValue.BList(items), pos + 1)
+    }
+
+    private fun decodeBencodeDict(data: ByteArray, offset: Int): Pair<BencodeValue.BDict, Int> {
+        var pos = offset + 1
+        val entries = mutableListOf<Pair<BencodeValue.BString, BencodeValue>>()
+        while (data[pos].toInt().toChar() != 'e') {
+            val (key, newPos1) = decodeBencodeString(data, pos)
+            val (value, newPos2) = decodeBencode(data, newPos1)
+            entries.add(Pair(key, value))
+            pos = newPos2
+        }
+        return Pair(BencodeValue.BDict(entries), pos + 1)
+    }
+
+    private fun encodeBencode(value: BencodeValue): ByteArray {
+        return when (value) {
+            is BencodeValue.BString -> {
+                val len = value.bytes.size.toString().toByteArray()
+                len + ":".toByteArray() + value.bytes
+            }
+            is BencodeValue.BInt -> "i${value.value}e".toByteArray()
+            is BencodeValue.BList -> {
+                val parts = mutableListOf<ByteArray>("l".toByteArray())
+                for (item in value.items) parts.add(encodeBencode(item))
+                parts.add("e".toByteArray())
+                parts.reduce { acc, bytes -> acc + bytes }
+            }
+            is BencodeValue.BDict -> {
+                val parts = mutableListOf<ByteArray>("d".toByteArray())
+                for ((key, val_) in value.entries) {
+                    parts.add(encodeBencode(key))
+                    parts.add(encodeBencode(val_))
+                }
+                parts.add("e".toByteArray())
+                parts.reduce { acc, bytes -> acc + bytes }
+            }
+        }
+    }
+
+    // ==================== TRACKER STRIPPING ====================
+
+    /**
+     * Strip tracker URLs from a .torrent file.
+     * Removes `announce` and `announce-list` from top-level dict ONLY.
+     * Does NOT touch the `info` dict — info hash is preserved.
+     */
+    private fun stripTrackersFromTorrent(torrentBytes: ByteArray): ByteArray {
+        return try {
+            val (root, _) = decodeBencode(torrentBytes, 0)
+            val dict = root as? BencodeValue.BDict ?: return torrentBytes
+            dict.entries.removeAll { (k, _) ->
+                k.bytes.contentEquals("announce".toByteArray()) ||
+                k.bytes.contentEquals("announce-list".toByteArray())
+            }
+            encodeBencode(dict)
+        } catch (e: Exception) {
+            Log.w(TAG, "stripTrackers failed: ${e.message}")
+            torrentBytes
+        }
+    }
+
+    // ==================== INFO HASH & ANNOUNCE URL ====================
+
+    private fun computeInfoHash(torrentBytes: ByteArray): String? {
+        return try {
+            val (root, _) = decodeBencode(torrentBytes, 0)
+            val dict = root as? BencodeValue.BDict ?: return null
+            val infoEntry = dict.entries.find { (k, _) ->
+                k.bytes.contentEquals("info".toByteArray())
+            } ?: return null
+            val infoEncoded = encodeBencode(infoEntry.second)
+            val sha1 = java.security.MessageDigest.getInstance("SHA-1").digest(infoEncoded)
+            sha1.joinToString("") { "%02x".format(it) }
+        } catch (e: Exception) {
+            Log.e(TAG, "computeInfoHash: ${e.message}")
+            null
+        }
+    }
+
+    private fun extractAnnounceUrl(torrentBytes: ByteArray): String? {
+        return try {
+            val (root, _) = decodeBencode(torrentBytes, 0)
+            val dict = root as? BencodeValue.BDict ?: return null
+            // Try "announce" key
+            val announceEntry = dict.entries.find { (k, _) ->
+                k.bytes.contentEquals("announce".toByteArray())
+            }
+            if (announceEntry != null) {
+                return String((announceEntry.second as BencodeValue.BString).bytes)
+            }
+            // Try first in "announce-list"
+            val listEntry = dict.entries.find { (k, _) ->
+                k.bytes.contentEquals("announce-list".toByteArray())
+            }
+            if (listEntry != null) {
+                val list = listEntry.second as? BencodeValue.BList ?: return null
+                if (list.items.isNotEmpty()) {
+                    val tier = list.items[0] as? BencodeValue.BList ?: return null
+                    if (tier.items.isNotEmpty()) {
+                        return String((tier.items[0] as BencodeValue.BString).bytes)
+                    }
+                }
+            }
+            null
+        } catch (e: Exception) {
+            Log.e(TAG, "extractAnnounceUrl: ${e.message}")
+            null
+        }
+    }
+
+    // ==================== SEND EVENT=STOPPED TO TRACKER ====================
+
+    private fun sendTrackerStopped(announceUrl: String, infoHashHex: String, peerId: String? = null, port: Int = 6881): Boolean {
+        return try {
+            val infoHashBytes = ByteArray(20)
+            for (i in 0 until 20) {
+                infoHashBytes[i] = infoHashHex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+            }
+            val encodedInfoHash = infoHashBytes.joinToString("") { byte ->
+                "%${String.format("%02x", byte.toInt() and 0xFF)}"
+            }
+            val effectivePeerId = peerId ?: ("-LT1000-" + (1..12).map { "0123456789abcdef".random() }.joinToString(""))
+            val separator = if ("?" in announceUrl) "&" else "?"
+            val stoppedUrl = buildString {
+                append(announceUrl).append(separator)
+                append("info_hash=").append(encodedInfoHash)
+                append("&peer_id=").append(URLEncoder.encode(effectivePeerId, "UTF-8"))
+                append("&port=").append(port)
+                append("&uploaded=0&downloaded=0&left=0")
+                append("&compact=1&event=stopped&numwant=0")
+            }
+            val request = Request.Builder().url(stoppedUrl)
+                .header("User-Agent", "libtorrent/1.2.19.0").build()
+            torrServeClient.newCall(request).execute().use { resp ->
+                Log.d(TAG, "event=stopped: HTTP ${resp.code}")
+                resp.isSuccessful
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "event=stopped: ${e.message}")
+            false
+        }
+    }
+
+    private fun sendTrackerStoppedNoPeerId(announceUrl: String, infoHashHex: String): Boolean {
+        return try {
+            val infoHashBytes = ByteArray(20)
+            for (i in 0 until 20) {
+                infoHashBytes[i] = infoHashHex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+            }
+            val encodedInfoHash = infoHashBytes.joinToString("") { byte ->
+                "%${String.format("%02x", byte.toInt() and 0xFF)}"
+            }
+            val separator = if ("?" in announceUrl) "&" else "?"
+            val stoppedUrl = buildString {
+                append(announceUrl).append(separator)
+                append("info_hash=").append(encodedInfoHash)
+                append("&peer_id=&port=0")
+                append("&uploaded=0&downloaded=0&left=0")
+                append("&compact=1&event=stopped&numwant=0")
+            }
+            val request = Request.Builder().url(stoppedUrl)
+                .header("User-Agent", "libtorrent/1.2.19.0").build()
+            torrServeClient.newCall(request).execute().use { resp ->
+                resp.isSuccessful
+            }
+        } catch (e: Exception) { false }
     }
 }
