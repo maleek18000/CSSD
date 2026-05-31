@@ -481,10 +481,15 @@ class Arabp : MainAPI() {
                 ?: doc.selectFirst("img.listing_poster")?.attr("src") ?: ""
 
             val absPosterUrl = toAbsoluteUrl(posterUrl)
+            // Try multiple selectors for the torrents table — arabp2p pages vary
             val rows = doc.select("table#listing_table tr")
+                .ifEmpty { doc.select("table.lista2t tr.lista2") }
+                .ifEmpty { doc.select("table tr:has(a[href*=torrent-details])") }
+                .ifEmpty { doc.select("div.file-header") }
+
             val episodes = mutableListOf<Episode>()
-            val seasonNamesList = mutableListOf<SeasonData>()
-            var globalSeasonNum = 1
+            val epDataList = mutableListOf<String>()
+            var epNum = 1
 
             for (row in rows) {
                 val nameLink = row.selectFirst("a[href*=torrent-details]") ?: continue
@@ -508,16 +513,16 @@ class Arabp : MainAPI() {
                 }
 
                 val epData = "$torrentId|${toAbsoluteUrl(detailHref)}|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
-                seasonNamesList.add(SeasonData(season = globalSeasonNum, name = displayName))
+                epDataList.add(epData)
                 episodes.add(
                     newEpisode(epData, fix = false, initializer = {
                         name = displayName
-                        season = globalSeasonNum
-                        episode = 1
+                        season = 1
+                        episode = epNum
                         this.posterUrl = absPosterUrl
                     })
                 )
-                globalSeasonNum++
+                epNum++
             }
 
             val pageTvType = tvTypeFromPage(fullUrl)
@@ -527,11 +532,17 @@ class Arabp : MainAPI() {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
                 }
+            } else if (episodes.size == 1) {
+                // Single torrent → return as Movie (no episode picker needed)
+                newMovieLoadResponse(title, fullUrl, pageTvType.toMovieType(), epDataList[0]) {
+                    this.posterUrl = absPosterUrl
+                    this.posterHeaders = imageHeaders
+                }
             } else {
+                // Multiple torrents → return as Series with episodes in Season 1
                 newTvSeriesLoadResponse(title, fullUrl, pageTvType.toSeriesType(), episodes) {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
-                    this.seasonNames = seasonNamesList
                 }
             }
         } catch (e: Exception) {
@@ -580,24 +591,8 @@ class Arabp : MainAPI() {
             else if (detailUrl.contains("anime-listing")) TvType.Anime
             else tvTypeFromTitle(title)
 
-        // External torrents with magnet: return as movie with magnet data
-        if (isExternal && magnetUrl.startsWith("magnet:")) {
-            return newMovieLoadResponse(title, data, pageTvType.toMovieType(), data) {
-                this.posterUrl = absPosterUrl
-                this.posterHeaders = imageHeaders
-            }
-        }
-
-        // All other torrents: return as single-episode series.
-        // loadLinks() will convert .torrent → magnet when user clicks play.
-        return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), listOf(
-            newEpisode(data, fix = false, initializer = {
-                name = title
-                season = 1
-                episode = 1
-                this.posterUrl = absPosterUrl
-            })
-        )) {
+        // Single torrent → always return as Movie (no episode picker needed)
+        return newMovieLoadResponse(title, data, pageTvType.toMovieType(), data) {
             this.posterUrl = absPosterUrl
             this.posterHeaders = imageHeaders
         }
@@ -772,7 +767,7 @@ class Arabp : MainAPI() {
                 callback(
                     newExtractorLink(
                         source = this.name,
-                        name = "${this.name} (Magnet)",
+                        name = "${this.name} External",
                         url = magnetUrl,
                         type = ExtractorLinkType.MAGNET
                     )
@@ -804,22 +799,9 @@ class Arabp : MainAPI() {
                             resolvedDownloadUrl = toAbsoluteUrl(dlLink.attr("href"))
                         }
 
-                        // Also check for magnet link on detail page as fallback
-                        val magnetEl = detailDoc.selectFirst("a[href^=magnet:]")
-                        if (magnetEl != null) {
-                            val pageMagnet = magnetEl.attr("href")
-                            if (pageMagnet.startsWith("magnet:")) {
-                                callback(
-                                    newExtractorLink(
-                                        source = this.name,
-                                        name = "${this.name} (Magnet)",
-                                        url = pageMagnet,
-                                        type = ExtractorLinkType.MAGNET
-                                    )
-                                )
-                                foundLink = true
-                            }
-                        }
+                        // Note: We skip the detail page magnet link here because
+                        // handleTorrentDownloadResult() will generate a proper magnet
+                        // from the actual .torrent file (with correct passkey trackers).
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to fetch detail page: ${e.message}")
@@ -874,7 +856,7 @@ class Arabp : MainAPI() {
                     callback(
                         newExtractorLink(
                             source = this.name,
-                            name = "${this.name} (Torrent)",
+                            name = "${this.name} Player",
                             url = localUrl,
                             type = ExtractorLinkType.TORRENT
                         )
@@ -889,7 +871,7 @@ class Arabp : MainAPI() {
                     callback(
                         newExtractorLink(
                             source = this.name,
-                            name = "${this.name} (Magnet)",
+                            name = "${this.name} External",
                             url = magnet,
                             type = ExtractorLinkType.MAGNET
                         )
@@ -909,7 +891,7 @@ class Arabp : MainAPI() {
                             callback(
                                 newExtractorLink(
                                     source = this.name,
-                                    name = "${this.name} (Torrent)",
+                                    name = "${this.name} Player",
                                     url = localUrl,
                                     type = ExtractorLinkType.TORRENT
                                 )
@@ -922,7 +904,7 @@ class Arabp : MainAPI() {
                             callback(
                                 newExtractorLink(
                                     source = this.name,
-                                    name = "${this.name} (Magnet)",
+                                    name = "${this.name} External",
                                     url = magnet,
                                     type = ExtractorLinkType.MAGNET
                                 )
