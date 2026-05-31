@@ -481,15 +481,10 @@ class Arabp : MainAPI() {
                 ?: doc.selectFirst("img.listing_poster")?.attr("src") ?: ""
 
             val absPosterUrl = toAbsoluteUrl(posterUrl)
-            // Try multiple selectors for the torrents table — arabp2p pages vary
             val rows = doc.select("table#listing_table tr")
-                .ifEmpty { doc.select("table.lista2t tr.lista2") }
-                .ifEmpty { doc.select("table tr:has(a[href*=torrent-details])") }
-                .ifEmpty { doc.select("div.file-header") }
-
             val episodes = mutableListOf<Episode>()
-            val epDataList = mutableListOf<String>()
-            var epNum = 1
+            val seasonNamesList = mutableListOf<SeasonData>()
+            var globalSeasonNum = 1
 
             for (row in rows) {
                 val nameLink = row.selectFirst("a[href*=torrent-details]") ?: continue
@@ -513,16 +508,16 @@ class Arabp : MainAPI() {
                 }
 
                 val epData = "$torrentId|${toAbsoluteUrl(detailHref)}|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
-                epDataList.add(epData)
+                seasonNamesList.add(SeasonData(season = globalSeasonNum, name = displayName))
                 episodes.add(
                     newEpisode(epData, fix = false, initializer = {
                         name = displayName
-                        season = 1
-                        episode = epNum
+                        season = globalSeasonNum
+                        episode = 1
                         this.posterUrl = absPosterUrl
                     })
                 )
-                epNum++
+                globalSeasonNum++
             }
 
             val pageTvType = tvTypeFromPage(fullUrl)
@@ -532,17 +527,11 @@ class Arabp : MainAPI() {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
                 }
-            } else if (episodes.size == 1) {
-                // Single torrent → return as Movie (no episode picker needed)
-                newMovieLoadResponse(title, fullUrl, pageTvType.toMovieType(), epDataList[0]) {
-                    this.posterUrl = absPosterUrl
-                    this.posterHeaders = imageHeaders
-                }
             } else {
-                // Multiple torrents → return as Series with episodes in Season 1
                 newTvSeriesLoadResponse(title, fullUrl, pageTvType.toSeriesType(), episodes) {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
+                    this.seasonNames = seasonNamesList
                 }
             }
         } catch (e: Exception) {
@@ -591,8 +580,24 @@ class Arabp : MainAPI() {
             else if (detailUrl.contains("anime-listing")) TvType.Anime
             else tvTypeFromTitle(title)
 
-        // Single torrent → always return as Movie (no episode picker needed)
-        return newMovieLoadResponse(title, data, pageTvType.toMovieType(), data) {
+        // External torrents with magnet: return as movie with magnet data
+        if (isExternal && magnetUrl.startsWith("magnet:")) {
+            return newMovieLoadResponse(title, data, pageTvType.toMovieType(), data) {
+                this.posterUrl = absPosterUrl
+                this.posterHeaders = imageHeaders
+            }
+        }
+
+        // All other torrents: return as single-episode series.
+        // loadLinks() will convert .torrent → magnet when user clicks play.
+        return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), listOf(
+            newEpisode(data, fix = false, initializer = {
+                name = title
+                season = 1
+                episode = 1
+                this.posterUrl = absPosterUrl
+            })
+        )) {
             this.posterUrl = absPosterUrl
             this.posterHeaders = imageHeaders
         }
@@ -728,9 +733,9 @@ class Arabp : MainAPI() {
     // serve it from a local HTTP server on 127.0.0.1. CS3's Go server fetches from
     // localhost without needing auth.
     //
-    // Two sources provided:
-    // 1. "Arabp (Torrent)" — local server serving the .torrent file → CS3 built-in player
-    // 2. "Arabp (Magnet)" — magnet link with passkey trackers → external players
+    // Only ONE source is returned (the .torrent file served via local HTTP server)
+    // so CloudStream auto-selects it and the built-in torrent player shows the
+    // file picker for multi-file torrents (episode selection within the torrent).
 
     override suspend fun loadLinks(
         data: String,
@@ -761,21 +766,7 @@ class Arabp : MainAPI() {
 
             var foundLink = false
 
-            // === EXTERNAL TORRENTS: pass magnet link directly ===
-            if (isExternal && magnetUrl.startsWith("magnet:")) {
-                Log.d(TAG, "External torrent — passing magnet link")
-                callback(
-                    newExtractorLink(
-                        source = this.name,
-                        name = "${this.name} External",
-                        url = magnetUrl,
-                        type = ExtractorLinkType.MAGNET
-                    )
-                )
-                return true
-            }
-
-            // === INTERNAL TORRENTS: download .torrent → serve via local server + magnet ===
+            // === DOWNLOAD .torrent → serve via local server ===
             var resolvedDownloadUrl = downloadUrl
 
             // Step 1: Resolve download URL with &f= parameter
@@ -834,8 +825,10 @@ class Arabp : MainAPI() {
     }
 
     /**
-     * Processes a TorrentDownloadResult: serves .torrent via local server and
-     * generates a magnet link. Returns true if at least one source was added.
+     * Processes a TorrentDownloadResult: serves .torrent via local server.
+     * Only returns ONE source so CS auto-selects it and shows the torrent
+     * file picker for multi-file torrents (episode selection within the torrent).
+     * Returns true if a source was added.
      */
     private suspend fun handleTorrentDownloadResult(
         result: TorrentDownloadResult,
@@ -848,15 +841,15 @@ class Arabp : MainAPI() {
             is TorrentDownloadResult.Success -> {
                 Log.d(TAG, "Downloaded .torrent: ${result.bytes.size} bytes")
 
-                // Source 1: Serve .torrent via local HTTP server
-                // CS3's Go torrent server fetches from localhost — no auth needed!
+                // Serve .torrent via local HTTP server — CS3's Go torrent server
+                // fetches from localhost, then shows the file picker for multi-file torrents
                 val localUrl = startLocalTorrentServer(result.bytes)
                 if (localUrl != null) {
                     Log.d(TAG, "Serving .torrent via local server: $localUrl")
                     callback(
                         newExtractorLink(
                             source = this.name,
-                            name = "${this.name} Player",
+                            name = this.name,
                             url = localUrl,
                             type = ExtractorLinkType.TORRENT
                         )
@@ -864,19 +857,10 @@ class Arabp : MainAPI() {
                     foundLink = true
                 }
 
-                // Source 2: Magnet link — works with external players
+                // Cache the magnet for potential external use (not shown as source)
                 val magnet = torrentToMagnet(result.bytes)
                 if (magnet != null) {
-                    Log.d(TAG, "Generated magnet: ${magnet.take(150)}...")
-                    callback(
-                        newExtractorLink(
-                            source = this.name,
-                            name = "${this.name} External",
-                            url = magnet,
-                            type = ExtractorLinkType.MAGNET
-                        )
-                    )
-                    foundLink = true
+                    Log.d(TAG, "Generated magnet (cached): ${magnet.take(150)}...")
                 }
             }
             is TorrentDownloadResult.DailyLimitExceeded -> {
@@ -891,22 +875,9 @@ class Arabp : MainAPI() {
                             callback(
                                 newExtractorLink(
                                     source = this.name,
-                                    name = "${this.name} Player",
+                                    name = this.name,
                                     url = localUrl,
                                     type = ExtractorLinkType.TORRENT
-                                )
-                            )
-                            foundLink = true
-                        }
-
-                        val magnet = torrentToMagnet(retryResult.bytes)
-                        if (magnet != null) {
-                            callback(
-                                newExtractorLink(
-                                    source = this.name,
-                                    name = "${this.name} External",
-                                    url = magnet,
-                                    type = ExtractorLinkType.MAGNET
                                 )
                             )
                             foundLink = true
