@@ -1,9 +1,6 @@
 package com.arabp
 
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
-import android.widget.Toast
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -25,7 +22,6 @@ import java.net.CookiePolicy
 import java.net.HttpCookie
 import java.net.URI
 import java.net.URLEncoder
-import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
 class Arabp : MainAPI() {
@@ -33,7 +29,10 @@ class Arabp : MainAPI() {
     override var name = "Arabp"
     override val hasMainPage = true
     override var lang = "ar"
-    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA, TvType.TvSeries, TvType.Movie)
+    override val supportedTypes = setOf(
+        TvType.Anime, TvType.AnimeMovie, TvType.OVA,
+        TvType.TvSeries, TvType.Movie
+    )
 
     companion object {
         private const val TAG = "Arabp_Log"
@@ -46,34 +45,9 @@ class Arabp : MainAPI() {
         private const val TORRSERVE_HOST = "http://127.0.0.1:8090"
 
         // How many times to poll TorrServe for file list after upload
-        private const val TORRSERVE_POLL_ATTEMPTS = 20
+        private const val TORRSERVE_POLL_ATTEMPTS = 6
         // Delay between polls (ms)
-        private const val TORRSERVE_POLL_DELAY = 2000L
-
-        // How long to wait before stripping trackers (ms)
-        // The tracker needs time to connect and find peers first.
-        private const val TRACKER_STRIP_DELAY = 10000L
-    }
-
-    // Cache of original .torrent bytes keyed by hash,
-    // used to re-upload stripped versions after peers connect.
-    private val torrentBytesCache = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
-
-    // ==================== ON-SCREEN TOAST NOTIFICATIONS ====================
-
-    /**
-     * Show a toast notification on the Android screen.
-     * This lets you see debug info WITHOUT needing ADB or logcat.
-     */
-    private fun showToast(msg: String) {
-        try {
-            Handler(Looper.getMainLooper()).post {
-                val ctx = com.lagradost.cloudstream3.CloudStreamApp.context
-                Toast.makeText(ctx, "Arabp: $msg", Toast.LENGTH_LONG).show()
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Toast: $msg")
-        }
+        private const val TORRSERVE_POLL_DELAY = 1000L
     }
 
     // Images require Referer header to avoid 403
@@ -216,12 +190,74 @@ class Arabp : MainAPI() {
         }
     }
 
+    // ==================== TV TYPE HELPERS ====================
+
+    /**
+     * Determine the appropriate TvType from a listing page URL.
+     * - anime-listing → Anime
+     * - tv-listing → TvSeries
+     * - movies-listing → Movie
+     */
+    private fun tvTypeFromPage(pageUrl: String): TvType {
+        return when {
+            pageUrl.contains("movies-listing") -> TvType.Movie
+            pageUrl.contains("tv-listing") -> TvType.TvSeries
+            else -> TvType.Anime
+        }
+    }
+
+    /**
+     * Determine TvType from a title string.
+     * Checks for Arabic/English movie keywords.
+     */
+    private fun tvTypeFromTitle(title: String): TvType {
+        return when {
+            title.contains("فيلم", ignoreCase = true) || title.contains("Movie", ignoreCase = true) -> TvType.Movie
+            else -> TvType.TvSeries
+        }
+    }
+
+    /**
+     * Get the search response constructor for a given TvType.
+     * CloudStream requires specific search response types for each TvType.
+     */
+    private fun buildSearchResponse(
+        title: String,
+        url: String,
+        tvType: TvType,
+        posterUrl: String = "",
+        posterHeaders: Map<String, String> = imageHeaders
+    ): SearchResponse {
+        return when (tvType) {
+            TvType.Movie, TvType.AnimeMovie -> newMovieSearchResponse(title, url, tvType) {
+                this.posterUrl = posterUrl
+                this.posterHeaders = posterHeaders
+            }
+            TvType.TvSeries -> newTvSeriesSearchResponse(title, url, tvType) {
+                this.posterUrl = posterUrl
+                this.posterHeaders = posterHeaders
+            }
+            else -> newAnimeSearchResponse(title, url, tvType) {
+                this.posterUrl = posterUrl
+                this.posterHeaders = posterHeaders
+            }
+        }
+    }
+
     // ==================== AUTH-AWARE DOCUMENT FETCHING ====================
 
+    /**
+     * Whether a page URL requires authentication to view its content.
+     * Anime listing is public; tv-listing and movies-listing require login.
+     */
     private fun requiresAuth(url: String): Boolean {
         return url.contains("tv-listing") || url.contains("movies-listing")
     }
 
+    /**
+     * Fetch an HTML document using authenticated OkHttp + Jsoup.
+     * Used for pages that require login (tv-listing, movies-listing).
+     */
     private fun fetchDocWithAuth(url: String): Document? {
         if (!ensureLogin()) return null
         return try {
@@ -239,6 +275,9 @@ class Arabp : MainAPI() {
         }
     }
 
+    /**
+     * Fetch a document with auth if needed, otherwise use CloudStream's app.get().
+     */
     private suspend fun fetchDoc(url: String): Document? {
         return if (requiresAuth(url)) {
             fetchDocWithAuth(url)
@@ -266,6 +305,7 @@ class Arabp : MainAPI() {
             if (items.isNotEmpty()) {
                 homeSets.add(HomePageList(request.name, items))
             }
+            Log.d(TAG, "MainPage ${request.name} page $page: found ${items.size} items")
             return newHomePageResponse(homeSets, items.isNotEmpty())
         } catch (e: Exception) {
             Log.e(TAG, "MainPage Error: ${e.message}")
@@ -273,35 +313,9 @@ class Arabp : MainAPI() {
         return newHomePageResponse(homeSets)
     }
 
-    private fun tvTypeFromPage(pageUrl: String): TvType {
-        return when {
-            pageUrl.contains("movies-listing") -> TvType.Movie
-            pageUrl.contains("tv-listing") -> TvType.TvSeries
-            else -> TvType.Anime
-        }
-    }
-
-    private fun tvTypeFromTitle(title: String): TvType {
-        return when {
-            title.contains("فيلم", ignoreCase = true) || title.contains("Movie", ignoreCase = true) -> TvType.Movie
-            else -> TvType.TvSeries
-        }
-    }
-
-    private fun TvType.toMovieType(): TvType = when (this) {
-        TvType.Movie -> TvType.Movie
-        TvType.Anime -> TvType.AnimeMovie
-        else -> TvType.Movie
-    }
-
-    private fun TvType.toSeriesType(): TvType = when (this) {
-        TvType.TvSeries -> TvType.TvSeries
-        TvType.Anime -> TvType.Anime
-        else -> TvType.TvSeries
-    }
-
     private fun toSearchResult(element: Element, fallbackTvType: TvType = TvType.Anime): SearchResponse? {
         return try {
+            // Find the listing link - could be anime-listing, tv-listing, or movies-listing
             val linkEl = element.selectFirst("div.listing_div2 a")
                 ?: element.selectFirst("a[href*=anime-listing]")
                 ?: element.selectFirst("a[href*=tv-listing]")
@@ -323,20 +337,7 @@ class Arabp : MainAPI() {
                 else -> fallbackTvType
             }
 
-            when (tvType) {
-                TvType.Movie, TvType.AnimeMovie -> newMovieSearchResponse(title, href, tvType) {
-                    this.posterUrl = toAbsoluteUrl(posterUrl)
-                    this.posterHeaders = imageHeaders
-                }
-                TvType.TvSeries -> newTvSeriesSearchResponse(title, href, tvType) {
-                    this.posterUrl = toAbsoluteUrl(posterUrl)
-                    this.posterHeaders = imageHeaders
-                }
-                else -> newAnimeSearchResponse(title, href, tvType) {
-                    this.posterUrl = toAbsoluteUrl(posterUrl)
-                    this.posterHeaders = imageHeaders
-                }
-            }
+            buildSearchResponse(title, href, tvType, toAbsoluteUrl(posterUrl), imageHeaders)
         } catch (e: Exception) {
             Log.e(TAG, "toSearchResult Error: ${e.message}")
             null
@@ -348,11 +349,8 @@ class Arabp : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val encoded = URLEncoder.encode(query, "UTF-8")
         val results = mutableListOf<SearchResponse>()
-        val queryLower = query.lowercase().trim()
 
         // Source 1: LISTINGS (anime=public, tv/movies=require auth)
-        // NOTE: Some listing pages ignore the search parameter and return ALL items.
-        // We filter results client-side to only keep relevant ones.
         val listingPages = listOf(
             Triple("$mainUrl/index.php?page=anime-listing&search=$encoded", "anime", TvType.Anime),
             Triple("$mainUrl/index.php?page=tv-listing&search=$encoded", "tv", TvType.TvSeries),
@@ -362,10 +360,7 @@ class Arabp : MainAPI() {
         for ((listingUrl, label, tvType) in listingPages) {
             try {
                 val doc = fetchDoc(listingUrl)
-                val listingResults = doc?.select("div.listing_div1")
-                    ?.mapNotNull { toSearchResult(it, tvType) }
-                    ?.filter { matchesQuery(it.name, queryLower) }
-                    ?: emptyList()
+                val listingResults = doc?.select("div.listing_div1")?.mapNotNull { toSearchResult(it, tvType) } ?: emptyList()
                 Log.d(TAG, "$label listing search: found ${listingResults.size} results")
                 results.addAll(listingResults)
             } catch (e: Exception) {
@@ -373,7 +368,7 @@ class Arabp : MainAPI() {
             }
         }
 
-        // Source 2: PRIVATE torrents page (supports search natively)
+        // Source 2: PRIVATE torrents page
         if (ensureLogin()) {
             try {
                 val torrentsUrl = "$mainUrl/index.php?page=torrents&search=$encoded&category=0&active=0"
@@ -402,16 +397,6 @@ class Arabp : MainAPI() {
 
         Log.d(TAG, "Total search results: ${results.size}")
         return results
-    }
-
-    /**
-     * Check if a title matches the search query.
-     * Handles both Arabic and English, and partial word matching.
-     */
-    private fun matchesQuery(title: String?, queryLower: String): Boolean {
-        if (title.isNullOrBlank() || queryLower.isBlank()) return true
-        val titleLower = title.lowercase()
-        return titleLower.contains(queryLower)
     }
 
     private fun isFreeTorrent(row: Element): Boolean {
@@ -446,8 +431,10 @@ class Arabp : MainAPI() {
             val isExternal = isExternalTorrent(row)
             val tvType = when {
                 categoryName.contains("فيلم", ignoreCase = true) || categoryName.contains("Movie", ignoreCase = true) ||
-                        name.contains("فيلم", ignoreCase = true) -> TvType.AnimeMovie
-                else -> TvType.Anime
+                        name.contains("فيلم", ignoreCase = true) -> TvType.Movie
+                categoryName.contains("مسلسل", ignoreCase = true) || categoryName.contains("Series", ignoreCase = true) -> TvType.TvSeries
+                categoryName.contains("انمي", ignoreCase = true) || categoryName.contains("Anime", ignoreCase = true) -> TvType.Anime
+                else -> tvTypeFromTitle(name)
             }
 
             val displayName = buildString {
@@ -457,16 +444,8 @@ class Arabp : MainAPI() {
                 if (seeders.isNotEmpty()) append(" | ▲$seeders")
             }
 
-            // Poster is in the rel attribute of a.screenshot (tooltip/hover image)
-            val posterUrl = row.selectFirst("a.screenshot")?.attr("rel")
-                ?: nameLink.attr("rel")
-                ?: ""
-
             val epData = "$torrentId|$detailHref|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
-            newAnimeSearchResponse(displayName, epData, tvType) {
-                this.posterUrl = toAbsoluteUrl(posterUrl)
-                this.posterHeaders = imageHeaders
-            }
+            buildSearchResponse(displayName, epData, tvType)
         } catch (e: Exception) {
             Log.e(TAG, "torrentRowToSearchResult Error: ${e.message}")
             null
@@ -485,214 +464,144 @@ class Arabp : MainAPI() {
 
             val isFree = isFreeTorrent(row)
             val isExternal = isExternalTorrent(row)
-            val tvType = when {
-                name.contains("فيلم", ignoreCase = true) || name.contains("Movie", ignoreCase = true) -> TvType.AnimeMovie
-                else -> TvType.Anime
-            }
+            val tvType = tvTypeFromTitle(name)
 
             val displayName = buildString {
                 append(name)
                 if (isFree) append(" ✅مجاني")
             }
 
-            // Poster is in the rel attribute of a.screenshot (tooltip/hover image)
-            val posterUrl = row.selectFirst("a.screenshot")?.attr("rel")
-                ?: nameLink.attr("rel")
-                ?: ""
-
             val epData = "$torrentId|$detailHref|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
-            newAnimeSearchResponse(displayName, epData, tvType) {
-                this.posterUrl = toAbsoluteUrl(posterUrl)
-                this.posterHeaders = imageHeaders
-            }
+            buildSearchResponse(displayName, epData, tvType)
         } catch (e: Exception) {
             Log.e(TAG, "modernTorrentRowToSearchResult Error: ${e.message}")
             null
         }
     }
 
-    // ==================== SMART FOLDER GROUPING ====================
-    //
-    // The key problem: simple extractFolderName() only takes the FIRST path
-    // component, but many torrents have a wrapper folder like:
-    //   "RootFolder/Show1/E01.mkv"
-    //   "RootFolder/Show2/E01.mkv"
-    // extractFolderName returns "RootFolder" for both → hasMultipleShows=false!
-    //
-    // Solution: analyze ALL paths together and find the grouping level
-    // where there are MULTIPLE distinct values.
+    // ==================== NATURAL SORT FOR EPISODE ORDERING ====================
 
     /**
-     * Represents a file's path split into components, with the computed
-     * "show name" (the grouping key at the diversity level).
+     * Natural sort key: pads digit sequences so that "E01" < "E02" < "E10"
+     * (not lexicographic "E01" < "E10" < "E02").
+     * Ensures Episode 1 appears at the top (ascending order).
      */
-    data class PathGroup(
-        val path: String,           // Full normalized path
-        val fileName: String,       // Just the filename
-        val showName: String,       // Computed show/group name
-        val showDepth: Int          // How deep the show level is (0=root, 1=first folder, etc.)
-    )
-
-    /**
-     * Analyze all file paths together to find the correct grouping level.
-     *
-     * Algorithm:
-     * 1. Split every path into components
-     * 2. Find the shallowest level where there are 2+ distinct values
-     * 3. Group files by their value at that level
-     *
-     * Examples:
-     *   ["Show1/E01.mkv", "Show2/E01.mkv"]
-     *     → Level 0: {"Show1","Show2"} → 2 values → shows at level 0
-     *
-     *   ["Root/Show1/E01.mkv", "Root/Show2/E01.mkv"]
-     *     → Level 0: {"Root","Root"} → 1 value → skip
-     *     → Level 1: {"Show1","Show2"} → 2 values → shows at level 1
-     *
-     *   ["Show1/E01.mkv", "Show1/E02.mkv"]
-     *     → Level 0: {"Show1","Show1"} → 1 value → single show
-     */
-    private fun computeShowGroups(entries: List<TorrServeStreamEntry>): List<PathGroup> {
-        if (entries.isEmpty()) return emptyList()
-
-        // Split each entry's filePath into components
-        val pathParts = entries.map { entry ->
-            val parts = entry.filePath.split("/").filter { it.isNotEmpty() }
-            // Last component is the filename, rest are folders
-            Pair(entry, if (parts.isNotEmpty()) parts.dropLast(1) else emptyList())
-        }
-
-        // Find the maximum folder depth
-        val maxDepth = pathParts.maxOf { it.second.size }
-
-        // Find the shallowest level with 2+ distinct values
-        var showLevel = -1
-        for (level in 0 until maxDepth) {
-            val valuesAtLevel = pathParts.mapNotNull { it.second.getOrNull(level) }.toSet()
-            if (valuesAtLevel.size >= 2) {
-                showLevel = level
-                break
-            }
-        }
-
-        // Build PathGroup for each entry
-        return pathParts.map { (entry, parts) ->
-            val showName = if (showLevel >= 0 && showLevel < parts.size) {
-                parts[showLevel]
-            } else if (parts.isNotEmpty()) {
-                // All files share the same path prefix — single show
-                // Use the last folder component as the show name (or empty if only root)
-                if (parts.size > 1) parts.last() else parts.first()
-            } else {
-                "" // No folder at all
-            }
-
-            PathGroup(
-                path = entry.filePath,
-                fileName = entry.fileName,
-                showName = showName,
-                showDepth = showLevel
-            )
-        }
-    }
-
-    /**
-     * Check if the entries represent multiple shows based on smart grouping.
-     */
-    private fun hasMultipleShowsSmart(entries: List<TorrServeStreamEntry>): Boolean {
-        val groups = computeShowGroups(entries)
-        val distinctShows = groups.map { it.showName }.filter { it.isNotEmpty() }.toSet()
-        return distinctShows.size > 1
+    private fun naturalSortKey(str: String): String {
+        return str.replace(Regex("\\d+")) { match ->
+            match.value.padStart(6, '0')
+        }.lowercase()
     }
 
     // ==================== BUILD EPISODES FROM STREAM ENTRIES ====================
-    //
-    // Shared logic for both load() and loadFromTorrentData().
-    // Creates per-file episodes with ts:// data, grouped by show/season.
 
     /**
-     * Build a list of Episodes from pre-resolved stream entries.
-     * Each video file becomes its own Episode with a ts:// data URL,
-     * so loadLinks() returns exactly ONE source (not a flat list of all files).
+     * Build episodes and season data from a list of TorrServe stream entries.
      *
-     * For multi-show torrents, each show becomes a SEASON with a readable name.
+     * For multi-show torrents (multiple folders), each folder becomes a season
+     * with the folder name as the season name. Episodes are naturally sorted
+     * within each season so Episode 1 appears first.
+     *
+     * Returns Pair<episodes, seasonNames> where seasonNames is a List<SeasonData>.
      */
     private fun buildEpisodesFromEntries(
-        streamEntries: List<TorrServeStreamEntry>,
-        absPosterUrl: String
+        entries: List<TorrServeStreamEntry>
     ): Pair<List<Episode>, List<SeasonData>> {
-        val groups = computeShowGroups(streamEntries)
-        val distinctShows = groups.map { it.showName }.filter { it.isNotEmpty() }.distinct()
-        val isMultiShow = distinctShows.size > 1
+        val sortedEntries = entries.sortedBy { naturalSortKey(it.fileName) }
+        val folderGroups = sortedEntries.groupBy { it.folderName }
+        val distinctFolders = folderGroups.keys.filter { it.isNotEmpty() }.sortedBy { naturalSortKey(it) }
 
         val episodes = mutableListOf<Episode>()
         val seasonNamesList = mutableListOf<SeasonData>()
+        val addedSeasons = mutableSetOf<Int>()
 
-        if (isMultiShow) {
-            // MULTI-SHOW: each show = one season
-            var seasonNum = 1
+        if (distinctFolders.size > 1) {
+            // MULTI-SHOW: each folder = one season
+            for ((folderIndex, folder) in distinctFolders.withIndex()) {
+                val seasonNum = folderIndex + 1
+                val folderEntries = folderGroups[folder] ?: continue
 
-            for (showName in distinctShows) {
-                seasonNamesList.add(SeasonData(season = seasonNum, name = showName))
-
-                // Find all entries belonging to this show
-                val showEntries = groups.filter { it.showName == showName }
-                for ((epIndex, group) in showEntries.withIndex()) {
-                    // Find the original TorrServeStreamEntry for this file
-                    val entry = streamEntries.find { it.filePath == group.path } ?: continue
-                    val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-
-                    episodes.add(
-                        newEpisode(epData, fix = false, initializer = {
-                            name = entry.fileName
-                            season = seasonNum
-                            episode = epIndex + 1
-                            this.posterUrl = absPosterUrl
-                        })
-                    )
+                // Add season name (only once per season)
+                if (!addedSeasons.contains(seasonNum)) {
+                    seasonNamesList.add(SeasonData(seasonNum, folder))
+                    addedSeasons.add(seasonNum)
                 }
-                seasonNum++
-            }
 
-            // Files without a show name → put in next season
-            val noShowEntries = groups.filter { it.showName.isEmpty() }
-            if (noShowEntries.isNotEmpty()) {
-                seasonNamesList.add(SeasonData(season = seasonNum, name = "أخرى"))
-                for ((epIndex, group) in noShowEntries.withIndex()) {
-                    val entry = streamEntries.find { it.filePath == group.path } ?: continue
+                // Create one episode per file in this folder
+                for ((epIndex, entry) in folderEntries.withIndex()) {
                     val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-
                     episodes.add(
-                        newEpisode(epData, fix = false, initializer = {
+                        newEpisode(epData) {
                             name = entry.fileName
                             season = seasonNum
                             episode = epIndex + 1
-                            this.posterUrl = absPosterUrl
-                        })
+                        }
                     )
                 }
             }
 
-            Log.d(TAG, "buildEpisodes: MULTI-SHOW → ${episodes.size} episodes in ${seasonNamesList.size} seasons")
-        } else {
-            // SINGLE-SHOW: all files in season 1
-            val showLabel = distinctShows.firstOrNull() ?: ""
-            val sName = if (showLabel.isNotEmpty()) showLabel else "مواسم" // "Seasons"
-            seasonNamesList.add(SeasonData(season = 1, name = sName))
+            // Files without a folder → "Other" season
+            val otherEntries = folderGroups[""]
+            if (otherEntries != null && otherEntries.isNotEmpty()) {
+                val otherSeasonNum = distinctFolders.size + 1
+                if (!addedSeasons.contains(otherSeasonNum)) {
+                    seasonNamesList.add(SeasonData(otherSeasonNum, "أخرى"))
+                    addedSeasons.add(otherSeasonNum)
+                }
+                for ((epIndex, entry) in otherEntries.withIndex()) {
+                    val epData = "ts://${entry.streamUrl}|${entry.fileName}"
+                    episodes.add(
+                        newEpisode(epData) {
+                            name = entry.fileName
+                            season = otherSeasonNum
+                            episode = epIndex + 1
+                        }
+                    )
+                }
+            }
+        } else if (distinctFolders.size == 1) {
+            // SINGLE folder: one season named after the folder
+            val folder = distinctFolders.first()
+            val folderEntries = folderGroups[folder] ?: emptyList()
+            seasonNamesList.add(SeasonData(1, folder))
 
-            for ((epIndex, entry) in streamEntries.withIndex()) {
+            for ((epIndex, entry) in folderEntries.withIndex()) {
                 val epData = "ts://${entry.streamUrl}|${entry.fileName}"
                 episodes.add(
-                    newEpisode(epData, fix = false, initializer = {
+                    newEpisode(epData) {
                         name = entry.fileName
                         season = 1
                         episode = epIndex + 1
-                        this.posterUrl = absPosterUrl
-                    })
+                    }
                 )
             }
 
-            Log.d(TAG, "buildEpisodes: SINGLE-SHOW → ${episodes.size} episodes")
+            // Also handle root-level files if any
+            val rootEntries = folderGroups[""]
+            if (rootEntries != null && rootEntries.isNotEmpty()) {
+                for ((epIndex, entry) in rootEntries.withIndex()) {
+                    val epData = "ts://${entry.streamUrl}|${entry.fileName}"
+                    episodes.add(
+                        newEpisode(epData) {
+                            name = entry.fileName
+                            season = 1
+                            episode = folderEntries.size + epIndex + 1
+                        }
+                    )
+                }
+            }
+        } else {
+            // NO folders: all files in root, single season
+            seasonNamesList.add(SeasonData(1, "الموسم 1"))
+            for ((epIndex, entry) in sortedEntries.withIndex()) {
+                val epData = "ts://${entry.streamUrl}|${entry.fileName}"
+                episodes.add(
+                    newEpisode(epData) {
+                        name = entry.fileName
+                        season = 1
+                        episode = epIndex + 1
+                    }
+                )
+            }
         }
 
         return Pair(episodes, seasonNamesList)
@@ -716,10 +625,14 @@ class Arabp : MainAPI() {
                 ?: doc.selectFirst("img.listing_poster")?.attr("src") ?: ""
 
             val absPosterUrl = toAbsoluteUrl(posterUrl)
+
+            // Determine TvType from the URL
+            val pageTvType = tvTypeFromPage(fullUrl)
+
             val rows = doc.select("table#listing_table tr")
-            val episodes = mutableListOf<Episode>()
-            val seasonNamesList = mutableListOf<SeasonData>()
-            var globalSeasonNum = 1
+            val allEpisodes = mutableListOf<Episode>()
+            val allSeasonNames = mutableListOf<SeasonData>()
+            val addedSeasons = mutableSetOf<Int>()
 
             for (row in rows) {
                 val nameLink = row.selectFirst("a[href*=torrent-details]") ?: continue
@@ -740,97 +653,72 @@ class Arabp : MainAPI() {
                     if (seeders.isNotEmpty()) append(" | ▲$seeders")
                 }
 
-                // For non-free torrents, skip pre-resolve (it would hit the daily limit).
-                // The thank + download will happen in loadLinks() when user clicks play.
-                // For free torrents, pre-resolve to detect multi-show structure.
-                val streamEntries = if (isFree) {
-                    tryResolveTorrent(
-                        torrentId, toAbsoluteUrl(detailHref), toAbsoluteUrl(downloadHref), isFree
-                    )
-                } else {
-                    null
-                }
+                // Try to pre-resolve via TorrServe to detect multi-show torrents
+                val streamEntries = tryResolveTorrent(
+                    torrentId, toAbsoluteUrl(detailHref), toAbsoluteUrl(downloadHref), isFree
+                )
 
                 if (streamEntries == null || streamEntries.isEmpty()) {
-                    // Pre-resolve failed — fall back to legacy data (one episode = one torrent)
+                    // Pre-resolve failed — fall back to legacy data
                     val epData = "$torrentId|${toAbsoluteUrl(detailHref)}|${toAbsoluteUrl(downloadHref)}||${if (isFree) "1" else "0"}|0"
-                    seasonNamesList.add(SeasonData(season = globalSeasonNum, name = displayName))
-                    episodes.add(
-                        newEpisode(epData, fix = false, initializer = {
+                    allEpisodes.add(
+                        newEpisode(epData) {
                             name = displayName
-                            season = globalSeasonNum
-                            episode = 1
-                            this.posterUrl = absPosterUrl
-                        })
+                        }
                     )
-                    globalSeasonNum++
                     continue
                 }
 
-                // Pre-resolve succeeded — build per-file episodes
                 if (streamEntries.size == 1) {
-                    // Single file → one episode in its own season
+                    // Single file → one episode
                     val entry = streamEntries.first()
                     val epData = "ts://${entry.streamUrl}|${entry.fileName}"
-                    seasonNamesList.add(SeasonData(season = globalSeasonNum, name = displayName))
-                    episodes.add(
-                        newEpisode(epData, fix = false, initializer = {
+                    allEpisodes.add(
+                        newEpisode(epData) {
                             name = displayName
-                            season = globalSeasonNum
-                            episode = 1
-                            this.posterUrl = absPosterUrl
-                        })
-                    )
-                    globalSeasonNum++
-                } else {
-                    // Multiple files — use smart grouping for seasons
-                    val (fileEpisodes, fileSeasonNames) = buildEpisodesFromEntries(streamEntries, absPosterUrl)
-
-                    // Build a lookup map from the SeasonData list for easy access
-                    val fileSeasonMap = fileSeasonNames.associate { it.season to (it.name ?: "") }
-
-                    // Add one SeasonData per unique remapped season (not per episode!)
-                    for ((localSeason, showName) in fileSeasonMap) {
-                        val remappedSeason = globalSeasonNum + localSeason - 1
-                        val seasonDisplay = if (fileSeasonMap.size > 1) {
-                            "$displayName — $showName"
-                        } else {
-                            displayName
                         }
-                        seasonNamesList.add(SeasonData(season = remappedSeason, name = seasonDisplay))
-                    }
+                    )
+                } else {
+                    // Multiple files → use buildEpisodesFromEntries with seasons
+                    val (eps, seasonNames) = buildEpisodesFromEntries(streamEntries)
 
-                    // Remap season numbers in episodes to our global numbering
-                    for (ep in fileEpisodes) {
-                        val localSeason = ep.season ?: 1
-                        val remappedSeason = globalSeasonNum + localSeason - 1
-
-                        episodes.add(
-                            newEpisode(ep.data ?: "", fix = false, initializer = {
-                                name = ep.name ?: ""
-                                season = remappedSeason
+                    // Offset season numbers so they don't collide with previous torrents
+                    val seasonOffset = allSeasonNames.size
+                    for (ep in eps) {
+                        val origSeason = ep.season ?: 1
+                        val newSeason = seasonOffset + origSeason
+                        allEpisodes.add(
+                            newEpisode(ep.data ?: "") {
+                                name = ep.name
+                                season = newSeason
                                 episode = ep.episode
-                                this.posterUrl = absPosterUrl
-                            })
+                            }
                         )
                     }
-                    globalSeasonNum += fileSeasonMap.size
+                    // Add season names with offset
+                    for (sd in seasonNames) {
+                        val newSeasonNum = seasonOffset + sd.season
+                        if (!addedSeasons.contains(newSeasonNum)) {
+                            allSeasonNames.add(SeasonData(newSeasonNum, sd.name))
+                            addedSeasons.add(newSeasonNum)
+                        }
+                    }
                 }
             }
 
-            val pageTvType = tvTypeFromPage(fullUrl)
-
-            if (episodes.isEmpty()) {
+            if (allEpisodes.isEmpty()) {
                 newMovieLoadResponse(title, fullUrl, pageTvType.toMovieType(), "0|$fullUrl|||0|0") {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
                 }
             } else {
-                newTvSeriesLoadResponse(title, fullUrl, pageTvType.toSeriesType(), episodes) {
+                val response = newTvSeriesLoadResponse(title, fullUrl, pageTvType.toSeriesType(), allEpisodes) {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
-                    this.seasonNames = seasonNamesList
+                    seasonNames = allSeasonNames.ifEmpty { null }
                 }
+                Log.d(TAG, "load: returning TvSeriesLoadResponse with ${allEpisodes.size} episodes, seasonNames=${allSeasonNames.map { "S${it.season}=${it.name}" }}")
+                response
             }
         } catch (e: Exception) {
             Log.e(TAG, "Load Error: ${e.message}")
@@ -840,24 +728,17 @@ class Arabp : MainAPI() {
 
     // ==================== LOAD FROM TORRENT DATA ====================
     //
-    // Called when the URL contains "|" (pipe-delimited torrent data
-    // from search results). This is a SINGLE torrent, so we CAN
-    // pre-resolve it via TorrServe to detect multi-show structure.
+    // PRE-RESOLVE STRATEGY:
+    // Instead of waiting for loadLinks() to download/upload the torrent,
+    // we do it right here in load() so we can create proper episode entries.
     //
-    // Strategy:
-    // - Pre-resolve the torrent (download .torrent → upload to TorrServe)
-    // - If torrent has MULTIPLE shows (detected via smart grouping):
-    //   Each show becomes a SEASON with a readable name. User picks a
-    //   season (show) first, then sees only that show's episodes.
-    // - If torrent has ONE show:
-    //   Each video file becomes one Episode. All in season 1.
-    // - If pre-resolve fails:
-    //   Fall back to one episode with legacy data; loadLinks() will
-    //   try again and show all files with folder-based naming.
+    // For MULTI-SHOW torrents (multiple folders), each show/folder
+    // becomes its own season in CloudStream's UI, with episodes nested
+    // under each season.
     //
-    // Episode data formats:
-    //   ts://STREAM_URL|FILENAME  — pre-resolved direct stream (one source)
-    //   pipe-delimited            — legacy fallback (all files as sources)
+    // Episode data format:
+    //   ts://STREAM_URL|FILENAME
+    //   (loadLinks detects the ts:// prefix and creates ExtractorLink)
 
     private suspend fun loadFromTorrentData(data: String): LoadResponse? {
         val parts = data.split("|", limit = 6)
@@ -892,7 +773,7 @@ class Arabp : MainAPI() {
 
         val absPosterUrl = toAbsoluteUrl(posterUrl)
 
-        // Determine TvType from detail URL
+        // Determine TvType from title and detail URL
         val pageTvType = if (detailUrl.contains("movies-listing")) TvType.Movie
             else if (detailUrl.contains("tv-listing")) TvType.TvSeries
             else if (detailUrl.contains("anime-listing")) TvType.Anime
@@ -907,34 +788,24 @@ class Arabp : MainAPI() {
         }
 
         // === INTERNAL TORRENTS: try to pre-resolve via TorrServe ===
-        // For non-free torrents, skip pre-resolve (would hit daily limit).
-        // The thank + download will happen in loadLinks() when user clicks play.
-        val streamEntries = if (isFree) {
-            tryResolveTorrent(torrentId, detailUrl, downloadUrl, isFree)
-        } else {
-            null
-        }
+        val streamEntries = tryResolveTorrent(torrentId, detailUrl, downloadUrl, isFree)
 
         if (streamEntries.isNullOrEmpty()) {
-            // Failed to pre-resolve — fall back to TV series with one episode.
+            // Failed to pre-resolve — fall back to movie format.
             // loadLinks() will try again when the user clicks play.
-            Log.w(TAG, "Pre-resolve failed for torrent $torrentId, falling back to single-episode format")
-            return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), listOf(
-                newEpisode(data, fix = false, initializer = {
-                    name = title
-                    season = 1
-                    episode = 1
-                    this.posterUrl = absPosterUrl
-                })
-            )) {
+            Log.w(TAG, "Pre-resolve failed for torrent $torrentId, falling back to movie format")
+            return newMovieLoadResponse(title, data, pageTvType.toMovieType(), data) {
                 this.posterUrl = absPosterUrl
                 this.posterHeaders = imageHeaders
             }
         }
 
+        // Sort entries naturally (Episode 1 first)
+        val sortedEntries = streamEntries.sortedBy { naturalSortKey(it.fileName) }
+
         // Single video file → Movie
-        if (streamEntries.size == 1) {
-            val entry = streamEntries.first()
+        if (sortedEntries.size == 1) {
+            val entry = sortedEntries.first()
             val epData = "ts://${entry.streamUrl}|${entry.fileName}"
             val tvType = if (title.contains("فيلم", ignoreCase = true) || title.contains("Movie", ignoreCase = true))
                 pageTvType.toMovieType() else pageTvType.toSeriesType()
@@ -944,14 +815,23 @@ class Arabp : MainAPI() {
             }
         }
 
-        // Multiple video files → TV Series with smart show grouping
-        val (episodes, seasonNames) = buildEpisodesFromEntries(streamEntries, absPosterUrl)
+        // Multiple video files → TV Series with seasons (using buildEpisodesFromEntries)
+        val (episodes, seasonData) = buildEpisodesFromEntries(sortedEntries)
 
-        return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), episodes) {
+        Log.d(TAG, "loadFromTorrentData: ${episodes.size} episodes, ${seasonData.size} seasons")
+        for (sd in seasonData) {
+            Log.d(TAG, "  Season ${sd.season}: ${sd.name}")
+        }
+        for (ep in episodes) {
+            Log.d(TAG, "  S${ep.season}E${ep.episode}: ${ep.name}")
+        }
+
+        val response = newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), episodes) {
             this.posterUrl = absPosterUrl
             this.posterHeaders = imageHeaders
-            this.seasonNames = seasonNames
+            seasonNames = seasonData.ifEmpty { null }
         }
+        return response
     }
 
     /**
@@ -1012,7 +892,7 @@ class Arabp : MainAPI() {
                 return null
             }
             is TorrentDownloadResult.DailyLimitExceeded -> {
-                Log.e(TAG, "tryResolveTorrent: daily download limit exceeded - will retry in loadLinks()")
+                Log.e(TAG, "tryResolveTorrent: daily download limit exceeded")
                 return null
             }
             is TorrentDownloadResult.NotLoggedIn -> {
@@ -1029,20 +909,21 @@ class Arabp : MainAPI() {
 
     // ==================== LOAD LINKS ====================
     //
-    // Two data formats handled:
+    // Data formats handled:
     //
     // 1. Pre-resolved stream (ts://...):
     //    Format: ts://STREAM_URL|FILENAME
     //    The torrent was already uploaded to TorrServe in load().
-    //    We create ONE ExtractorLink directly — the user sees exactly
-    //    one source, not a flat list of all episodes.
+    //    We create one ExtractorLink directly.
+    //    This is now used for ALL pre-resolved episodes (including multi-show).
     //
-    // 2. Legacy (pipe-delimited):
+    // 2. Legacy folder (tsfolder://...) — DEPRECATED, kept for cached data:
+    //    Format: tsfolder://FOLDER_NAME|FILE_COUNT|ts://URL1|FILE1;;ts://URL2|FILE2;;...
+    //
+    // 3. Legacy (pipe-delimited):
     //    Format: torrentId|detailUrl|downloadUrl|magnetUrl|isFree|isExternal
     //    The full download/upload cycle runs here.
     //    Used as fallback when pre-resolve failed.
-    //    For multi-folder torrents, folder names are added to link names
-    //    so the user can identify which show each file belongs to.
 
     override suspend fun loadLinks(
         data: String,
@@ -1050,16 +931,69 @@ class Arabp : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // === PRE-RESOLVED STREAM: direct link from load() ===
-        // Each episode has its own ts:// URL, so the user sees ONE source.
-        if (data.startsWith("ts://")) {
-            val afterPrefix = data.substringAfter("ts://")
+        // === PRE-RESOLVED FOLDER: show with multiple episodes ===
+        // Handle both clean "tsfolder://..." and fixUrl-corrupted versions
+        val folderData = if (data.startsWith("tsfolder://")) {
+            data
+        } else if (data.contains("tsfolder://")) {
+            data.substring(data.indexOf("tsfolder://"))
+        } else {
+            null
+        }
+
+        if (folderData != null) {
+            val afterPrefix = folderData.substringAfter("tsfolder://")
+            // Format: FOLDER_NAME|FILE_COUNT|ts://URL1|FILE1;;ts://URL2|FILE2;;...
+            val firstPipe = afterPrefix.indexOf('|')
+            if (firstPipe < 0) return false
+            val folderName = afterPrefix.substring(0, firstPipe)
+
+            val afterFolder = afterPrefix.substring(firstPipe + 1)
+            val secondPipe = afterFolder.indexOf('|')
+            if (secondPipe < 0) return false
+            val fileCountStr = afterFolder.substring(0, secondPipe)
+            val filesPart = afterFolder.substring(secondPipe + 1)
+
+            // Parse each ts:// entry separated by ;;
+            val fileEntries = filesPart.split(";;")
+            Log.d(TAG, "loadLinks: folder '$folderName' with $fileCountStr files, parsed ${fileEntries.size} entries")
+
+            for (entry in fileEntries) {
+                if (!entry.startsWith("ts://")) continue
+                val afterTs = entry.substringAfter("ts://")
+                val pipeIdx = afterTs.indexOf('|')
+                val streamUrl = if (pipeIdx >= 0) afterTs.substring(0, pipeIdx) else afterTs
+                val fileName = if (pipeIdx >= 0) afterTs.substring(pipeIdx + 1) else "Video"
+
+                callback(
+                    newExtractorLink(
+                        source = this.name,
+                        name = fileName,
+                        url = streamUrl,
+                        type = ExtractorLinkType.VIDEO
+                    )
+                )
+            }
+            return fileEntries.isNotEmpty()
+        }
+
+        // === PRE-RESOLVED STREAM: single direct link from load() ===
+        // Handle both clean "ts://..." and fixUrl-corrupted "https://www.arabp2p.net/ts://..."
+        val tsData = if (data.startsWith("ts://")) {
+            data
+        } else if (data.contains("ts://")) {
+            // fixUrl may have prepended mainUrl, extract the ts:// part
+            data.substring(data.indexOf("ts://"))
+        } else {
+            null
+        }
+
+        if (tsData != null) {
+            val afterPrefix = tsData.substringAfter("ts://")
             val pipeIndex = afterPrefix.indexOf('|')
             val streamUrl = if (pipeIndex >= 0) afterPrefix.substring(0, pipeIndex) else afterPrefix
             val fileName = if (pipeIndex >= 0) afterPrefix.substring(pipeIndex + 1) else "Video"
 
-            // Return the link FIRST so playback starts immediately,
-            // then adjust priorities in the background (don't block playback).
             Log.d(TAG, "loadLinks: pre-resolved stream → $fileName")
             callback(
                 newExtractorLink(
@@ -1069,110 +1003,6 @@ class Arabp : MainAPI() {
                     type = ExtractorLinkType.VIDEO
                 )
             )
-
-            // Resume only this file, pause all others to save bandwidth.
-            // Then strip trackers AFTER the tracker has connected and found peers.
-            // This is best-effort — if it fails, playback still works.
-            try {
-                val parsed = parseTorrServeUrl(streamUrl)
-                if (parsed != null) {
-                    val (hash, activeIndex) = parsed
-                    // First, resume the active file
-                    setTorrServeFilePriority(hash, activeIndex, 1)
-                    // Then pause all other files
-                    val allIndices = getTorrServeFileIndices(hash)
-                    if (allIndices.isNotEmpty()) {
-                        for (idx in allIndices) {
-                            if (idx != activeIndex) {
-                                setTorrServeFilePriority(hash, idx, 0)
-                            }
-                        }
-                    }
-                    // ===== STOP TRACKER COUNTING =====
-                    //
-                    // STRATEGY: Delete torrent from TorrServe, then re-upload
-                    // a STRIPPED .torrent (no announce/announce-list) with the
-                    // SAME info hash. TorrServe finds existing data on disk
-                    // and can stream from it. Without tracker URLs, TorrServe
-                    // CANNOT announce — the tracker simply cannot be reached.
-                    //
-                    // This is the nuclear option. Previous approaches all failed:
-                    // - set-trackers API: TorrServe accepts but ignores
-                    // - action=pause/stop: TorrServe may not support these
-                    // - event=stopped from us: tracker doesn't match session
-                    // - Re-upload stripped on top: TorrServe keeps old trackers
-                    //
-                    // Toast notifications show every step on screen.
-
-                    val originalBytes = torrentBytesCache[hash]
-                    Thread {
-                        try {
-                            showToast("1/5 Waiting for data to buffer...")
-                            Thread.sleep(TRACKER_STRIP_DELAY)
-
-                            // Step 1: Query torrent state before doing anything
-                            val preState = queryTorrServeTorrentState(hash)
-                            showToast("2/5 Current state: $preState")
-
-                            // Step 2: Delete the torrent (keep data on disk!)
-                            showToast("3/5 Deleting torrent (keeping data)...")
-                            val deleted = deleteTorrServeTorrent(hash, saveData = true)
-                            if (!deleted) {
-                                showToast("❌ Delete failed! Aborting.")
-                                return@Thread
-                            }
-                            showToast("3/5 Deleted OK")
-
-                            // Step 3: Wait a moment for TorrServe to clean up
-                            Thread.sleep(2000)
-
-                            // Step 4: Re-upload the STRIPPED .torrent (same info hash, no trackers)
-                            if (originalBytes != null) {
-                                val strippedBytes = stripTrackersFromTorrent(originalBytes)
-                                showToast("4/5 Re-uploading stripped torrent...")
-                                val newHash = uploadStrippedTorrent(strippedBytes)
-                                if (newHash != null) {
-                                    showToast("4/5 Re-uploaded! Hash: ${newHash.take(8)}...")
-
-                                    // Step 5: Test if stream still works
-                                    Thread.sleep(3000)
-                                    val streamWorks = testStreamUrl(streamUrl)
-                                    if (streamWorks) {
-                                        showToast("✅ No trackers! Stream works! Counting should stop.")
-                                    } else {
-                                        showToast("⚠ Stream may break — try restarting video")
-                                    }
-
-                                    // Also send event=stopped to tracker as cleanup
-                                    try {
-                                        val infoHash = computeInfoHash(originalBytes)
-                                        val announceUrl = extractAnnounceUrl(originalBytes)
-                                        if (infoHash != null && announceUrl != null) {
-                                            sendTrackerStopped(announceUrl, infoHash)
-                                            sendTrackerStoppedNoPeerId(announceUrl, infoHash)
-                                            Log.d(TAG, "Cleanup: sent event=stopped to tracker")
-                                        }
-                                    } catch (e: Exception) {
-                                        Log.w(TAG, "Cleanup event=stopped: ${e.message}")
-                                    }
-                                } else {
-                                    showToast("❌ Re-upload failed! Tracker still active.")
-                                }
-                            } else {
-                                showToast("❌ No cached torrent data")
-                            }
-
-                            torrentBytesCache.remove(hash)
-                        } catch (e: Exception) {
-                            showToast("❌ Error: ${e.message}")
-                            Log.w(TAG, "Tracker removal error: ${e.message}")
-                        }
-                    }.start()
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "TorrServe priority/tracker adjustment failed (non-fatal): ${e.message}")
-            }
-
             return true
         }
 
@@ -1252,14 +1082,6 @@ class Arabp : MainAPI() {
                 }
             }
 
-            // Step 1.5: Thank the uploader for non-free torrents to bypass daily download limit
-            if (!isFree) {
-                val thankDetailUrl = if (detailUrl.isNotBlank()) detailUrl
-                    else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
-                val thanked = thankUploader(torrentId, thankDetailUrl)
-                Log.d(TAG, "loadLinks: thank uploader result = $thanked for torrent $torrentId")
-            }
-
             // Step 2: Download .torrent → upload to TorrServe → get ALL video files
             if (resolvedDownloadUrl.isNotBlank() && resolvedDownloadUrl.contains("&f=")) {
                 try {
@@ -1269,19 +1091,15 @@ class Arabp : MainAPI() {
                             Log.d(TAG, "Downloaded .torrent: ${result.bytes.size} bytes, uploading to TorrServe...")
                             val streamEntries = uploadToTorrServe(result.bytes, torrentId)
                             if (streamEntries != null && streamEntries.isNotEmpty()) {
-                                // Use smart grouping for better naming
-                                val groups = computeShowGroups(streamEntries)
-                                val distinctShows = groups.map { it.showName }.filter { it.isNotEmpty() }.distinct()
-                                val isMultiShow = distinctShows.size > 1
-
-                                for (entry in streamEntries) {
-                                    val group = groups.find { it.path == entry.filePath }
-                                    val linkName = when {
-                                        streamEntries.size == 1 -> "${this.name} (TorrServe)"
-                                        isMultiShow && group != null && group.showName.isNotEmpty() -> "[${group.showName}] ${entry.fileName}"
-                                        else -> entry.fileName
+                                // Sort entries naturally (Episode 1 first)
+                                val sortedEntries = streamEntries.sortedBy { naturalSortKey(it.fileName) }
+                                for ((index, entry) in sortedEntries.withIndex()) {
+                                    val linkName = if (sortedEntries.size == 1) {
+                                        "${this.name} (TorrServe)"
+                                    } else {
+                                        entry.fileName
                                     }
-                                    Log.d(TAG, "TorrServe link: ${entry.fileName} → ${entry.streamUrl} (show: ${group?.showName})")
+                                    Log.d(TAG, "TorrServe link [$index]: ${entry.fileName} → ${entry.streamUrl}")
                                     callback(
                                         newExtractorLink(
                                             source = this.name,
@@ -1297,117 +1115,36 @@ class Arabp : MainAPI() {
                             }
                         }
                         is TorrentDownloadResult.DailyLimitExceeded -> {
-                            // Retry: thank the uploader and try downloading again
-                            Log.w(TAG, "DAILY DOWNLOAD LIMIT EXCEEDED for torrent id=$torrentId, thanking and retrying...")
-                            val thankDetailUrl = if (detailUrl.isNotBlank()) detailUrl
-                                else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
-                            thankUploader(torrentId, thankDetailUrl)
-                            val retryResult = downloadTorrentFile(resolvedDownloadUrl)
-                            when (retryResult) {
-                                is TorrentDownloadResult.Success -> {
-                                    Log.d(TAG, "Retry succeeded! Downloaded .torrent: ${retryResult.bytes.size} bytes")
-                                    val retryEntries = uploadToTorrServe(retryResult.bytes, torrentId)
-                                    if (retryEntries != null && retryEntries.isNotEmpty()) {
-                                        val groups = computeShowGroups(retryEntries)
-                                        val distinctShows = groups.map { it.showName }.filter { it.isNotEmpty() }.distinct()
-                                        val isMultiShow = distinctShows.size > 1
-                                        for (entry in retryEntries) {
-                                            val group = groups.find { it.path == entry.filePath }
-                                            val linkName = when {
-                                                retryEntries.size == 1 -> "${this.name} (TorrServe)"
-                                                isMultiShow && group != null && group.showName.isNotEmpty() -> "[${group.showName}] ${entry.fileName}"
-                                                else -> entry.fileName
-                                            }
-                                            callback(
-                                                newExtractorLink(
-                                                    source = this.name,
-                                                    name = linkName,
-                                                    url = entry.streamUrl,
-                                                    type = ExtractorLinkType.VIDEO
-                                                )
-                                            )
-                                        }
-                                        foundLink = true
-                                    }
-                                }
-                                else -> {
-                                    Log.e(TAG, "Download still failed after thank + retry for torrent id=$torrentId")
-                                    callback(
-                                        newExtractorLink(
-                                            source = this.name,
-                                            name = "\u274C تجاوزت الحد اليومي للتحميل",
-                                            url = "$mainUrl/",
-                                            type = ExtractorLinkType.VIDEO
-                                        )
-                                    )
-                                    foundLink = true
-                                }
-                            }
+                            Log.e(TAG, "DAILY DOWNLOAD LIMIT EXCEEDED for torrent id=$torrentId")
+                            callback(
+                                newExtractorLink(
+                                    source = this.name,
+                                    name = "\u274C تجاوزت الحد اليومي للتحميل",
+                                    url = "error://daily-limit-exceeded",
+                                    type = ExtractorLinkType.VIDEO
+                                )
+                            )
+                            foundLink = true
                         }
                         is TorrentDownloadResult.NotLoggedIn -> {
+                            Log.e(TAG, "Session expired — resetting login state")
                             isLoggedIn = false
-                            Log.e(TAG, "Session expired for torrent id=$torrentId")
                         }
                         is TorrentDownloadResult.Error -> {
-                            Log.e(TAG, "Download error for torrent id=$torrentId: ${result.message}")
+                            Log.e(TAG, "Failed to download .torrent: ${result.message}")
                         }
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "TorrServe processing error: ${e.message}")
+                    Log.e(TAG, "TorrServe integration error: ${e.message}")
                 }
             }
 
+            if (!foundLink) {
+                Log.e(TAG, "No links found for torrent id=$torrentId")
+            }
             foundLink
         } catch (e: Exception) {
             Log.e(TAG, "loadLinks Error: ${e.message}")
-            false
-        }
-    }
-
-    // ==================== THANK UPLOADER ====================
-
-    /**
-     * Click "اشكر الرافع" (thank the uploader) on the torrent detail page.
-     * This must be done before downloading non-free torrents to avoid the
-     * daily download limit ("لقد تجاوزت الحد المسموح به من التحميلات بيوم واحد").
-     *
-     * The arabp2p website uses an AJAX mechanism (sack library) that sends a
-     * POST request to thanks.php with form data tid=TORRENT_ID&thanks=1 when
-     * the "اشكر الرافع" button (id="ty", class="btn thanks_btn",
-     * onclick="thank_you(ID)") is clicked. We replicate this by:
-     * 1. Sending a POST request to thanks.php with tid and thanks parameters
-     *
-     * Returns true if the thank was sent or already done, false on error.
-     */
-    private fun thankUploader(torrentId: String, detailUrl: String): Boolean {
-        if (!ensureLogin()) return false
-
-        return try {
-            // Send the thank POST request — same as the sack AJAX call:
-            // at.requestFile='thanks.php'; at.setVar('tid',ia); at.setVar('thanks',1);
-            // sack library uses POST method by default with form-encoded body
-            val thankFormBody = FormBody.Builder()
-                .add("tid", torrentId)
-                .add("thanks", "1")
-                .build()
-
-            val pageUrl = if (detailUrl.isNotBlank()) toAbsoluteUrl(detailUrl)
-                else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
-
-            val thankRequest = Request.Builder()
-                .url("$mainUrl/thanks.php")
-                .post(thankFormBody)
-                .headers(getAuthHeaders(referer = pageUrl).toOkHttpHeaders())
-                .header("X-Requested-With", "XMLHttpRequest")
-                .build()
-
-            authClient.newCall(thankRequest).execute().use { response ->
-                val responseBody = response.body?.string() ?: ""
-                Log.d(TAG, "Thank uploader: HTTP ${response.code}, response: ${responseBody.take(200)}")
-                response.isSuccessful
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "thankUploader error: ${e.message}")
             false
         }
     }
@@ -1471,142 +1208,22 @@ class Arabp : MainAPI() {
     data class TorrServeStreamEntry(
         val fileName: String,      // Just the filename (e.g. "Episode01.mkv")
         val filePath: String,      // Full path within torrent (e.g. "ShowName/Episode01.mkv")
-        val folderName: String,    // Legacy: first folder component (for backward compat)
+        val folderName: String,    // Parent folder / show name (e.g. "ShowName"), empty if in root
         val fileIndex: Int,        // TorrServe file index (1-based)
         val streamUrl: String      // Full stream URL with correct index
     )
 
-    // ==================== BENCODE PARSER (for .torrent tracker stripping) ====================
-    //
-    // Minimal bencode parser/encoder to strip tracker URLs from .torrent files
-    // before uploading to TorrServe. This prevents the private tracker from
-    // counting your download/upload.
-
-    private sealed class BencodeValue {
-        data class BInt(val value: Long) : BencodeValue()
-        data class BString(val bytes: ByteArray) : BencodeValue() {
-            override fun equals(other: Any?) = other is BString && bytes.contentEquals(other.bytes)
-            override fun hashCode() = bytes.contentHashCode()
-        }
-        data class BList(val items: List<BencodeValue>) : BencodeValue()
-        data class BDict(val entries: MutableList<Pair<BString, BencodeValue>>) : BencodeValue()
-    }
-
-    private fun decodeBencode(data: ByteArray, offset: Int): Pair<BencodeValue, Int> {
-        val byte = data[offset]
-        return when {
-            byte == 'i'.code.toByte() -> {
-                // Integer: i<number>e
-                val end = indexOf(data, 'e'.code.toByte(), offset + 1)
-                val num = String(data, offset + 1, end - offset - 1).toLong()
-                Pair(BencodeValue.BInt(num), end + 1)
-            }
-            byte in '0'.code.toByte()..'9'.code.toByte() -> {
-                // String: <length>:<bytes>
-                val colon = indexOf(data, ':'.code.toByte(), offset)
-                val len = String(data, offset, colon - offset).toInt()
-                val strStart = colon + 1
-                val strBytes = data.sliceArray(strStart until strStart + len)
-                Pair(BencodeValue.BString(strBytes), strStart + len)
-            }
-            byte == 'l'.code.toByte() -> {
-                // List: l<items>e
-                val items = mutableListOf<BencodeValue>()
-                var pos = offset + 1
-                while (data[pos] != 'e'.code.toByte()) {
-                    val (item, newPos) = decodeBencode(data, pos)
-                    items.add(item)
-                    pos = newPos
-                }
-                Pair(BencodeValue.BList(items), pos + 1)
-            }
-            byte == 'd'.code.toByte() -> {
-                // Dictionary: d<key><value>...e
-                val entries = mutableListOf<Pair<BencodeValue.BString, BencodeValue>>()
-                var pos = offset + 1
-                while (data[pos] != 'e'.code.toByte()) {
-                    val (key, keyEnd) = decodeBencode(data, pos)
-                    val (value, valueEnd) = decodeBencode(data, keyEnd)
-                    entries.add(key as BencodeValue.BString to value)
-                    pos = valueEnd
-                }
-                Pair(BencodeValue.BDict(entries), pos + 1)
-            }
-            else -> throw IllegalArgumentException("Invalid bencode byte at $offset: ${byte.toInt().toChar()}")
-        }
-    }
-
-    private fun encodeBencode(value: BencodeValue): ByteArray {
-        return when (value) {
-            is BencodeValue.BInt -> "i${value.value}e".toByteArray()
-            is BencodeValue.BString -> {
-                val prefix = "${value.bytes.size}:".toByteArray()
-                prefix + value.bytes
-            }
-            is BencodeValue.BList -> {
-                val parts = value.items.map { encodeBencode(it) }
-                byteArrayOf('l'.code.toByte()) + parts.reduce { acc, bytes -> acc + bytes } + byteArrayOf('e'.code.toByte())
-            }
-            is BencodeValue.BDict -> {
-                val parts = value.entries.flatMap { (k, v) ->
-                    listOf(encodeBencode(k), encodeBencode(v))
-                }
-                val body = if (parts.isEmpty()) ByteArray(0) else parts.reduce { acc, bytes -> acc + bytes }
-                byteArrayOf('d'.code.toByte()) + body + byteArrayOf('e'.code.toByte())
-            }
-        }
-    }
-
-    private fun indexOf(data: ByteArray, b: Byte, from: Int): Int {
-        for (i in from until data.size) {
-            if (data[i] == b) return i
-        }
-        throw IllegalArgumentException("Byte not found in bencode data")
-    }
-
-    /**
-     * Strip tracker URLs from a .torrent file.
-     * Removes `announce` and `announce-list` keys from the top-level dictionary.
-     * The `info` dict is kept UNCHANGED (same info hash → TorrServe recognizes
-     * it as the same torrent and updates it in place).
-     *
-     * IMPORTANT: We do NOT remove the `private` flag from the info dict because
-     * that would CHANGE the info hash, making it a completely different torrent.
-     * The existing peer connections persist regardless of the private flag.
-     *
-     * Without tracker URLs, no announce happens → the private tracker
-     * cannot count your download/upload. Existing peer connections continue.
-     */
-    private fun stripTrackersFromTorrent(torrentBytes: ByteArray): ByteArray {
-        return try {
-            val (root, _) = decodeBencode(torrentBytes, 0)
-            val dict = root as? BencodeValue.BDict ?: return torrentBytes
-
-            // Remove announce and announce-list from top-level dict ONLY.
-            // Do NOT touch the info dict — that would change the info hash!
-            dict.entries.removeAll { (k, _) ->
-                k.bytes.contentEquals("announce".toByteArray()) ||
-                k.bytes.contentEquals("announce-list".toByteArray())
-            }
-
-            val result = encodeBencode(dict)
-            Log.d(TAG, "stripTrackersFromTorrent: ${torrentBytes.size} → ${result.size} bytes (trackers removed, info hash preserved)")
-            result
-        } catch (e: Exception) {
-            Log.w(TAG, "stripTrackersFromTorrent failed, using original: ${e.message}")
-            torrentBytes
-        }
-    }
-
     /**
      * Upload .torrent to TorrServe, then poll for file list.
+     *
+     * Flow:
+     * 1. POST /torrent/upload with .torrent file → get hash
+     * 2. Try to parse file_stats from upload response
+     * 3. If empty, poll POST /torrents {"action":"get","hash":...} with retries
+     * 4. Filter to video files, group by folder, return stream entries
      */
     private fun uploadToTorrServe(torrentBytes: ByteArray, torrentId: String): List<TorrServeStreamEntry>? {
         return try {
-            // Upload the ORIGINAL .torrent with trackers/passkey so TorrServe
-            // can connect to the tracker and find peers. Trackers will be removed
-            // AFTER the download starts (once peers are connected via DHT/PEX).
-
             // Step 1: Upload .torrent file
             val requestBody = MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
@@ -1642,9 +1259,6 @@ class Arabp : MainAPI() {
 
                 Log.d(TAG, "TorrServe hash: $hash")
 
-                // Cache original torrent bytes so we can strip and re-upload later
-                torrentBytesCache[hash] = torrentBytes
-
                 // Try to parse file_stats from the upload response
                 fileStats = parseFileStatsFromResponse(responseBody)
                 Log.d(TAG, "Parsed ${fileStats.size} files from upload response")
@@ -1671,7 +1285,7 @@ class Arabp : MainAPI() {
                 )
             }
 
-            // Filter to only video files and create stream entries
+            // Filter to only video files and create stream entries with folder info
             val videoEntries = fileStats
                 .filter { (path, _) -> isVideoFile(path) }
                 .map { (path, id) ->
@@ -1690,19 +1304,6 @@ class Arabp : MainAPI() {
 
             Log.d(TAG, "Created ${videoEntries.size} video stream entries (from ${fileStats.size} total files)")
 
-            // Post-upload: pause files.
-            // Tracker counting is stopped in loadLinks() after the video starts playing.
-            // We send event=stopped directly to the tracker + replace trackers with dummy URL.
-            // Best-effort: don't let these fail the upload.
-            try {
-                if (videoEntries.size > 1) {
-                    val allIndices = videoEntries.map { it.fileIndex }
-                    pauseAllFiles(hash, allIndices)
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "TorrServe post-upload setup failed (non-fatal): ${e.message}")
-            }
-
             if (videoEntries.isEmpty()) {
                 // If no video files detected, use first file as fallback
                 val first = fileStats.first()
@@ -1717,8 +1318,8 @@ class Arabp : MainAPI() {
                     )
                 )
             } else {
-                // Sort: by full path for consistent ordering
-                videoEntries.sortedBy { it.filePath }
+                // Sort naturally by filename (Episode 1 before Episode 10)
+                videoEntries.sortedBy { naturalSortKey(it.fileName) }
             }
         } catch (e: java.net.ConnectException) {
             Log.e(TAG, "TorrServe connection refused — is TorrServe running on $TORRSERVE_HOST?")
@@ -1731,6 +1332,9 @@ class Arabp : MainAPI() {
 
     /**
      * Poll TorrServe's POST /torrents API to get file_stats.
+     * The torrent may need time to resolve its metadata (stat=1 → stat=3).
+     *
+     * Returns list of (path, id) pairs, or empty list if polling fails.
      */
     private fun pollTorrServeFileList(hash: String): List<Pair<String, Int>> {
         for (attempt in 1..TORRSERVE_POLL_ATTEMPTS) {
@@ -1745,7 +1349,6 @@ class Arabp : MainAPI() {
                 val request = Request.Builder()
                     .url("$TORRSERVE_HOST/torrents")
                     .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
-                    .header("Content-Type", "application/json")
                     .build()
 
                 torrServeClient.newCall(request).execute().use { response ->
@@ -1755,1005 +1358,150 @@ class Arabp : MainAPI() {
                     }
 
                     val responseBody = response.body?.string() ?: return@use
-                    val resultJson = JSONObject(responseBody)
+                    Log.d(TAG, "TorrServe poll attempt $attempt: ${responseBody.take(300)}")
 
-                    // Check if torrent is ready (stat=3 means metadata resolved)
-                    val stat = resultJson.optInt("stat", 0)
-                    Log.d(TAG, "TorrServe poll attempt $attempt: stat=$stat")
-
-                    if (stat == 3 || stat == 4) {
-                        val stats = parseFileStatsFromJsonObj(resultJson)
-                        if (stats.isNotEmpty()) {
-                            Log.d(TAG, "TorrServe poll SUCCESS: ${stats.size} files after $attempt attempts")
-                            return stats
-                        }
+                    val fileStats = parseFileStatsFromResponse(responseBody)
+                    if (fileStats.isNotEmpty()) {
+                        Log.d(TAG, "TorrServe poll SUCCESS on attempt $attempt: ${fileStats.size} files")
+                        return fileStats
                     }
+
+                    // Check torrent status
+                    try {
+                        val json = JSONObject(responseBody)
+                        val stat = json.optInt("stat", -1)
+                        val statString = json.optString("stat_string", "")
+                        Log.d(TAG, "TorrServe torrent stat=$stat ($statString)")
+
+                        // stat=4 means closed/errored — no point polling further
+                        if (stat == 4) {
+                            Log.e(TAG, "TorrServe torrent closed/errored, stopping polls")
+                            return emptyList()
+                        }
+                    } catch (_: Exception) {}
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "TorrServe poll attempt $attempt error: ${e.message}")
             }
         }
 
-        Log.e(TAG, "TorrServe polling exhausted after $TORRSERVE_POLL_ATTEMPTS attempts")
+        Log.w(TAG, "TorrServe polling exhausted after $TORRSERVE_POLL_ATTEMPTS attempts")
         return emptyList()
     }
 
-    // ==================== TORRSERVE FILE PRIORITY (PAUSE/RESUME) ====================
-    //
-    // TorrServe downloads ALL files in a torrent by default. To save bandwidth
-    // and storage, we pause all files except the one being watched. When the user
-    // clicks another episode, that file is resumed and the rest are paused.
-    //
-    // TorrServe Matrix API: POST /torrents with action=set-file-priority
-    // Priority values: 0 = Don't download (paused), 1 = Normal, 2 = High, 3 = Maximum
+    // ==================== JSON PARSING (using JSONObject for reliability) ====================
 
     /**
-     * Set download priority for a single file in TorrServe.
-     * @param hash Torrent hash
-     * @param fileIndex 1-based file index
-     * @param priority 0=paused, 1=normal, 2=high, 3=max
+     * Parse hash from TorrServe JSON response using JSONObject.
      */
-    private fun setTorrServeFilePriority(hash: String, fileIndex: Int, priority: Int): Boolean {
+    private fun parseHashFromResponse(json: String): String? {
         return try {
-            val jsonBody = JSONObject().apply {
-                put("action", "set-file-priority")
-                put("hash", hash)
-                put("file_id", fileIndex)
-                put("priority", priority)
-            }
-
-            val request = Request.Builder()
-                .url("$TORRSERVE_HOST/torrents")
-                .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
-                .header("Content-Type", "application/json")
-                .build()
-
-            torrServeClient.newCall(request).execute().use { response ->
-                val success = response.isSuccessful
-                if (success) {
-                    Log.d(TAG, "TorrServe: set file $fileIndex priority=$priority for $hash")
-                } else {
-                    Log.w(TAG, "TorrServe: set priority failed, HTTP ${response.code}")
-                }
-                success
-            }
+            val obj = JSONObject(json)
+            val hashValue = obj.optString("hash", "")
+            if (hashValue.isNotEmpty()) hashValue.lowercase() else null
         } catch (e: Exception) {
-            Log.e(TAG, "TorrServe setFilePriority error: ${e.message}")
-            false
+            // Fallback to regex if JSONObject fails
+            Log.w(TAG, "JSONObject hash parsing failed, trying regex: ${e.message}")
+            val hashPattern = """"hash"\s*:\s*"([a-fA-F0-9]{40})"""".toRegex()
+            hashPattern.find(json)?.groupValues?.getOrNull(1)?.lowercase()
         }
     }
 
     /**
-     * Pause all files in a torrent except the one being watched.
-     * The active file gets normal priority (1), all others get paused (0).
-     *
-     * @param hash Torrent hash
-     * @param activeFileIndex 1-based index of the file to resume
-     * @param totalFileIndices All file indices in the torrent
+     * Parse file_stats from TorrServe JSON response using JSONObject/JSONArray.
+     * Returns list of (path, id) pairs.
      */
-    private fun pauseAllExceptOne(hash: String, activeFileIndex: Int, totalFileIndices: List<Int>) {
-        var successCount = 0
-        for (idx in totalFileIndices) {
-            val priority = if (idx == activeFileIndex) 1 else 0
-            if (setTorrServeFilePriority(hash, idx, priority)) {
-                successCount++
-            }
-        }
-        Log.d(TAG, "pauseAllExceptOne: set priorities for $successCount/${totalFileIndices.size} files (active=$activeFileIndex)")
-    }
+    private fun parseFileStatsFromResponse(json: String): List<Pair<String, Int>> {
+        val results = mutableListOf<Pair<String, Int>>()
 
-    /**
-     * Pause all files in a torrent after upload (before user selects any episode).
-     */
-    private fun pauseAllFiles(hash: String, totalFileIndices: List<Int>) {
-        for (idx in totalFileIndices) {
-            setTorrServeFilePriority(hash, idx, 0)
-        }
-        Log.d(TAG, "pauseAllFiles: paused ${totalFileIndices.size} files for $hash")
-    }
-
-    /**
-     * Extract hash and file index from a TorrServe stream URL.
-     * URL format: http://127.0.0.1:8090/stream/fname?link=HASH&index=INDEX&play
-     * @return Pair(hash, index) or null if parsing fails
-     */
-    private fun parseTorrServeUrl(streamUrl: String): Pair<String, Int>? {
-        return try {
-            val hash = streamUrl.substringAfter("link=").substringBefore("&")
-            val indexStr = streamUrl.substringAfter("index=").substringBefore("&")
-            val index = indexStr.toIntOrNull() ?: return null
-            if (hash.isNotBlank()) Pair(hash, index) else null
-        } catch (e: Exception) {
-            Log.w(TAG, "parseTorrServeUrl error: ${e.message}")
-            null
-        }
-    }
-
-    /**
-     * Get all file indices for a torrent hash from TorrServe.
-     */
-    private fun getTorrServeFileIndices(hash: String): List<Int> {
-        return try {
-            val jsonBody = JSONObject().apply {
-                put("action", "get")
-                put("hash", hash)
-            }
-
-            val request = Request.Builder()
-                .url("$TORRSERVE_HOST/torrents")
-                .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
-                .header("Content-Type", "application/json")
-                .build()
-
-            torrServeClient.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return emptyList()
-                val body = response.body?.string() ?: return emptyList()
-                val json = JSONObject(body)
-                val fileStats = parseFileStatsFromJsonObj(json)
-                fileStats.map { it.second }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "getTorrServeFileIndices error: ${e.message}")
-            emptyList()
-        }
-    }
-
-    // ==================== TORRSERVE PAUSE/RESUME ====================
-    //
-    // These use TorrServe's own pause/stop actions.
-    // When TorrServe pauses a torrent, IT sends event=stopped to the
-    // tracker using its own session data. This is the correct way to
-    // stop tracker counting - much better than sending event=stopped
-    // from outside, which the tracker doesn't recognize.
-
-    /**
-     * Pause a torrent in TorrServe.
-     * When TorrServe pauses a torrent, it sends event=stopped to the tracker
-     * using its own session data (correct peer_id, port, etc.).
-     * The tracker will recognize this and close the session.
-     * Returns the action name that worked, or null if all failed.
-     */
-    private fun pauseTorrServeTorrent(hash: String): String? {
-        // Try various action names that TorrServe might support
-        for (action in listOf("pause", "stop", "force-stop")) {
+        try {
+            val jsonObj = JSONObject(json)
+            parseFileStatsFromObject(jsonObj, results)
+        } catch (_: Exception) {
             try {
-                val jsonBody = JSONObject().apply {
-                    put("action", action)
-                    put("hash", hash)
-                }
-                val request = Request.Builder()
-                    .url("$TORRSERVE_HOST/torrents")
-                    .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
-                    .header("Content-Type", "application/json")
-                    .build()
-                torrServeClient.newCall(request).execute().use { resp ->
-                    val respBody = resp.body?.string() ?: ""
-                    Log.d(TAG, "pauseTorrServeTorrent ($action): HTTP ${resp.code}, body=${respBody.take(300)}")
-                    if (resp.isSuccessful) {
-                        Log.d(TAG, "pauseTorrServeTorrent: '$action' worked!")
-                        return action
-                    }
+                val jsonArr = JSONArray(json)
+                for (i in 0 until jsonArr.length()) {
+                    parseFileStatsFromObject(jsonArr.getJSONObject(i), results)
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "pauseTorrServeTorrent ($action): ${e.message}")
+                Log.w(TAG, "parseFileStatsFromResponse: both object and array parsing failed: ${e.message}")
             }
         }
-        return null
+
+        return results
     }
 
-    /**
-     * Resume a paused torrent in TorrServe.
-     */
-    private fun resumeTorrServeTorrent(hash: String): Boolean {
-        for (action in listOf("resume", "start", "force-start")) {
+    private fun parseFileStatsFromObject(obj: JSONObject, results: MutableList<Pair<String, Int>>) {
+        val fileStats = obj.optJSONArray("file_stats") ?: return
+
+        for (i in 0 until fileStats.length()) {
             try {
-                val jsonBody = JSONObject().apply {
-                    put("action", action)
-                    put("hash", hash)
-                }
-                val request = Request.Builder()
-                    .url("$TORRSERVE_HOST/torrents")
-                    .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
-                    .header("Content-Type", "application/json")
-                    .build()
-                torrServeClient.newCall(request).execute().use { resp ->
-                    val respBody = resp.body?.string() ?: ""
-                    Log.d(TAG, "resumeTorrServeTorrent ($action): HTTP ${resp.code}, body=${respBody.take(300)}")
-                    if (resp.isSuccessful) return true
+                val fileObj = fileStats.getJSONObject(i)
+                val id = fileObj.optInt("id", -1)
+                val path = fileObj.optString("path", "")
+                if (id > 0 && path.isNotEmpty()) {
+                    results.add(path to id)
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "resumeTorrServeTorrent ($action): ${e.message}")
-            }
-        }
-        return false
-    }
-
-    /**
-     * Test if a TorrServe stream URL is still accessible.
-     * Returns true if the stream can still be read (HTTP 200 or 206).
-     */
-    private fun testStreamUrl(url: String): Boolean {
-        return try {
-            val request = Request.Builder()
-                .url(url)
-                .header("Range", "bytes=0-1")  // Request just first 2 bytes
-                .build()
-            torrServeClient.newCall(request).execute().use { resp ->
-                // 200 = OK, 206 = Partial Content (both mean stream works)
-                val works = resp.isSuccessful || resp.code == 206
-                Log.d(TAG, "testStreamUrl: HTTP ${resp.code} → works=$works")
-                works
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "testStreamUrl error: ${e.message}")
-            false
-        }
-    }
-
-    // ==================== TORRSERVE TRACKER HELPERS ====================
-    //
-    // These helper functions support the tracker counting stop strategy.
-    // Primary approach: delete torrent + re-upload stripped version (no trackers).
-
-    /**
-     * Query TorrServe for the current state of a torrent.
-     * Returns a short string like "stat=3, trackers=2, dl=1.2MB" for display in toast.
-     */
-    private fun queryTorrServeTorrentState(hash: String): String {
-        return try {
-            val jsonBody = JSONObject().apply {
-                put("action", "get")
-                put("hash", hash)
-            }
-            val request = Request.Builder()
-                .url("$TORRSERVE_HOST/torrents")
-                .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
-                .header("Content-Type", "application/json")
-                .build()
-            torrServeClient.newCall(request).execute().use { resp ->
-                val body = resp.body?.string() ?: "no body"
-                val json = JSONObject(body)
-                val stat = json.optInt("stat", -1)
-                val trackersArr = json.optJSONArray("trackers")
-                val trackerCount = trackersArr?.length() ?: 0
-                val dl = json.optLong("downloaded", json.optLong("total_download", 0))
-                val dlStr = if (dl > 1048576) "${dl / 1048576}MB" else if (dl > 1024) "${dl / 1024}KB" else "${dl}B"
-                "stat=$stat trackers=$trackerCount dl=$dlStr"
-            }
-        } catch (e: Exception) {
-            "error: ${e.message}"
-        }
-    }
-
-    /**
-     * Delete a torrent from TorrServe.
-     * @param saveData If true, keep the downloaded data on disk.
-     */
-    private fun deleteTorrServeTorrent(hash: String, saveData: Boolean): Boolean {
-        return try {
-            val jsonBody = JSONObject().apply {
-                put("action", "delete")
-                put("hash", hash)
-                put("save", saveData)
-            }
-            val request = Request.Builder()
-                .url("$TORRSERVE_HOST/torrents")
-                .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
-                .header("Content-Type", "application/json")
-                .build()
-            torrServeClient.newCall(request).execute().use { resp ->
-                val body = resp.body?.string() ?: ""
-                Log.d(TAG, "deleteTorrServeTorrent: HTTP ${resp.code}, body=${body.take(300)}")
-                resp.isSuccessful
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "deleteTorrServeTorrent error: ${e.message}")
-            false
-        }
-    }
-
-    /**
-     * Upload a stripped .torrent file (no trackers) to TorrServe.
-     * Returns the info hash of the uploaded torrent, or null on failure.
-     */
-    private fun uploadStrippedTorrent(torrentBytes: ByteArray): String? {
-        return try {
-            val requestBody = MultipartBody.Builder()
-                .setType(MultipartBody.FORM)
-                .addFormDataPart(
-                    "file", "stripped.torrent",
-                    torrentBytes.toRequestBody("application/x-bittorrent".toMediaType())
-                )
-                .addFormDataPart("save", "1")
-                .build()
-
-            val request = Request.Builder()
-                .url("$TORRSERVE_HOST/torrent/upload")
-                .post(requestBody)
-                .build()
-
-            torrServeClient.newCall(request).execute().use { resp ->
-                if (!resp.isSuccessful) {
-                    Log.e(TAG, "uploadStrippedTorrent: HTTP ${resp.code}")
-                    return null
-                }
-                val body = resp.body?.string() ?: return null
-                Log.d(TAG, "uploadStrippedTorrent response: ${body.take(500)}")
-                val hash = parseHashFromResponse(body)
-                if (hash != null) {
-                    Log.d(TAG, "uploadStrippedTorrent: hash=$hash")
-                } else {
-                    Log.e(TAG, "uploadStrippedTorrent: could not parse hash from response")
-                }
-                hash
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "uploadStrippedTorrent error: ${e.message}")
-            null
-        }
-    }
-
-    /**
-     * Data class for TorrServe torrent properties.
-     * Populated by querying the TorrServe API.
-     */
-    data class TorrServeTorrentProps(
-        val peerId: String?,
-        val listenPort: Int,
-        val trackerUrls: List<String>,
-        val totalDownloaded: Long,
-        val totalUploaded: Long,
-        val stat: Int,
-        val rawJson: String
-    )
-
-    /**
-     * Query TorrServe for detailed torrent properties.
-     * Returns peer_id, listening port, tracker URLs, and other session data.
-     * We need this to send a proper event=stopped to the tracker.
-     */
-    private fun getTorrServeTorrentProps(hash: String): TorrServeTorrentProps? {
-        return try {
-            val jsonBody = JSONObject().apply {
-                put("action", "get")
-                put("hash", hash)
-            }
-
-            val request = Request.Builder()
-                .url("$TORRSERVE_HOST/torrents")
-                .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
-                .header("Content-Type", "application/json")
-                .build()
-
-            torrServeClient.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return null
-                val body = response.body?.string() ?: return null
-
-                // Log the FULL response for debugging — this is critical
-                // to understand what TorrServe actually returns
-                Log.d(TAG, "TorrServe torrent props FULL response: ${body.take(2000)}")
-
-                val json = JSONObject(body)
-                val stat = json.optInt("stat", -1)
-
-                // Try to extract peer_id — it might be under different keys
-                var peerId: String? = null
-                // Try common keys
-                for (key in listOf("peer_id", "peer-id", "peerId", "connection_id")) {
-                    val v = json.optString(key, null)
-                    if (v != null && v.isNotEmpty()) {
-                        peerId = v
-                        Log.d(TAG, "Found peer_id under key '$key': $peerId")
-                        break
-                    }
-                }
-
-                // Try to get it from the torrent object if it's nested
-                if (peerId == null) {
-                    val dataObj = json.optJSONObject("data")
-                    if (dataObj != null) {
-                        for (key in listOf("peer_id", "peer-id", "peerId")) {
-                            val v = dataObj.optString(key, null)
-                            if (v != null && v.isNotEmpty()) {
-                                peerId = v
-                                Log.d(TAG, "Found peer_id under data.$key: $peerId")
-                                break
-                            }
-                        }
-                    }
-                }
-
-                // Extract listening port
-                var listenPort = json.optInt("listen_port",
-                    json.optInt("port",
-                        json.optInt("lp", 0)))
-
-                // Try from data object
-                if (listenPort == 0) {
-                    val dataObj = json.optJSONObject("data")
-                    if (dataObj != null) {
-                        listenPort = dataObj.optInt("listen_port",
-                            dataObj.optInt("port", 0))
-                    }
-                }
-                if (listenPort == 0) listenPort = 6881  // default BitTorrent port
-
-                // Extract tracker URLs
-                val trackerUrls = mutableListOf<String>()
-                val trackersArr = json.optJSONArray("trackers")
-                if (trackersArr != null) {
-                    for (i in 0 until trackersArr.length()) {
-                        when (val item = trackersArr.get(i)) {
-                            is String -> trackerUrls.add(item)
-                            is JSONArray -> {
-                                for (j in 0 until item.length()) {
-                                    val url = item.optString(j)
-                                    if (url.isNotEmpty()) trackerUrls.add(url)
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Extract download/upload stats
-                val totalDownloaded = json.optLong("downloaded",
-                    json.optLong("total_download",
-                        json.optLong("total_downloaded", 0L)))
-                val totalUploaded = json.optLong("uploaded",
-                    json.optLong("total_upload",
-                        json.optLong("total_uploaded", 0L)))
-
-                val props = TorrServeTorrentProps(
-                    peerId = peerId,
-                    listenPort = listenPort,
-                    trackerUrls = trackerUrls,
-                    totalDownloaded = totalDownloaded,
-                    totalUploaded = totalUploaded,
-                    stat = stat,
-                    rawJson = body.take(500)
-                )
-                Log.d(TAG, "TorrServe torrent props: peerId=$peerId, port=$listenPort, trackers=${trackerUrls.size}, dl=$totalDownloaded, ul=$totalUploaded, stat=$stat")
-                props
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "getTorrServeTorrentProps error: ${e.message}")
-            null
-        }
-    }
-
-    /**
-     * Compute the info_hash (SHA-1 of bencoded info dict) from a .torrent file.
-     * This is the same hash that identifies the torrent on the tracker.
-     */
-    private fun computeInfoHash(torrentBytes: ByteArray): String? {
-        return try {
-            val (root, _) = decodeBencode(torrentBytes, 0)
-            val dict = root as? BencodeValue.BDict ?: return null
-
-            // Find the "info" entry
-            val infoEntry = dict.entries.find { (k, _) ->
-                k.bytes.contentEquals("info".toByteArray())
-            } ?: return null
-
-            // Re-encode just the info dict
-            val infoEncoded = encodeBencode(infoEntry.second)
-
-            // SHA-1 hash
-            val sha1 = MessageDigest.getInstance("SHA-1").digest(infoEncoded)
-
-            // Convert to hex string
-            val hexHash = sha1.joinToString("") { "%02x".format(it) }
-            Log.d(TAG, "computeInfoHash: $hexHash")
-            hexHash
-        } catch (e: Exception) {
-            Log.e(TAG, "computeInfoHash error: ${e.message}")
-            null
-        }
-    }
-
-    /**
-     * Extract the tracker announce URL from a .torrent file.
-     * Returns the first announce URL (which includes the passkey for private trackers).
-     */
-    private fun extractAnnounceUrl(torrentBytes: ByteArray): String? {
-        return try {
-            val (root, _) = decodeBencode(torrentBytes, 0)
-            val dict = root as? BencodeValue.BDict ?: return null
-
-            // Try "announce" key first
-            val announceEntry = dict.entries.find { (k, _) ->
-                k.bytes.contentEquals("announce".toByteArray())
-            }
-            if (announceEntry != null) {
-                val url = String((announceEntry.second as BencodeValue.BString).bytes)
-                Log.d(TAG, "extractAnnounceUrl: $url")
-                return url
-            }
-
-            // Try first URL in "announce-list"
-            val announceListEntry = dict.entries.find { (k, _) ->
-                k.bytes.contentEquals("announce-list".toByteArray())
-            }
-            if (announceListEntry != null) {
-                val list = announceListEntry.second as? BencodeValue.BList ?: return null
-                if (list.items.isNotEmpty()) {
-                    val tier = list.items[0] as? BencodeValue.BList ?: return null
-                    if (tier.items.isNotEmpty()) {
-                        val url = String((tier.items[0] as BencodeValue.BString).bytes)
-                        Log.d(TAG, "extractAnnounceUrl (from announce-list): $url")
-                        return url
-                    }
-                }
-            }
-
-            null
-        } catch (e: Exception) {
-            Log.e(TAG, "extractAnnounceUrl error: ${e.message}")
-            null
-        }
-    }
-
-    /**
-     * Send `event=stopped` directly to the tracker's HTTP announce URL.
-     * This bypasses TorrServe entirely and tells the tracker we're stopping.
-     *
-     * For private trackers, the announce URL includes a passkey that identifies
-     * the user. When the tracker receives event=stopped, it closes the user's
-     * session and stops counting download/upload for that torrent.
-     *
-     * @param announceUrl The tracker announce URL (with passkey)
-     * @param infoHashHex The info_hash as hex string
-     * @param peerId The peer_id to use (TorrServe's actual peer_id if available)
-     * @param port The port to report (TorrServe's actual listening port if available)
-     * @return true if the tracker accepted the stopped event
-     */
-    private fun sendTrackerStopped(
-        announceUrl: String,
-        infoHashHex: String,
-        peerId: String? = null,
-        port: Int = 6881
-    ): Boolean {
-        return try {
-            // Convert hex info_hash to URL-encoded binary format
-            val infoHashBytes = ByteArray(20)
-            for (i in 0 until 20) {
-                infoHashBytes[i] = infoHashHex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
-            }
-
-            // URL-encode each byte of the info_hash
-            val encodedInfoHash = infoHashBytes.joinToString("") { byte ->
-                "%${String.format("%02x", byte.toInt() and 0xFF)}"
-            }
-
-            // Use TorrServe's actual peer_id if available, otherwise generate one
-            val effectivePeerId = peerId ?: run {
-                // Generate a libtorrent-style peer_id: -LT1000- + 12 random hex
-                "-LT1000-" + (1..12).map {
-                    "0123456789abcdef".random()
-                }.joinToString("")
-            }
-
-            // Build the announce URL with event=stopped
-            val separator = if ("?" in announceUrl) "&" else "?"
-            val stoppedUrl = buildString {
-                append(announceUrl)
-                append(separator)
-                append("info_hash=").append(encodedInfoHash)
-                append("&peer_id=").append(URLEncoder.encode(effectivePeerId, "UTF-8"))
-                append("&port=").append(port)
-                append("&uploaded=0")
-                append("&downloaded=0")
-                append("&left=0")
-                append("&compact=1")
-                append("&event=stopped")
-                append("&numwant=0")
-            }
-
-            Log.d(TAG, "sendTrackerStopped: sending event=stopped to $announceUrl (peer_id=$effectivePeerId, port=$port)")
-
-            val request = Request.Builder()
-                .url(stoppedUrl)
-                .header("User-Agent", "libtorrent/1.2.19.0")
-                .build()
-
-            torrServeClient.newCall(request).execute().use { response ->
-                val body = response.body?.string() ?: ""
-                Log.d(TAG, "sendTrackerStopped: HTTP ${response.code}, body=${body.take(300)}")
-
-                if (response.isSuccessful) {
-                    // Check if the response is a valid bencoded tracker response
-                    if (body.startsWith("d") || body.contains("interval")) {
-                        Log.d(TAG, "sendTrackerStopped: SUCCESS — tracker accepted event=stopped")
-                        true
-                    } else {
-                        // Even non-bencoded 200 might mean success
-                        Log.w(TAG, "sendTrackerStopped: tracker returned unexpected response: ${body.take(100)}")
-                        true
-                    }
-                } else {
-                    Log.w(TAG, "sendTrackerStopped: FAILED — HTTP ${response.code}")
-                    false
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "sendTrackerStopped error: ${e.message}")
-            false
-        }
-    }
-
-    /**
-     * Send event=stopped to the tracker WITHOUT a peer_id.
-     * For private trackers that use passkey authentication, the passkey
-     * in the announce URL identifies the user. The tracker may accept
-     * event=stopped based on just info_hash + passkey, without peer_id.
-     */
-    private fun sendTrackerStoppedNoPeerId(announceUrl: String, infoHashHex: String): Boolean {
-        return try {
-            // Convert hex info_hash to URL-encoded binary format
-            val infoHashBytes = ByteArray(20)
-            for (i in 0 until 20) {
-                infoHashBytes[i] = infoHashHex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
-            }
-
-            val encodedInfoHash = infoHashBytes.joinToString("") { byte ->
-                "%${String.format("%02x", byte.toInt() and 0xFF)}"
-            }
-
-            // Build announce URL with ONLY info_hash + passkey (no peer_id)
-            val separator = if ("?" in announceUrl) "&" else "?"
-            val stoppedUrl = buildString {
-                append(announceUrl)
-                append(separator)
-                append("info_hash=").append(encodedInfoHash)
-                append("&peer_id=")  // empty peer_id
-                append("&port=0")
-                append("&uploaded=0")
-                append("&downloaded=0")
-                append("&left=0")
-                append("&compact=1")
-                append("&event=stopped")
-                append("&numwant=0")
-            }
-
-            Log.d(TAG, "sendTrackerStoppedNoPeerId: sending to $announceUrl")
-
-            val request = Request.Builder()
-                .url(stoppedUrl)
-                .header("User-Agent", "libtorrent/1.2.19.0")
-                .build()
-
-            torrServeClient.newCall(request).execute().use { response ->
-                val body = response.body?.string() ?: ""
-                Log.d(TAG, "sendTrackerStoppedNoPeerId: HTTP ${response.code}, body=${body.take(300)}")
-                response.isSuccessful
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "sendTrackerStoppedNoPeerId error: ${e.message}")
-            false
-        }
-    }
-
-    /**
-     * Replace the trackers in a TorrServe torrent with a dummy URL.
-     */
-    private fun replaceTrackersWithDummy(hash: String): Boolean {
-        val dummyTracker = "http://127.0.0.1:1/announce"
-        var success = false
-
-        // Method 1: set-trackers with dummy URL as string
-        try {
-            val jsonBody = JSONObject().apply {
-                put("action", "set-trackers")
-                put("hash", hash)
-                put("trackers", dummyTracker)
-            }
-
-            val request = Request.Builder()
-                .url("$TORRSERVE_HOST/torrents")
-                .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
-                .header("Content-Type", "application/json")
-                .build()
-
-            torrServeClient.newCall(request).execute().use { response ->
-                Log.d(TAG, "replaceTrackersWithDummy method 1: HTTP ${response.code}")
-                if (response.isSuccessful) success = true
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "replaceTrackersWithDummy method 1 error: ${e.message}")
-        }
-
-        // Method 2: set-trackers with dummy URL as array
-        if (!success) {
-            try {
-                val jsonBody = JSONObject().apply {
-                    put("action", "set-trackers")
-                    put("hash", hash)
-                    put("trackers", JSONArray().put(dummyTracker))
-                }
-
-                val request = Request.Builder()
-                    .url("$TORRSERVE_HOST/torrents")
-                    .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
-                    .header("Content-Type", "application/json")
-                    .build()
-
-                torrServeClient.newCall(request).execute().use { response ->
-                    Log.d(TAG, "replaceTrackersWithDummy method 2: HTTP ${response.code}")
-                    if (response.isSuccessful) success = true
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "replaceTrackersWithDummy method 2 error: ${e.message}")
-            }
-        }
-
-        // Method 3: set-trackers with nested array (announce-list format)
-        if (!success) {
-            try {
-                val jsonBody = JSONObject().apply {
-                    put("action", "set-trackers")
-                    put("hash", hash)
-                    put("trackers", JSONArray().put(JSONArray().put(dummyTracker)))
-                }
-
-                val request = Request.Builder()
-                    .url("$TORRSERVE_HOST/torrents")
-                    .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
-                    .header("Content-Type", "application/json")
-                    .build()
-
-                torrServeClient.newCall(request).execute().use { response ->
-                    Log.d(TAG, "replaceTrackersWithDummy method 3: HTTP ${response.code}")
-                    if (response.isSuccessful) success = true
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "replaceTrackersWithDummy method 3 error: ${e.message}")
-            }
-        }
-
-        if (!success) {
-            Log.w(TAG, "replaceTrackersWithDummy: all methods failed for $hash")
-        }
-        return success
-    }
-
-    /**
-     * Delete a torrent from TorrServe and re-add it via magnet link
-     * WITHOUT tracker URLs. This completely removes the tracker from
-     * the equation — no tracker URL means no announce.
-     *
-     * The magnet link is: magnet:?xt=urn:btih:HASH (no &tr=)
-     * TorrServe will check existing data on disk and can stream from it.
-     * Without trackers, the torrent uses DHT/PEX to find peers.
-     * Since we add via magnet (not .torrent), the private flag is NOT
-     * enforced, so DHT/PEX are enabled.
-     *
-     * @param hash The torrent info hash
-     * @param activeFileIndex The file index to resume after re-adding
-     * @return true if the operation succeeded
-     */
-    private fun deleteAndReaddWithoutTrackers(hash: String, activeFileIndex: Int): Boolean {
-        // Step 1: Delete torrent from TorrServe (keep downloaded data on disk)
-        try {
-            val deleteBody = JSONObject().apply {
-                put("action", "delete")
-                put("hash", hash)
-                put("save", true)  // keep downloaded data
-            }
-            val deleteRequest = okhttp3.Request.Builder()
-                .url("$TORRSERVE_HOST/torrents")
-                .post(deleteBody.toString().toRequestBody("application/json".toMediaType()))
-                .header("Content-Type", "application/json")
-                .build()
-            torrServeClient.newCall(deleteRequest).execute().use { delResp ->
-                Log.d(TAG, "TorrServe: delete torrent $hash → HTTP ${delResp.code}")
-                if (!delResp.isSuccessful) {
-                    Log.w(TAG, "TorrServe: delete failed, aborting re-add")
-                    return false
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "TorrServe: delete torrent failed: ${e.message}")
-            return false
-        }
-
-        // Step 2: Re-add via magnet link WITHOUT trackers
-        // magnet:?xt=urn:btih:HASH — no &tr= parameter
-        val magnetUri = "magnet:?xt=urn:btih:$hash"
-        Log.d(TAG, "TorrServe: re-adding via magnet (no trackers): $magnetUri")
-
-        try {
-            val addBody = JSONObject().apply {
-                put("action", "add")
-                put("link", magnetUri)
-                put("save", true)  // save to disk
-            }
-            val addRequest = okhttp3.Request.Builder()
-                .url("$TORRSERVE_HOST/torrents")
-                .post(addBody.toString().toRequestBody("application/json".toMediaType()))
-                .header("Content-Type", "application/json")
-                .build()
-            torrServeClient.newCall(addRequest).execute().use { addResp ->
-                Log.d(TAG, "TorrServe: add magnet → HTTP ${addResp.code}")
-                if (!addResp.isSuccessful) {
-                    Log.w(TAG, "TorrServe: add magnet failed, trying upload endpoint")
-                    // Try the upload endpoint as a fallback
-                    return tryAddMagnetViaUpload(magnetUri)
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "TorrServe: add magnet failed: ${e.message}")
-            return tryAddMagnetViaUpload(magnetUri)
-        }
-
-        // Step 3: Wait a moment for TorrServe to process the magnet
-        try { Thread.sleep(3000) } catch (_: InterruptedException) {}
-
-        // Step 4: Resume the active file, pause all others
-        try {
-            val allIndices = getTorrServeFileIndices(hash)
-            if (allIndices.isNotEmpty()) {
-                for (idx in allIndices) {
-                    setTorrServeFilePriority(hash, idx, if (idx == activeFileIndex) 1 else 0)
-                }
-                Log.d(TAG, "TorrServe: re-applied file priorities after magnet re-add")
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "TorrServe: re-apply priorities failed: ${e.message}")
-        }
-
-        return true
-    }
-
-    /**
-     * Try adding a magnet link via the torrent/upload endpoint.
-     * Some TorrServe versions accept magnet links through this endpoint.
-     */
-    private fun tryAddMagnetViaUpload(magnetUri: String): Boolean {
-        return try {
-            val requestBody = MultipartBody.Builder()
-                .setType(MultipartBody.FORM)
-                .addFormDataPart("file", magnetUri)
-                .addFormDataPart("save", "1")
-                .build()
-
-            val request = okhttp3.Request.Builder()
-                .url("$TORRSERVE_HOST/torrent/upload")
-                .post(requestBody)
-                .build()
-
-            torrServeClient.newCall(request).execute().use { response ->
-                val body = response.body?.string() ?: ""
-                Log.d(TAG, "tryAddMagnetViaUpload: HTTP ${response.code}, body=${body.take(300)}")
-                response.isSuccessful
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "tryAddMagnetViaUpload error: ${e.message}")
-            false
-        }
-    }
-
-    // ==================== TORRSERVE RESPONSE PARSING ====================
-
-    private fun parseHashFromResponse(body: String): String? {
-        return try {
-            val json = JSONObject(body)
-            json.optString("hash", null)
-                ?: json.optJSONObject("data")?.optString("hash", null)
-                ?: run {
-                    val dataArr = json.optJSONArray("data")
-                    if (dataArr != null && dataArr.length() > 0) {
-                        dataArr.getJSONObject(0).optString("hash", null)
-                    } else null
-                }
-        } catch (e: Exception) {
-            Log.w(TAG, "parseHashFromResponse error: ${e.message}")
-            null
-        }
-    }
-
-    private fun parseFileStatsFromResponse(body: String): List<Pair<String, Int>> {
-        val stats = mutableListOf<Pair<String, Int>>()
-        try {
-            val json = JSONObject(body)
-            val fileStatsArr = json.optJSONArray("file_stats")
-            if (fileStatsArr != null) {
-                parseFileStatsArray(fileStatsArr, stats)
-                if (stats.isNotEmpty()) return stats
-            }
-            val dataObj = json.optJSONObject("data")
-            if (dataObj != null) {
-                val innerStats = dataObj.optJSONArray("file_stats")
-                if (innerStats != null) {
-                    parseFileStatsArray(innerStats, stats)
-                    if (stats.isNotEmpty()) return stats
-                }
-            }
-            val dataArr = json.optJSONArray("data")
-            if (dataArr != null && dataArr.length() > 0) {
-                val firstObj = dataArr.getJSONObject(0)
-                val innerStats = firstObj.optJSONArray("file_stats")
-                if (innerStats != null) {
-                    parseFileStatsArray(innerStats, stats)
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "parseFileStatsFromResponse error: ${e.message}")
-        }
-        return stats
-    }
-
-    private fun parseFileStatsFromJsonObj(json: JSONObject): List<Pair<String, Int>> {
-        val stats = mutableListOf<Pair<String, Int>>()
-        try {
-            val fileStatsArr = json.optJSONArray("file_stats")
-            if (fileStatsArr != null) {
-                parseFileStatsArray(fileStatsArr, stats)
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "parseFileStatsFromJsonObj error: ${e.message}")
-        }
-        return stats
-    }
-
-    private fun parseFileStatsArray(arr: JSONArray, stats: MutableList<Pair<String, Int>>) {
-        for (i in 0 until arr.length()) {
-            try {
-                val item = arr.getJSONObject(i)
-                val id = item.optInt("id", i + 1)
-                val path = item.optString("path", "")
-                    .ifEmpty { item.optString("name", "") }
-                    .ifEmpty { item.optString("file", "") }
-                if (path.isNotEmpty()) {
-                    stats.add(Pair(path, id))
-                }
-            } catch (e: Exception) {
-                // Skip malformed entries
+                Log.w(TAG, "Error parsing file_stats entry $i: ${e.message}")
             }
         }
     }
 
-    // ==================== UTILITY FUNCTIONS ====================
+    // ==================== PATH HELPERS ====================
 
     private fun normalizePath(path: String): String {
-        return path.replace("\\", "/").trim('/')
+        return path.replace("\\", "/")
     }
 
-    /**
-     * Extract the first folder name from a path.
-     * NOTE: This is used for the TorrServeStreamEntry.folderName field
-     * for backward compatibility, but the ACTUAL multi-show detection
-     * uses computeShowGroups() which handles nested folders correctly.
-     */
     private fun extractFolderName(normalizedPath: String): String {
-        val parts = normalizedPath.split("/")
-        return if (parts.size > 1) parts.first() else ""
+        val slashIndex = normalizedPath.indexOf('/')
+        return if (slashIndex > 0) normalizedPath.substring(0, slashIndex) else ""
     }
 
     private fun isVideoFile(fileName: String): Boolean {
+        val videoExtensions = listOf(
+            ".mkv", ".mp4", ".avi", ".wmv", ".flv", ".mov", ".webm",
+            ".m4v", ".ts", ".mpg", ".mpeg", ".ogv", ".rmvb", ".rm",
+            ".vob", ".m2ts", ".mts", ".3gp", ".divx"
+        )
         val lower = fileName.lowercase()
-        return lower.endsWith(".mkv") || lower.endsWith(".mp4") || lower.endsWith(".avi") ||
-                lower.endsWith(".mov") || lower.endsWith(".wmv") || lower.endsWith(".flv") ||
-                lower.endsWith(".webm") || lower.endsWith(".ts") || lower.endsWith(".m4v")
+        return videoExtensions.any { lower.endsWith(it) }
     }
 
-    private fun cleanTitleText(text: String): String {
-        return text
-            .replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&#039;", "'")
-            .replace("&nbsp;", " ")
-            .trim()
-    }
-
-    // ==================== OKHTTP HELPERS ====================
+    // ==================== HELPERS ====================
 
     private fun Map<String, String>.toOkHttpHeaders(): okhttp3.Headers {
         val builder = okhttp3.Headers.Builder()
-        for ((key, value) in this) {
-            builder.add(key, value)
-        }
+        this.forEach { (key, value) -> builder.add(key, value) }
         return builder.build()
+    }
+
+    private fun cleanTitleText(text: String): String {
+        return text.replace("\\n", " ").replace("\n", " ").replace(Regex("\\s+"), " ").trim()
+    }
+
+    /**
+     * Convert TvType to its series equivalent for TV series responses.
+     * Anime → Anime, TvSeries → TvSeries, Movie → TvSeries
+     */
+    private fun TvType.toSeriesType(): TvType {
+        return when (this) {
+            TvType.Anime, TvType.AnimeMovie, TvType.OVA -> TvType.Anime
+            TvType.Movie -> TvType.TvSeries
+            else -> this
+        }
+    }
+
+    /**
+     * Convert TvType to its movie equivalent for movie responses.
+     * Anime → AnimeMovie, TvSeries → Movie, Movie → Movie
+     */
+    private fun TvType.toMovieType(): TvType {
+        return when (this) {
+            TvType.Anime, TvType.AnimeMovie, TvType.OVA -> TvType.AnimeMovie
+            TvType.TvSeries -> TvType.Movie
+            else -> this
+        }
     }
 }
