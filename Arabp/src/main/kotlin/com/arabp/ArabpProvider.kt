@@ -1,6 +1,9 @@
 package com.arabp
 
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.widget.Toast
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -41,6 +44,18 @@ class Arabp : MainAPI() {
         "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
         "Referer" to "$mainUrl/"
     )
+
+    /** Show a toast notification for debugging */
+    private fun showToast(msg: String) {
+        try {
+            val ctx = com.lagradost.cloudstream3.AcraApplication.context ?: return
+            Handler(Looper.getMainLooper()).post {
+                Toast.makeText(ctx, "Arabp: $msg", Toast.LENGTH_LONG).show()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Toast: $msg")
+        }
+    }
 
     // ==================== SESSION / COOKIE MANAGEMENT ====================
 
@@ -602,10 +617,8 @@ class Arabp : MainAPI() {
     // Downloads the .torrent file → converts to magnet link → returns MAGNET source.
     // No TorrServe needed! CloudStream handles magnet links natively.
     //
-    // Two sources provided:
-    // 1. "Arabp (Magnet)" — magnet WITH trackers (works but may count)
-    // 2. "Arabp (Magnet - No Trackers)" — magnet WITHOUT trackers (safe from counting,
-    //    but needs a debrid service or DHT to find peers)
+    // The magnet includes tracker URLs with passkey (from the .torrent announce field).
+    // Without the passkey tracker, the magnet cannot find peers (timeout error).
 
     override suspend fun loadLinks(
         data: String,
@@ -707,39 +720,25 @@ class Arabp : MainAPI() {
                         is TorrentDownloadResult.Success -> {
                             Log.d(TAG, "Downloaded .torrent: ${result.bytes.size} bytes, converting to magnet...")
 
-                            // Convert .torrent to magnet link
-                            val magnetWithTrackers = torrentToMagnet(result.bytes, includeTrackers = true)
-                            val magnetNoTrackers = torrentToMagnet(result.bytes, includeTrackers = false)
+                            // Convert .torrent to magnet link (with trackers + passkey)
+                            val magnet = torrentToMagnet(result.bytes, includeTrackers = true)
 
-                            if (magnetWithTrackers != null) {
-                                // Source 1: Magnet WITH trackers (may count on tracker)
+                            if (magnet != null) {
+                                Log.d(TAG, "Generated magnet: ${magnet.take(200)}")
+                                showToast("Magnet: ${magnet.take(150)}")
+
                                 callback(
                                     newExtractorLink(
                                         source = this.name,
                                         name = "${this.name} (Magnet)",
-                                        url = magnetWithTrackers,
+                                        url = magnet,
                                         type = ExtractorLinkType.MAGNET
                                     )
                                 )
                                 foundLink = true
-                            }
-
-                            if (magnetNoTrackers != null && magnetNoTrackers != magnetWithTrackers) {
-                                // Source 2: Magnet WITHOUT trackers (safe from counting,
-                                // but needs debrid service or DHT to find peers)
-                                callback(
-                                    newExtractorLink(
-                                        source = "$name-NT",
-                                        name = "${this.name} (لا متتبع)", // "No Tracker"
-                                        url = magnetNoTrackers,
-                                        type = ExtractorLinkType.MAGNET
-                                    )
-                                )
-                                foundLink = true
-                            }
-
-                            if (magnetWithTrackers == null && magnetNoTrackers == null) {
+                            } else {
                                 Log.e(TAG, "Failed to convert .torrent to magnet link")
+                                showToast("Magnet conversion failed!")
                             }
                         }
                         is TorrentDownloadResult.DailyLimitExceeded -> {
@@ -753,24 +752,13 @@ class Arabp : MainAPI() {
                                 is TorrentDownloadResult.Success -> {
                                     Log.d(TAG, "Retry succeeded! Converting to magnet...")
                                     val magnet = torrentToMagnet(retryResult.bytes, includeTrackers = true)
-                                    val magnetNT = torrentToMagnet(retryResult.bytes, includeTrackers = false)
                                     if (magnet != null) {
+                                        showToast("Magnet (retry): ${magnet.take(150)}")
                                         callback(
                                             newExtractorLink(
                                                 source = this.name,
                                                 name = "${this.name} (Magnet)",
                                                 url = magnet,
-                                                type = ExtractorLinkType.MAGNET
-                                            )
-                                        )
-                                        foundLink = true
-                                    }
-                                    if (magnetNT != null && magnetNT != magnet) {
-                                        callback(
-                                            newExtractorLink(
-                                                source = "$name-NT",
-                                                name = "${this.name} (لا متتبع)",
-                                                url = magnetNT,
                                                 type = ExtractorLinkType.MAGNET
                                             )
                                         )
@@ -920,9 +908,14 @@ class Arabp : MainAPI() {
 
             // Convert SHA1 hash to Base32 (standard for magnet URIs)
             val infoHashBase32 = base32Encode(sha1)
+            // Also compute hex format (some clients prefer this)
+            val infoHashHex = sha1.joinToString("") { "%02x".format(it) }
 
-            // Build magnet URI
-            val magnet = StringBuilder("magnet:?xt=urn:btih:$infoHashBase32")
+            Log.d(TAG, "torrentToMagnet: info_hash_base32=$infoHashBase32")
+            Log.d(TAG, "torrentToMagnet: info_hash_hex=$infoHashHex")
+
+            // Build magnet URI — use hex format for btih (more widely compatible)
+            val magnet = StringBuilder("magnet:?xt=urn:btih:$infoHashHex")
 
             // Add display name (dn)
             val nameEntry = (infoEntry.second as? BencodeValue.BDict)?.entries?.find { (k, _) ->
@@ -942,18 +935,19 @@ class Arabp : MainAPI() {
                 magnet.append("&xl=$length")
             }
 
-            // Add tracker URLs (tr) — only if requested
+            // Add tracker URLs (tr) — MUST include passkey for the magnet to work
             if (includeTrackers) {
-                // Single announce URL
+                // Single announce URL (contains passkey!)
                 val announceEntry = dict.entries.find { (k, _) ->
                     k.bytes.contentEquals("announce".toByteArray())
                 }
                 if (announceEntry != null) {
                     val announceUrl = String((announceEntry.second as BencodeValue.BString).bytes)
+                    Log.d(TAG, "torrentToMagnet: announce=$announceUrl")
                     magnet.append("&tr=").append(URLEncoder.encode(announceUrl, "UTF-8"))
                 }
 
-                // Announce-list (multiple trackers)
+                // Announce-list (multiple trackers, may include passkey variants)
                 val announceListEntry = dict.entries.find { (k, _) ->
                     k.bytes.contentEquals("announce-list".toByteArray())
                 }
@@ -963,14 +957,16 @@ class Arabp : MainAPI() {
                         val tierList = tier as? BencodeValue.BList
                         tierList?.items?.forEach { tracker ->
                             val trackerUrl = String((tracker as BencodeValue.BString).bytes)
+                            Log.d(TAG, "torrentToMagnet: tracker=$trackerUrl")
                             magnet.append("&tr=").append(URLEncoder.encode(trackerUrl, "UTF-8"))
                         }
                     }
                 }
             }
 
-            Log.d(TAG, "torrentToMagnet: ${if (includeTrackers) "with" else "without"} trackers → ${magnet.toString().take(100)}...")
-            magnet.toString()
+            val magnetStr = magnet.toString()
+            Log.d(TAG, "torrentToMagnet: ${if (includeTrackers) "with" else "without"} trackers → ${magnetStr.take(150)}...")
+            magnetStr
         } catch (e: Exception) {
             Log.e(TAG, "torrentToMagnet error: ${e.message}")
             null
