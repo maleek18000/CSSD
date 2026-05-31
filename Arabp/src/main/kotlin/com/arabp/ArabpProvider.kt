@@ -1,9 +1,6 @@
 package com.arabp
 
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
-import android.widget.Toast
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -34,28 +31,21 @@ class Arabp : MainAPI() {
         private const val LOGIN_USERNAME = "armano"
         private const val LOGIN_PASSWORD = "ARmano01**"
         private val DIGITS = Regex("\\d+")
+        private val PASSKEY_REGEX = Regex("/([0-9a-f]{32})/announce")
 
         // Base32 alphabet for magnet info hash encoding
         private const val BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
     }
+
+    // Cached passkey extracted from .torrent announce URL or website
+    @Volatile
+    private var cachedPasskey: String? = null
 
     // Images require Referer header to avoid 403
     private val imageHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
         "Referer" to "$mainUrl/"
     )
-
-    /** Show a toast notification for debugging */
-    private fun showToast(msg: String) {
-        try {
-            val ctx = com.lagradost.cloudstream3.AcraApplication.context ?: return
-            Handler(Looper.getMainLooper()).post {
-                Toast.makeText(ctx, "Arabp: $msg", Toast.LENGTH_LONG).show()
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Toast: $msg")
-        }
-    }
 
     // ==================== SESSION / COOKIE MANAGEMENT ====================
 
@@ -617,8 +607,8 @@ class Arabp : MainAPI() {
     // Downloads the .torrent file → converts to magnet link → returns MAGNET source.
     // No TorrServe needed! CloudStream handles magnet links natively.
     //
-    // The magnet includes tracker URLs with passkey (from the .torrent announce field).
-    // Without the passkey tracker, the magnet cannot find peers (timeout error).
+    // The magnet link includes BOTH non-passkey and passkey tracker URLs
+    // (like t2m does) so the torrent client can connect and authenticate.
 
     override suspend fun loadLinks(
         data: String,
@@ -640,6 +630,11 @@ class Arabp : MainAPI() {
             if (!ensureLogin()) {
                 Log.e(TAG, "Cannot load links: login failed")
                 return false
+            }
+
+            // Try to fetch passkey from website as fallback (before we need it)
+            if (cachedPasskey == null) {
+                fetchPasskeyFromWebsite()
             }
 
             var foundLink = false
@@ -720,13 +715,11 @@ class Arabp : MainAPI() {
                         is TorrentDownloadResult.Success -> {
                             Log.d(TAG, "Downloaded .torrent: ${result.bytes.size} bytes, converting to magnet...")
 
-                            // Convert .torrent to magnet link (with trackers + passkey)
-                            val magnet = torrentToMagnet(result.bytes, includeTrackers = true)
+                            // Convert .torrent to magnet link (always includes trackers with passkey)
+                            val magnet = torrentToMagnet(result.bytes)
 
                             if (magnet != null) {
-                                Log.d(TAG, "Generated magnet: ${magnet.take(200)}")
-                                showToast("Magnet: ${magnet.take(150)}")
-
+                                Log.d(TAG, "Generated magnet: ${magnet.take(150)}...")
                                 callback(
                                     newExtractorLink(
                                         source = this.name,
@@ -738,7 +731,6 @@ class Arabp : MainAPI() {
                                 foundLink = true
                             } else {
                                 Log.e(TAG, "Failed to convert .torrent to magnet link")
-                                showToast("Magnet conversion failed!")
                             }
                         }
                         is TorrentDownloadResult.DailyLimitExceeded -> {
@@ -751,9 +743,9 @@ class Arabp : MainAPI() {
                             when (retryResult) {
                                 is TorrentDownloadResult.Success -> {
                                     Log.d(TAG, "Retry succeeded! Converting to magnet...")
-                                    val magnet = torrentToMagnet(retryResult.bytes, includeTrackers = true)
+                                    val magnet = torrentToMagnet(retryResult.bytes)
                                     if (magnet != null) {
-                                        showToast("Magnet (retry): ${magnet.take(150)}")
+                                        Log.d(TAG, "Generated magnet: ${magnet.take(150)}...")
                                         callback(
                                             newExtractorLink(
                                                 source = this.name,
@@ -880,19 +872,20 @@ class Arabp : MainAPI() {
     // ==================== TORRENT → MAGNET CONVERSION ====================
     //
     // Converts a .torrent file to a magnet URI link.
-    // This is the same algorithm as fosstorrents.com/t2m/ but done natively:
+    // This matches fosstorrents.com/t2m/ conversion:
     //   1. Bencode-decode the .torrent file
     //   2. Extract the "info" dictionary
     //   3. Re-bencode just the info dict
     //   4. SHA1 hash the bencoded info → this is the info hash
     //   5. Base32-encode the hash → magnet xt parameter
-    //   6. Build magnet URI with xt, dn, xl, and optionally tr parameters
+    //   6. Build magnet URI with xt, dn, xl, and tr.N parameters
     //
-    // By omitting tracker URLs (includeTrackers=false), the torrent client
-    // cannot announce to the tracker, so arabp2p won't count the download.
-    // This requires a debrid service or DHT to find peers.
+    // Tracker URLs are ALWAYS included with BOTH:
+    //   tr.1 = non-passkey announce (e.g. http://www.arabp2p.net:2052/announce)
+    //   tr.2 = passkey announce (e.g. http://www.arabp2p.net:2052/3d365.../announce)
+    // This ensures the torrent client can connect to the tracker AND authenticate.
 
-    private fun torrentToMagnet(torrentBytes: ByteArray, includeTrackers: Boolean = true): String? {
+    private fun torrentToMagnet(torrentBytes: ByteArray): String? {
         return try {
             val (root, _) = decodeBencode(torrentBytes, 0)
             val dict = root as? BencodeValue.BDict ?: return null
@@ -908,14 +901,9 @@ class Arabp : MainAPI() {
 
             // Convert SHA1 hash to Base32 (standard for magnet URIs)
             val infoHashBase32 = base32Encode(sha1)
-            // Also compute hex format (some clients prefer this)
-            val infoHashHex = sha1.joinToString("") { "%02x".format(it) }
 
-            Log.d(TAG, "torrentToMagnet: info_hash_base32=$infoHashBase32")
-            Log.d(TAG, "torrentToMagnet: info_hash_hex=$infoHashHex")
-
-            // Build magnet URI — use hex format for btih (more widely compatible)
-            val magnet = StringBuilder("magnet:?xt=urn:btih:$infoHashHex")
+            // Build magnet URI
+            val magnet = StringBuilder("magnet:?xt=urn:btih:$infoHashBase32")
 
             // Add display name (dn)
             val nameEntry = (infoEntry.second as? BencodeValue.BDict)?.entries?.find { (k, _) ->
@@ -935,40 +923,164 @@ class Arabp : MainAPI() {
                 magnet.append("&xl=$length")
             }
 
-            // Add tracker URLs (tr) — MUST include passkey for the magnet to work
-            if (includeTrackers) {
-                // Single announce URL (contains passkey!)
-                val announceEntry = dict.entries.find { (k, _) ->
-                    k.bytes.contentEquals("announce".toByteArray())
-                }
-                if (announceEntry != null) {
-                    val announceUrl = String((announceEntry.second as BencodeValue.BString).bytes)
-                    Log.d(TAG, "torrentToMagnet: announce=$announceUrl")
-                    magnet.append("&tr=").append(URLEncoder.encode(announceUrl, "UTF-8"))
-                }
+            // === Collect all tracker URLs from the .torrent file ===
+            val trackerUrls = mutableListOf<String>()
 
-                // Announce-list (multiple trackers, may include passkey variants)
-                val announceListEntry = dict.entries.find { (k, _) ->
-                    k.bytes.contentEquals("announce-list".toByteArray())
-                }
-                if (announceListEntry != null) {
-                    val announceList = announceListEntry.second as? BencodeValue.BList
-                    announceList?.items?.forEach { tier ->
-                        val tierList = tier as? BencodeValue.BList
-                        tierList?.items?.forEach { tracker ->
-                            val trackerUrl = String((tracker as BencodeValue.BString).bytes)
-                            Log.d(TAG, "torrentToMagnet: tracker=$trackerUrl")
-                            magnet.append("&tr=").append(URLEncoder.encode(trackerUrl, "UTF-8"))
+            // Single announce URL
+            val announceEntry = dict.entries.find { (k, _) ->
+                k.bytes.contentEquals("announce".toByteArray())
+            }
+            if (announceEntry != null) {
+                trackerUrls.add(String((announceEntry.second as BencodeValue.BString).bytes))
+            }
+
+            // Announce-list (multiple trackers)
+            val announceListEntry = dict.entries.find { (k, _) ->
+                k.bytes.contentEquals("announce-list".toByteArray())
+            }
+            if (announceListEntry != null) {
+                val announceList = announceListEntry.second as? BencodeValue.BList
+                announceList?.items?.forEach { tier ->
+                    val tierList = tier as? BencodeValue.BList
+                    tierList?.items?.forEach { tracker ->
+                        val trackerUrl = String((tracker as BencodeValue.BString).bytes)
+                        if (trackerUrl !in trackerUrls) {
+                            trackerUrls.add(trackerUrl)
                         }
                     }
                 }
             }
 
-            val magnetStr = magnet.toString()
-            Log.d(TAG, "torrentToMagnet: ${if (includeTrackers) "with" else "without"} trackers → ${magnetStr.take(150)}...")
-            magnetStr
+            // === Extract passkey from tracker URLs and cache it ===
+            for (url in trackerUrls) {
+                val match = PASSKEY_REGEX.find(url)
+                if (match != null) {
+                    cachedPasskey = match.groupValues[1]
+                    Log.d(TAG, "torrentToMagnet: extracted passkey from announce URL")
+                    break
+                }
+            }
+
+            // === Build tracker parameters like t2m does ===
+            // Always include BOTH non-passkey and passkey announce URLs:
+            //   tr.1 = http://www.arabp2p.net:2052/announce
+            //   tr.2 = http://www.arabp2p.net:2052/<passkey>/announce
+            var trackerIndex = 1
+            val seenUrls = mutableSetOf<String>()
+
+            for (url in trackerUrls) {
+                if (!url.contains("arabp2p.net")) {
+                    // Non-arabp2p tracker (e.g. public tracker) — add as-is
+                    if (seenUrls.add(url)) {
+                        magnet.append("&tr.$trackerIndex=").append(URLEncoder.encode(url, "UTF-8"))
+                        trackerIndex++
+                    }
+                    continue
+                }
+
+                val passkeyMatch = PASSKEY_REGEX.find(url)
+                if (passkeyMatch != null) {
+                    // URL HAS a passkey (e.g. http://www.arabp2p.net:2052/3d365.../announce)
+                    // Derive the non-passkey version
+                    val pk = passkeyMatch.groupValues[1]
+                    val nonPasskeyUrl = url.replace("/$pk/announce", "/announce")
+
+                    // Add non-passkey first (tr.1)
+                    if (seenUrls.add(nonPasskeyUrl)) {
+                        magnet.append("&tr.$trackerIndex=").append(URLEncoder.encode(nonPasskeyUrl, "UTF-8"))
+                        trackerIndex++
+                    }
+                    // Add passkey version (tr.2)
+                    if (seenUrls.add(url)) {
+                        magnet.append("&tr.$trackerIndex=").append(URLEncoder.encode(url, "UTF-8"))
+                        trackerIndex++
+                    }
+                } else {
+                    // URL does NOT have a passkey (e.g. http://www.arabp2p.net:2052/announce)
+                    // Add it as-is
+                    if (seenUrls.add(url)) {
+                        magnet.append("&tr.$trackerIndex=").append(URLEncoder.encode(url, "UTF-8"))
+                        trackerIndex++
+                    }
+                    // Also add passkey version if we have a cached passkey
+                    val pk = cachedPasskey
+                    if (pk != null) {
+                        val passkeyUrl = url.replace("/announce", "/$pk/announce")
+                        if (seenUrls.add(passkeyUrl)) {
+                            magnet.append("&tr.$trackerIndex=").append(URLEncoder.encode(passkeyUrl, "UTF-8"))
+                            trackerIndex++
+                        }
+                    }
+                }
+            }
+
+            // If no tracker URLs were found in the .torrent file at all,
+            // try to construct them from the cached passkey
+            if (trackerUrls.isEmpty() && cachedPasskey != null) {
+                val nonPasskeyUrl = "http://www.arabp2p.net:2052/announce"
+                val passkeyUrl = "http://www.arabp2p.net:2052/${cachedPasskey}/announce"
+                magnet.append("&tr.$trackerIndex=").append(URLEncoder.encode(nonPasskeyUrl, "UTF-8"))
+                trackerIndex++
+                magnet.append("&tr.$trackerIndex=").append(URLEncoder.encode(passkeyUrl, "UTF-8"))
+                trackerIndex++
+            }
+
+            Log.d(TAG, "torrentToMagnet: → ${magnet.toString().take(120)}...")
+            magnet.toString()
         } catch (e: Exception) {
             Log.e(TAG, "torrentToMagnet error: ${e.message}")
+            null
+        }
+    }
+
+    // ==================== PASSKEY FETCH FROM WEBSITE ====================
+    //
+    // Fallback: if the .torrent file doesn't contain the passkey,
+    // try to extract it from the user's profile page on arabp2p.
+    // The passkey is usually shown in the user control panel or
+    // can be derived from the tracker URL shown on torrent detail pages.
+
+    private fun fetchPasskeyFromWebsite(): String? {
+        if (cachedPasskey != null) return cachedPasskey
+        if (!ensureLogin()) return null
+
+        return try {
+            // Try fetching user profile page to find passkey
+            val profileRequest = Request.Builder()
+                .url("$mainUrl/index.php?page=usercp")
+                .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
+                .build()
+
+            authClient.newCall(profileRequest).execute().use { response ->
+                val body = response.body?.string() ?: return null
+                val doc = Jsoup.parse(body, "$mainUrl/index.php?page=usercp")
+
+                // Look for passkey in the page (usually shown as a 32-char hex string)
+                // Try various selectors where xbtit-based trackers show passkey
+                val passkeyElements = doc.select("td:contains(passkey) + td, td:contains(Passkey) + td, " +
+                    "td:contains(مفتاح) + td, span.passkey, #passkey")
+                for (el in passkeyElements) {
+                    val match = Regex("[0-9a-f]{32}").find(el.text())
+                    if (match != null) {
+                        cachedPasskey = match.groupValues[0]
+                        Log.d(TAG, "fetchPasskeyFromWebsite: found passkey on profile page")
+                        return cachedPasskey
+                    }
+                }
+
+                // Fallback: search entire page for 32-char hex string that looks like a passkey
+                val bodyMatch = Regex("[0-9a-f]{32}").find(body)
+                if (bodyMatch != null) {
+                    cachedPasskey = bodyMatch.groupValues[0]
+                    Log.d(TAG, "fetchPasskeyFromWebsite: found passkey in page body")
+                    return cachedPasskey
+                }
+
+                Log.w(TAG, "fetchPasskeyFromWebsite: passkey not found on profile page")
+                null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchPasskeyFromWebsite error: ${e.message}")
             null
         }
     }
