@@ -898,75 +898,84 @@ class Arabp : MainAPI() {
     }
 
     private fun modifyTorrentAnnounce(torrentBytes: ByteArray, newAnnounceUrl: String): ByteArray {
+        // RAW BYTE REPLACEMENT — no bencode re-encoding!
+        // We find the announce URL in the raw bytes and swap it.
+        // We also remove the announce-list entry if present.
+        // Everything else (including the info dict) stays exactly as-is.
         return try {
             val (root, _) = decodeBencode(torrentBytes, 0)
             val dict = root as? BencodeValue.BDict ?: return torrentBytes
 
-            val infoBytesResult = findInfoDictBytes(torrentBytes) ?: return torrentBytes
+            // Find the real announce URL from parsed dict
+            val announceEntry = dict.entries.find { (k, _) ->
+                k.bytes.contentEquals("announce".toByteArray())
+            } ?: return torrentBytes
+            val oldUrl = String((announceEntry.second as BencodeValue.BString).bytes)
+            val oldUrlBytes = oldUrl.toByteArray(Charsets.ISO_8859_1)
+            val newUrlBytes = newAnnounceUrl.toByteArray(Charsets.ISO_8859_1)
 
-            val output = ByteArrayOutputStream()
-            output.write('d'.code)
+            // Build old and new bencode string entries: "length:url"
+            val oldEntry = "${oldUrlBytes.size}:".toByteArray(Charsets.ISO_8859_1) + oldUrlBytes
+            val newEntry = "${newUrlBytes.size}:".toByteArray(Charsets.ISO_8859_1) + newUrlBytes
 
-            for ((key, value) in dict.entries) {
-                val keyStr = String(key.bytes)
-                when (keyStr) {
-                    "announce" -> {
-                        // Replace announce URL with our proxy
-                        encodeBencodeValue(output, BencodeValue.BString("announce".toByteArray()))
-                        encodeBencodeValue(output, BencodeValue.BString(newAnnounceUrl.toByteArray()))
-                    }
-                    "announce-list" -> {
-                        // Remove announce-list entirely — we only want our proxy as tracker
-                    }
-                    "info" -> {
-                        // Use raw bytes to preserve info hash
-                        encodeBencodeValue(output, BencodeValue.BString("info".toByteArray()))
-                        output.write(infoBytesResult.bytes)
-                    }
-                    else -> {
-                        // Re-encode other entries
-                        encodeBencodeValue(output, key)
-                        encodeBencodeValue(output, value)
-                    }
+            // Find the old announce value in raw bytes (after the "8:announce" key)
+            val announceKey = "8:announce".toByteArray(Charsets.ISO_8859_1)
+            var result = torrentBytes
+
+            val keyIdx = findBytes(result, announceKey)
+            if (keyIdx >= 0) {
+                val valueStart = keyIdx + announceKey.size
+                // Verify the value matches
+                if (valueStart + oldEntry.size <= result.size &&
+                    result.copyOfRange(valueStart, valueStart + oldEntry.size).contentEquals(oldEntry)) {
+                    // Replace: keep bytes before, insert new entry, keep bytes after
+                    val output = ByteArrayOutputStream()
+                    output.write(result, 0, valueStart)
+                    output.write(newEntry)
+                    output.write(result, valueStart + oldEntry.size, result.size - valueStart - oldEntry.size)
+                    result = output.toByteArray()
+                    Log.d(TAG, "Raw byte replace: announce URL swapped (${oldUrlBytes.size} → ${newUrlBytes.size} bytes)")
+                } else {
+                    Log.w(TAG, "Announce value mismatch in raw bytes, skipping modification")
                 }
             }
 
-            output.write('e'.code)
-            output.toByteArray()
+            // Remove announce-list if present (raw byte removal)
+            val announceListKey = "13:announce-list".toByteArray(Charsets.ISO_8859_1)
+            val alIdx = findBytes(result, announceListKey)
+            if (alIdx >= 0) {
+                // Find the end of the announce-list value using the parser
+                val valueStart = alIdx + announceListKey.size
+                val (_, valueEnd) = decodeBencode(result, valueStart)
+                // Remove everything from alIdx to valueEnd
+                val output = ByteArrayOutputStream()
+                output.write(result, 0, alIdx)
+                output.write(result, valueEnd, result.size - valueEnd)
+                result = output.toByteArray()
+                Log.d(TAG, "Raw byte remove: announce-list removed (bytes $alIdx..$valueEnd)")
+            }
+
+            result
         } catch (e: Exception) {
             Log.e(TAG, "modifyTorrentAnnounce error: ${e.message}, serving original .torrent")
             torrentBytes
         }
     }
 
-    private fun encodeBencodeValue(output: ByteArrayOutputStream, value: BencodeValue) {
-        when (value) {
-            is BencodeValue.BString -> {
-                output.write(value.bytes.size.toString().toByteArray(Charsets.ISO_8859_1))
-                output.write(':'.code)
-                output.write(value.bytes)
-            }
-            is BencodeValue.BInt -> {
-                output.write('i'.code)
-                output.write(value.value.toString().toByteArray(Charsets.ISO_8859_1))
-                output.write('e'.code)
-            }
-            is BencodeValue.BList -> {
-                output.write('l'.code)
-                for (item in value.items) {
-                    encodeBencodeValue(output, item)
+    /** Finds the first occurrence of pattern in data, returns index or -1 */
+    private fun findBytes(data: ByteArray, pattern: ByteArray): Int {
+        if (pattern.isEmpty() || pattern.size > data.size) return -1
+        for (i in 0..data.size - pattern.size) {
+            var match = true
+            for (j in pattern.indices) {
+                if (data[i + j] != pattern[j]) {
+                    match = false
+                    break
                 }
-                output.write('e'.code)
             }
-            is BencodeValue.BDict -> {
-                output.write('d'.code)
-                for ((key, val_) in value.entries) {
-                    encodeBencodeValue(output, key)
-                    encodeBencodeValue(output, val_)
-                }
-                output.write('e'.code)
-            }
+            if (match) return i
         }
+        return -1
     }
 
     // ==================== LOAD LINKS ====================
