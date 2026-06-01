@@ -1089,7 +1089,7 @@ class Arabp : MainAPI() {
             if (resolvedDownloadUrl.isNotBlank() && resolvedDownloadUrl.contains("&f=")) {
                 try {
                     val result = downloadTorrentFile(resolvedDownloadUrl)
-                    foundLink = handleTorrentDownloadResult(result, resolvedDownloadUrl, callback) || foundLink
+                    foundLink = handleTorrentDownloadResult(result, resolvedDownloadUrl, torrentId, callback) || foundLink
                 } catch (e: Exception) {
                     Log.e(TAG, "Magnet conversion error: ${e.message}")
                 }
@@ -1109,6 +1109,7 @@ class Arabp : MainAPI() {
     private suspend fun handleTorrentDownloadResult(
         result: TorrentDownloadResult,
         downloadUrl: String,
+        torrentId: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         var foundLink = false
@@ -1133,11 +1134,18 @@ class Arabp : MainAPI() {
                 }
             }
             is TorrentDownloadResult.DailyLimitExceeded -> {
-                Log.w(TAG, "DAILY DOWNLOAD LIMIT EXCEEDED, thanking and retrying...")
+                Log.w(TAG, "DAILY DOWNLOAD LIMIT EXCEEDED, thanking uploader and retrying...")
+                // Thank the uploader first to bypass the daily limit
+                val thanked = thankUploader(torrentId, "")
+                Log.d(TAG, "Thank uploader (daily limit bypass): result = $thanked")
+                if (thanked) {
+                    // Small delay to let the server process the thank
+                    Thread.sleep(500)
+                }
                 val retryResult = downloadTorrentFile(downloadUrl)
                 when (retryResult) {
                     is TorrentDownloadResult.Success -> {
-                        Log.d(TAG, "Retry succeeded!")
+                        Log.d(TAG, "Retry after thank succeeded!")
 
                         val localUrl = startLocalTorrentServer(retryResult.bytes)
                         if (localUrl != null) {
