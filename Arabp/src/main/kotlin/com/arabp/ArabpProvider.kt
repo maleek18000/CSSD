@@ -43,7 +43,7 @@ class Arabp : MainAPI() {
 
         // Set to true to enable tracker proxy (modify .torrent announce URL → local proxy)
         // Set to false to serve original .torrent as-is (more reliable, but tracker counts downloads)
-        private const val ENABLE_TRACKER_PROXY = false
+        private const val ENABLE_TRACKER_PROXY = true
     }
 
     // Cached passkey extracted from .torrent announce URL or website
@@ -746,22 +746,35 @@ class Arabp : MainAPI() {
             val input = socket.getInputStream()
             val output = socket.getOutputStream()
 
-            // Read and discard the HTTP request headers
+            // Read the HTTP request
             val buffer = ByteArray(4096)
-            input.read(buffer)
+            val bytesRead = input.read(buffer)
+            if (bytesRead <= 0) return
 
-            val bytes = servedTorrentBytes
-            if (bytes == null) {
-                val response = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"
-                output.write(response.toByteArray())
+            val requestStr = String(buffer, 0, bytesRead, Charsets.ISO_8859_1)
+            val requestLine = requestStr.substringBefore("\r\n")
+            Log.d(TAG, "Local server request: $requestLine")
+
+            val path = requestLine.split(" ").getOrNull(1) ?: "/"
+
+            if (ENABLE_TRACKER_PROXY && path.startsWith("/announce")) {
+                // Tracker proxy: intercept announce and forward only the first one
+                handleAnnounceProxy(path, output)
             } else {
-                val response = "HTTP/1.1 200 OK\r\n" +
-                        "Content-Type: application/x-bittorrent\r\n" +
-                        "Content-Length: ${bytes.size}\r\n" +
-                        "Connection: close\r\n\r\n"
-                output.write(response.toByteArray())
-                output.write(bytes)
-                Log.d(TAG, "Local server: served .torrent file (${bytes.size} bytes)")
+                // Serve .torrent file
+                val bytes = servedTorrentBytes
+                if (bytes == null) {
+                    val response = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"
+                    output.write(response.toByteArray())
+                } else {
+                    val response = "HTTP/1.1 200 OK\r\n" +
+                            "Content-Type: application/x-bittorrent\r\n" +
+                            "Content-Length: ${bytes.size}\r\n" +
+                            "Connection: close\r\n\r\n"
+                    output.write(response.toByteArray())
+                    output.write(bytes)
+                    Log.d(TAG, "Local server: served .torrent file (${bytes.size} bytes)")
+                }
             }
             output.flush()
         } catch (e: Exception) {
@@ -840,9 +853,9 @@ class Arabp : MainAPI() {
     }
 
     private fun buildEmptyAnnounceResponse(): ByteArray {
-        // Minimal valid bencoded tracker response with empty peer list (compact format)
-        // d8:intervali7200e12:min intervali3600e5:peers0:e
-        return "d8:intervali7200e12:min intervali3600e5:peers0:e".toByteArray(Charsets.ISO_8859_1)
+        // Minimal valid bencoded tracker response with empty peer list
+        // d8:intervali1800e12:min intervali600e5:peers0:e
+        return "d8:intervali1800e12:min intervali600e5:peers0:e".toByteArray(Charsets.ISO_8859_1)
     }
 
     private fun writeHttpResponse(output: OutputStream, body: ByteArray) {
