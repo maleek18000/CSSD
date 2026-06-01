@@ -650,24 +650,35 @@ class Arabp : MainAPI() {
      * Returns the local URL (e.g. http://127.0.0.1:PORT/torrent.torrent) or null on error.
      */
     private fun startLocalTorrentServer(originalTorrentBytes: ByteArray): String? {
+        // Prepare bytes to serve (original or modified depending on proxy setting)
+        val bytesToServe = if (ENABLE_TRACKER_PROXY) {
+            val proxyAnnounce = "http://127.0.0.1:0/announce" // placeholder, updated below
+            val realUrl = extractAnnounceUrl(originalTorrentBytes)
+            if (realUrl != null) {
+                // Will be updated after we know the port
+                originalTorrentBytes // temporary, replaced below
+            } else {
+                originalTorrentBytes
+            }
+        } else {
+            originalTorrentBytes
+        }
+
+        servedTorrentBytes = bytesToServe
         lastServerActivity = System.currentTimeMillis()
 
-        // If server is already running, update bytes and return the URL
+        // If server is already running, just update bytes and return the URL
         if (localServerSocket != null && localServerPort > 0 && localServerThread?.isAlive == true) {
             Log.d(TAG, "Local torrent server: reusing existing server on port $localServerPort")
             if (ENABLE_TRACKER_PROXY) {
                 val proxyAnnounce = "http://127.0.0.1:$localServerPort/announce"
-                realAnnounceUrl = extractAnnounceUrl(originalTorrentBytes)
-                servedTorrentBytes = if (realAnnounceUrl != null) {
+                val realUrl = extractAnnounceUrl(originalTorrentBytes)
+                servedTorrentBytes = if (realUrl != null) {
                     modifyTorrentAnnounce(originalTorrentBytes, proxyAnnounce)
                 } else {
                     originalTorrentBytes
                 }
-                announceProxyForwarded = false
-                cachedAnnounceResponse = null
-            } else {
-                servedTorrentBytes = originalTorrentBytes
-                realAnnounceUrl = null
+                realAnnounceUrl = realUrl
                 announceProxyForwarded = false
                 cachedAnnounceResponse = null
             }
@@ -677,19 +688,14 @@ class Arabp : MainAPI() {
         // Stop any stale server
         stopLocalTorrentServer()
 
-        // Reset proxy state
-        announceProxyForwarded = false
-        cachedAnnounceResponse = null
-        realAnnounceUrl = null
-
         try {
             val socket = ServerSocket(0) // random available port
             socket.reuseAddress = true
-            socket.soTimeout = 5000 // accept() timeout — check for shutdown every 5s
+            socket.soTimeout = 5000 // accept() timeout
             localServerSocket = socket
             localServerPort = socket.localPort
 
-            // Decide: serve modified or original .torrent
+            // Now that we know the port, update bytes if tracker proxy is enabled
             if (ENABLE_TRACKER_PROXY) {
                 val proxyAnnounce = "http://127.0.0.1:$localServerPort/announce"
                 realAnnounceUrl = extractAnnounceUrl(originalTorrentBytes)
@@ -701,15 +707,12 @@ class Arabp : MainAPI() {
                     originalTorrentBytes
                 }
             } else {
-                // Serve original .torrent as-is — CS announces directly to the real tracker
-                servedTorrentBytes = originalTorrentBytes
                 Log.d(TAG, "Tracker proxy disabled, serving original .torrent (${originalTorrentBytes.size} bytes)")
             }
 
             localServerThread = Thread({
                 try {
                     while (!Thread.currentThread().isInterrupted) {
-                        // Auto-stop after 90 seconds of inactivity
                         if (System.currentTimeMillis() - lastServerActivity > 90_000) {
                             Log.d(TAG, "Local torrent server: shutting down after 90s inactivity")
                             break
@@ -719,7 +722,6 @@ class Arabp : MainAPI() {
                             lastServerActivity = System.currentTimeMillis()
                             handleLocalServerRequest(client)
                         } catch (_: java.net.SocketTimeoutException) {
-                            // Normal — loop back and check inactivity / interrupt
                             continue
                         }
                     }
@@ -744,38 +746,22 @@ class Arabp : MainAPI() {
             val input = socket.getInputStream()
             val output = socket.getOutputStream()
 
-            // Read the HTTP request
-            val buffer = ByteArray(8192)
-            val bytesRead = input.read(buffer)
-            if (bytesRead <= 0) return
+            // Read and discard the HTTP request headers
+            val buffer = ByteArray(4096)
+            input.read(buffer)
 
-            val requestStr = String(buffer, 0, bytesRead, Charsets.ISO_8859_1)
-            val requestLine = requestStr.substringBefore("\r\n")
-            Log.d(TAG, "Local server request: $requestLine")
-
-            // Parse path from request line: "GET /path HTTP/1.1"
-            val path = requestLine.split(" ").getOrNull(1) ?: "/"
-
-            when {
-                path.startsWith("/announce") -> {
-                    handleAnnounceProxy(path, output)
-                }
-                else -> {
-                    // Serve .torrent file
-                    val bytes = servedTorrentBytes
-                    if (bytes == null) {
-                        val response = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"
-                        output.write(response.toByteArray())
-                    } else {
-                        val response = "HTTP/1.1 200 OK\r\n" +
-                                "Content-Type: application/x-bittorrent\r\n" +
-                                "Content-Length: ${bytes.size}\r\n" +
-                                "Connection: close\r\n\r\n"
-                        output.write(response.toByteArray())
-                        output.write(bytes)
-                        Log.d(TAG, "Local server: served .torrent file (${bytes.size} bytes)")
-                    }
-                }
+            val bytes = servedTorrentBytes
+            if (bytes == null) {
+                val response = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"
+                output.write(response.toByteArray())
+            } else {
+                val response = "HTTP/1.1 200 OK\r\n" +
+                        "Content-Type: application/x-bittorrent\r\n" +
+                        "Content-Length: ${bytes.size}\r\n" +
+                        "Connection: close\r\n\r\n"
+                output.write(response.toByteArray())
+                output.write(bytes)
+                Log.d(TAG, "Local server: served .torrent file (${bytes.size} bytes)")
             }
             output.flush()
         } catch (e: Exception) {
