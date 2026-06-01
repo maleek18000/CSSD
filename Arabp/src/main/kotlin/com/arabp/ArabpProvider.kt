@@ -20,6 +20,8 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.URI
 import java.net.URLEncoder
+import java.io.ByteArrayOutputStream
+import java.io.OutputStream
 import java.util.concurrent.TimeUnit
 
 class Arabp : MainAPI() {
@@ -625,22 +627,49 @@ class Arabp : MainAPI() {
     @Volatile
     private var lastServerActivity: Long = 0
 
+    // Tracker proxy state: intercepts announce requests from CS's torrent engine
+    // and only forwards the FIRST one to the real tracker. All subsequent
+    // announces get a minimal empty-peers response, so the real tracker
+    // never sees download progress.
+    @Volatile
+    private var realAnnounceUrl: String? = null
+    @Volatile
+    private var announceProxyForwarded = false
+    @Volatile
+    private var cachedAnnounceResponse: ByteArray? = null
+
     /**
-     * Starts (or reuses) a local HTTP server that serves the given .torrent bytes.
+     * Starts (or reuses) a local HTTP server that:
+     * 1. Serves a MODIFIED .torrent file (announce URL → our /announce proxy)
+     * 2. Acts as tracker proxy: forwards only FIRST announce to real tracker,
+     *    then returns empty/cached responses for all subsequent announces.
      * Returns the local URL (e.g. http://127.0.0.1:PORT/torrent.torrent) or null on error.
      */
-    private fun startLocalTorrentServer(bytes: ByteArray): String? {
-        servedTorrentBytes = bytes
+    private fun startLocalTorrentServer(originalTorrentBytes: ByteArray): String? {
         lastServerActivity = System.currentTimeMillis()
 
-        // If server is already running, just update bytes and return the URL
+        // If server is already running, update bytes and proxy state, return the URL
         if (localServerSocket != null && localServerPort > 0 && localServerThread?.isAlive == true) {
             Log.d(TAG, "Local torrent server: reusing existing server on port $localServerPort")
+            val proxyAnnounce = "http://127.0.0.1:$localServerPort/announce"
+            realAnnounceUrl = extractAnnounceUrl(originalTorrentBytes)
+            servedTorrentBytes = if (realAnnounceUrl != null) {
+                modifyTorrentAnnounce(originalTorrentBytes, proxyAnnounce)
+            } else {
+                originalTorrentBytes
+            }
+            announceProxyForwarded = false
+            cachedAnnounceResponse = null
             return "http://127.0.0.1:$localServerPort/torrent.torrent"
         }
 
         // Stop any stale server
         stopLocalTorrentServer()
+
+        // Reset proxy state
+        announceProxyForwarded = false
+        cachedAnnounceResponse = null
+        realAnnounceUrl = null
 
         try {
             val socket = ServerSocket(0) // random available port
@@ -648,6 +677,17 @@ class Arabp : MainAPI() {
             socket.soTimeout = 5000 // accept() timeout — check for shutdown every 5s
             localServerSocket = socket
             localServerPort = socket.localPort
+
+            // Now that we know the port, modify .torrent and extract real announce URL
+            val proxyAnnounce = "http://127.0.0.1:$localServerPort/announce"
+            realAnnounceUrl = extractAnnounceUrl(originalTorrentBytes)
+            servedTorrentBytes = if (realAnnounceUrl != null) {
+                Log.d(TAG, "Tracker proxy: real announce = $realAnnounceUrl, replacing with $proxyAnnounce")
+                modifyTorrentAnnounce(originalTorrentBytes, proxyAnnounce)
+            } else {
+                Log.d(TAG, "No arabp2p tracker found in .torrent, serving unmodified")
+                originalTorrentBytes
+            }
 
             localServerThread = Thread({
                 try {
@@ -687,22 +727,38 @@ class Arabp : MainAPI() {
             val input = socket.getInputStream()
             val output = socket.getOutputStream()
 
-            // Read and discard the HTTP request headers
-            val buffer = ByteArray(4096)
-            input.read(buffer)
+            // Read the HTTP request
+            val buffer = ByteArray(8192)
+            val bytesRead = input.read(buffer)
+            if (bytesRead <= 0) return
 
-            val bytes = servedTorrentBytes
-            if (bytes == null) {
-                val response = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"
-                output.write(response.toByteArray())
-            } else {
-                val response = "HTTP/1.1 200 OK\r\n" +
-                        "Content-Type: application/x-bittorrent\r\n" +
-                        "Content-Length: ${bytes.size}\r\n" +
-                        "Connection: close\r\n\r\n"
-                output.write(response.toByteArray())
-                output.write(bytes)
-                Log.d(TAG, "Local server: served .torrent file (${bytes.size} bytes)")
+            val requestStr = String(buffer, 0, bytesRead, Charsets.ISO_8859_1)
+            val requestLine = requestStr.substringBefore("\r\n")
+            Log.d(TAG, "Local server request: $requestLine")
+
+            // Parse path from request line: "GET /path HTTP/1.1"
+            val path = requestLine.split(" ").getOrNull(1) ?: "/"
+
+            when {
+                path.startsWith("/announce") -> {
+                    handleAnnounceProxy(path, output)
+                }
+                else -> {
+                    // Serve .torrent file
+                    val bytes = servedTorrentBytes
+                    if (bytes == null) {
+                        val response = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"
+                        output.write(response.toByteArray())
+                    } else {
+                        val response = "HTTP/1.1 200 OK\r\n" +
+                                "Content-Type: application/x-bittorrent\r\n" +
+                                "Content-Length: ${bytes.size}\r\n" +
+                                "Connection: close\r\n\r\n"
+                        output.write(response.toByteArray())
+                        output.write(bytes)
+                        Log.d(TAG, "Local server: served .torrent file (${bytes.size} bytes)")
+                    }
+                }
             }
             output.flush()
         } catch (e: Exception) {
@@ -718,24 +774,215 @@ class Arabp : MainAPI() {
         localServerSocket = null
         localServerPort = 0
         localServerThread = null
+        realAnnounceUrl = null
+        announceProxyForwarded = false
+        cachedAnnounceResponse = null
+    }
+
+    // ==================== TRACKER ANNOUNCE PROXY ====================
+    //
+    // Intercepts announce requests from CS's torrent engine.
+    // Only the FIRST announce is forwarded to the real arabp2p tracker.
+    // All subsequent announces get an empty-peers response.
+    // This way the real tracker only ever sees ONE announce (event=started, downloaded=0)
+    // and never tracks download progress.
+
+    private fun handleAnnounceProxy(path: String, output: OutputStream) {
+        val announceUrl = realAnnounceUrl
+
+        if (announceUrl == null) {
+            // No real tracker to proxy to, return empty response
+            writeHttpResponse(output, buildEmptyAnnounceResponse())
+            return
+        }
+
+        if (!announceProxyForwarded) {
+            // Haven't successfully forwarded yet — try to forward to real tracker
+            try {
+                val queryString = if (path.contains("?")) path.substringAfter("?") else ""
+                val fullUrl = if (queryString.isNotEmpty()) "$announceUrl?$queryString" else announceUrl
+
+                Log.d(TAG, "Tracker proxy: forwarding FIRST announce to real tracker")
+
+                val request = Request.Builder()
+                    .url(fullUrl)
+                    .header("User-Agent", "Transmission/3.00")
+                    .build()
+
+                authClient.newCall(request).execute().use { response ->
+                    val bodyBytes = response.body?.bytes()
+                    if (bodyBytes != null && response.isSuccessful) {
+                        cachedAnnounceResponse = bodyBytes
+                        announceProxyForwarded = true
+                        Log.d(TAG, "Tracker proxy: got response from real tracker (${bodyBytes.size} bytes)")
+                        writeHttpResponse(output, bodyBytes)
+                        return
+                    } else {
+                        Log.w(TAG, "Tracker proxy: real tracker returned HTTP ${response.code}")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Tracker proxy: error forwarding announce: ${e.message}")
+            }
+            // Forwarding failed — return empty response but DON'T mark as forwarded
+            // so next announce will try again
+            writeHttpResponse(output, buildEmptyAnnounceResponse())
+            return
+        }
+
+        // Already forwarded successfully — return cached/empty response
+        val response = cachedAnnounceResponse ?: buildEmptyAnnounceResponse()
+        writeHttpResponse(output, response)
+        Log.d(TAG, "Tracker proxy: returning cached/empty response (not forwarding to real tracker)")
+    }
+
+    private fun buildEmptyAnnounceResponse(): ByteArray {
+        // Minimal valid bencoded tracker response with empty peer list (compact format)
+        // d8:intervali7200e12:min intervali3600e5:peers0:e
+        return "d8:intervali7200e12:min intervali3600e5:peers0:e".toByteArray(Charsets.ISO_8859_1)
+    }
+
+    private fun writeHttpResponse(output: OutputStream, body: ByteArray) {
+        val header = "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: text/plain\r\n" +
+                "Content-Length: ${body.size}\r\n" +
+                "Connection: close\r\n\r\n"
+        output.write(header.toByteArray(Charsets.ISO_8859_1))
+        output.write(body)
+    }
+
+    // ==================== TORRENT MODIFICATION ====================
+    //
+    // Extracts the real announce URL from a .torrent file and modifies it
+    // to point to our local tracker proxy. The info dict bytes are preserved
+    // exactly to ensure the info hash stays the same.
+
+    private fun extractAnnounceUrl(torrentBytes: ByteArray): String? {
+        return try {
+            val (root, _) = decodeBencode(torrentBytes, 0)
+            val dict = root as? BencodeValue.BDict ?: return null
+
+            // Look for announce URL with arabp2p passkey
+            val announceEntry = dict.entries.find { (k, _) ->
+                k.bytes.contentEquals("announce".toByteArray())
+            }
+            if (announceEntry != null) {
+                val url = String((announceEntry.second as BencodeValue.BString).bytes)
+                if (url.contains("arabp2p.net") || PASSKEY_REGEX.containsMatchIn(url)) {
+                    return url
+                }
+            }
+
+            // Check announce-list for passkey URLs
+            val announceListEntry = dict.entries.find { (k, _) ->
+                k.bytes.contentEquals("announce-list".toByteArray())
+            }
+            if (announceListEntry != null) {
+                val announceList = announceListEntry.second as? BencodeValue.BList
+                announceList?.items?.forEach { tier ->
+                    val tierList = tier as? BencodeValue.BList
+                    tierList?.items?.forEach { tracker ->
+                        val url = String((tracker as BencodeValue.BString).bytes)
+                        if (url.contains("arabp2p.net") || PASSKEY_REGEX.containsMatchIn(url)) {
+                            return url
+                        }
+                    }
+                }
+            }
+
+            null
+        } catch (e: Exception) {
+            Log.e(TAG, "extractAnnounceUrl error: ${e.message}")
+            null
+        }
+    }
+
+    private fun modifyTorrentAnnounce(torrentBytes: ByteArray, newAnnounceUrl: String): ByteArray {
+        return try {
+            val (root, _) = decodeBencode(torrentBytes, 0)
+            val dict = root as? BencodeValue.BDict ?: return torrentBytes
+
+            val infoBytesResult = findInfoDictBytes(torrentBytes) ?: return torrentBytes
+
+            val output = ByteArrayOutputStream()
+            output.write('d'.code)
+
+            for ((key, value) in dict.entries) {
+                val keyStr = String(key.bytes)
+                when (keyStr) {
+                    "announce" -> {
+                        // Replace announce URL with our proxy
+                        encodeBencodeValue(output, BencodeValue.BString("announce".toByteArray()))
+                        encodeBencodeValue(output, BencodeValue.BString(newAnnounceUrl.toByteArray()))
+                    }
+                    "announce-list" -> {
+                        // Remove announce-list entirely — we only want our proxy as tracker
+                    }
+                    "info" -> {
+                        // Use raw bytes to preserve info hash
+                        encodeBencodeValue(output, BencodeValue.BString("info".toByteArray()))
+                        output.write(infoBytesResult.bytes)
+                    }
+                    else -> {
+                        // Re-encode other entries
+                        encodeBencodeValue(output, key)
+                        encodeBencodeValue(output, value)
+                    }
+                }
+            }
+
+            output.write('e'.code)
+            output.toByteArray()
+        } catch (e: Exception) {
+            Log.e(TAG, "modifyTorrentAnnounce error: ${e.message}, serving original .torrent")
+            torrentBytes
+        }
+    }
+
+    private fun encodeBencodeValue(output: ByteArrayOutputStream, value: BencodeValue) {
+        when (value) {
+            is BencodeValue.BString -> {
+                output.write(value.bytes.size.toString().toByteArray(Charsets.ISO_8859_1))
+                output.write(':'.code)
+                output.write(value.bytes)
+            }
+            is BencodeValue.BInt -> {
+                output.write('i'.code)
+                output.write(value.value.toString().toByteArray(Charsets.ISO_8859_1))
+                output.write('e'.code)
+            }
+            is BencodeValue.BList -> {
+                output.write('l'.code)
+                for (item in value.items) {
+                    encodeBencodeValue(output, item)
+                }
+                output.write('e'.code)
+            }
+            is BencodeValue.BDict -> {
+                output.write('d'.code)
+                for ((key, val_) in value.entries) {
+                    encodeBencodeValue(output, key)
+                    encodeBencodeValue(output, val_)
+                }
+                output.write('e'.code)
+            }
+        }
     }
 
     // ==================== LOAD LINKS ====================
     //
-    // Downloads the .torrent file with auth → serves it via local HTTP server → returns sources.
+    // Downloads the .torrent file with auth → modifies announce URL to use our proxy →
+    // serves via local HTTP server → returns source.
     //
-    // IMPORTANT: CloudStream3's built-in torrent player uses a local Go server
-    // (anacrolix/torrent) that fetches .torrent files via HTTP. It does NOT forward
-    // the ExtractorLink headers — they are discarded. So private tracker .torrent
-    // URLs requiring authentication will always fail with CS3's built-in player.
+    // The local server also acts as a TRACKER PROXY:
+    // - The .torrent file is modified to point to our local /announce endpoint
+    // - CS's torrent engine announces to our proxy instead of the real tracker
+    // - The proxy forwards ONLY the first announce to the real tracker (to get peers)
+    // - All subsequent announces get an empty-peers response
+    // - Result: the real tracker only sees one announce (downloaded=0), never tracks progress
     //
-    // Solution: We download the .torrent file ourselves (with auth cookies), then
-    // serve it from a local HTTP server on 127.0.0.1. CS3's Go server fetches from
-    // localhost without needing auth.
-    //
-    // Only ONE source is returned (the .torrent file served via local HTTP server)
-    // so CloudStream auto-selects it and the built-in torrent player shows the
-    // file picker for multi-file torrents (episode selection within the torrent).
+    // Only ONE source is returned (the .torrent) so CloudStream auto-selects it
+    // and shows the file picker for multi-file torrents.
 
     override suspend fun loadLinks(
         data: String,
@@ -759,14 +1006,23 @@ class Arabp : MainAPI() {
                 return false
             }
 
-            // Try to fetch passkey from website as fallback (before we need it)
-            if (cachedPasskey == null) {
-                fetchPasskeyFromWebsite()
-            }
-
             var foundLink = false
 
-            // === DOWNLOAD .torrent → serve via local server ===
+            // === EXTERNAL TORRENTS: pass magnet link directly ===
+            if (isExternal && magnetUrl.startsWith("magnet:")) {
+                Log.d(TAG, "External torrent — passing magnet link")
+                callback(
+                    newExtractorLink(
+                        source = this.name,
+                        name = "${this.name} (Magnet)",
+                        url = magnetUrl,
+                        type = ExtractorLinkType.MAGNET
+                    )
+                )
+                return true
+            }
+
+            // === INTERNAL TORRENTS: download .torrent → serve via local server ===
             var resolvedDownloadUrl = downloadUrl
 
             // Step 1: Resolve download URL with &f= parameter
@@ -789,10 +1045,6 @@ class Arabp : MainAPI() {
                         if (dlLink != null) {
                             resolvedDownloadUrl = toAbsoluteUrl(dlLink.attr("href"))
                         }
-
-                        // Note: We skip the detail page magnet link here because
-                        // handleTorrentDownloadResult() will generate a proper magnet
-                        // from the actual .torrent file (with correct passkey trackers).
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to fetch detail page: ${e.message}")
@@ -807,7 +1059,7 @@ class Arabp : MainAPI() {
                 Log.d(TAG, "loadLinks: thank uploader result = $thanked for torrent $torrentId")
             }
 
-            // Step 2: Download .torrent → serve via local server + generate magnet
+            // Step 2: Download .torrent → serve via local server
             if (resolvedDownloadUrl.isNotBlank() && resolvedDownloadUrl.contains("&f=")) {
                 try {
                     val result = downloadTorrentFile(resolvedDownloadUrl)
@@ -826,8 +1078,6 @@ class Arabp : MainAPI() {
 
     /**
      * Processes a TorrentDownloadResult: serves .torrent via local server.
-     * Only returns ONE source so CS auto-selects it and shows the torrent
-     * file picker for multi-file torrents (episode selection within the torrent).
      * Returns true if a source was added.
      */
     private suspend fun handleTorrentDownloadResult(
@@ -841,8 +1091,7 @@ class Arabp : MainAPI() {
             is TorrentDownloadResult.Success -> {
                 Log.d(TAG, "Downloaded .torrent: ${result.bytes.size} bytes")
 
-                // Serve .torrent via local HTTP server — CS3's Go torrent server
-                // fetches from localhost, then shows the file picker for multi-file torrents
+                // Serve .torrent via local HTTP server (with original tracker intact)
                 val localUrl = startLocalTorrentServer(result.bytes)
                 if (localUrl != null) {
                     Log.d(TAG, "Serving .torrent via local server: $localUrl")
@@ -855,12 +1104,6 @@ class Arabp : MainAPI() {
                         )
                     )
                     foundLink = true
-                }
-
-                // Cache the magnet for potential external use (not shown as source)
-                val magnet = torrentToMagnet(result.bytes)
-                if (magnet != null) {
-                    Log.d(TAG, "Generated magnet (cached): ${magnet.take(150)}...")
                 }
             }
             is TorrentDownloadResult.DailyLimitExceeded -> {
