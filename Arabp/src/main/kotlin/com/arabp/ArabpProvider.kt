@@ -40,6 +40,10 @@ class Arabp : MainAPI() {
 
         // Base32 alphabet for magnet info hash encoding
         private const val BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+        // Set to true to enable tracker proxy (modify .torrent announce URL → local proxy)
+        // Set to false to serve original .torrent as-is (more reliable, but tracker counts downloads)
+        private const val ENABLE_TRACKER_PROXY = true
     }
 
     // Cached passkey extracted from .torrent announce URL or website
@@ -648,18 +652,25 @@ class Arabp : MainAPI() {
     private fun startLocalTorrentServer(originalTorrentBytes: ByteArray): String? {
         lastServerActivity = System.currentTimeMillis()
 
-        // If server is already running, update bytes and proxy state, return the URL
+        // If server is already running, update bytes and return the URL
         if (localServerSocket != null && localServerPort > 0 && localServerThread?.isAlive == true) {
             Log.d(TAG, "Local torrent server: reusing existing server on port $localServerPort")
-            val proxyAnnounce = "http://127.0.0.1:$localServerPort/announce"
-            realAnnounceUrl = extractAnnounceUrl(originalTorrentBytes)
-            servedTorrentBytes = if (realAnnounceUrl != null) {
-                modifyTorrentAnnounce(originalTorrentBytes, proxyAnnounce)
+            if (ENABLE_TRACKER_PROXY) {
+                val proxyAnnounce = "http://127.0.0.1:$localServerPort/announce"
+                realAnnounceUrl = extractAnnounceUrl(originalTorrentBytes)
+                servedTorrentBytes = if (realAnnounceUrl != null) {
+                    modifyTorrentAnnounce(originalTorrentBytes, proxyAnnounce)
+                } else {
+                    originalTorrentBytes
+                }
+                announceProxyForwarded = false
+                cachedAnnounceResponse = null
             } else {
-                originalTorrentBytes
+                servedTorrentBytes = originalTorrentBytes
+                realAnnounceUrl = null
+                announceProxyForwarded = false
+                cachedAnnounceResponse = null
             }
-            announceProxyForwarded = false
-            cachedAnnounceResponse = null
             return "http://127.0.0.1:$localServerPort/torrent.torrent"
         }
 
@@ -678,15 +689,21 @@ class Arabp : MainAPI() {
             localServerSocket = socket
             localServerPort = socket.localPort
 
-            // Now that we know the port, modify .torrent and extract real announce URL
-            val proxyAnnounce = "http://127.0.0.1:$localServerPort/announce"
-            realAnnounceUrl = extractAnnounceUrl(originalTorrentBytes)
-            servedTorrentBytes = if (realAnnounceUrl != null) {
-                Log.d(TAG, "Tracker proxy: real announce = $realAnnounceUrl, replacing with $proxyAnnounce")
-                modifyTorrentAnnounce(originalTorrentBytes, proxyAnnounce)
+            // Decide: serve modified or original .torrent
+            if (ENABLE_TRACKER_PROXY) {
+                val proxyAnnounce = "http://127.0.0.1:$localServerPort/announce"
+                realAnnounceUrl = extractAnnounceUrl(originalTorrentBytes)
+                servedTorrentBytes = if (realAnnounceUrl != null) {
+                    Log.d(TAG, "Tracker proxy: real announce = $realAnnounceUrl, replacing with $proxyAnnounce")
+                    modifyTorrentAnnounce(originalTorrentBytes, proxyAnnounce)
+                } else {
+                    Log.d(TAG, "No arabp2p tracker found in .torrent, serving unmodified")
+                    originalTorrentBytes
+                }
             } else {
-                Log.d(TAG, "No arabp2p tracker found in .torrent, serving unmodified")
-                originalTorrentBytes
+                // Serve original .torrent as-is — CS announces directly to the real tracker
+                servedTorrentBytes = originalTorrentBytes
+                Log.d(TAG, "Tracker proxy disabled, serving original .torrent (${originalTorrentBytes.size} bytes)")
             }
 
             localServerThread = Thread({
