@@ -43,7 +43,7 @@ class Arabp : MainAPI() {
 
         // Set to true to enable tracker proxy (modify .torrent announce URL → local proxy)
         // Set to false to serve original .torrent as-is (more reliable, but tracker counts downloads)
-        private const val ENABLE_TRACKER_PROXY = true
+        private const val ENABLE_TRACKER_PROXY = false
     }
 
     // Cached passkey extracted from .torrent announce URL or website
@@ -1047,7 +1047,21 @@ class Arabp : MainAPI() {
                 return true
             }
 
-            // === INTERNAL TORRENTS: download .torrent → serve via local server ===
+            // === INTERNAL TORRENTS ===
+            // We offer 2 source options:
+            // 1. "Torrent" — CS player with .torrent file (tracker counts download)
+            // 2. "Magnet/DHT" — CS player with magnet link (DHT may bypass tracker counting)
+
+            // Step 0: Prepare magnet link (needed for source 2)
+            var generatedMagnet: String? = null
+
+            // First, try using the page's magnet link if available
+            if (magnetUrl.startsWith("magnet:")) {
+                generatedMagnet = magnetUrl
+                Log.d(TAG, "Using page magnet link")
+            }
+
+            // === SOURCE 1: Torrent file via CS player (tracker counts download) ===
             var resolvedDownloadUrl = downloadUrl
 
             // Step 1: Resolve download URL with &f= parameter
@@ -1070,6 +1084,15 @@ class Arabp : MainAPI() {
                         if (dlLink != null) {
                             resolvedDownloadUrl = toAbsoluteUrl(dlLink.attr("href"))
                         }
+
+                        // Also grab magnet link from detail page if we don't have one yet
+                        if (generatedMagnet == null) {
+                            val magnetLink = detailDoc.selectFirst("a[href^=magnet:]")?.attr("href")
+                            if (magnetLink != null) {
+                                generatedMagnet = magnetLink
+                                Log.d(TAG, "Found magnet link on detail page")
+                            }
+                        }
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to fetch detail page: ${e.message}")
@@ -1084,14 +1107,39 @@ class Arabp : MainAPI() {
                 Log.d(TAG, "loadLinks: thank uploader result = $thanked for torrent $torrentId")
             }
 
-            // Step 2: Download .torrent → serve via local server
+            // Step 2: Download .torrent → serve via local server → SOURCE 1
             if (resolvedDownloadUrl.isNotBlank() && resolvedDownloadUrl.contains("&f=")) {
                 try {
                     val result = downloadTorrentFile(resolvedDownloadUrl)
                     foundLink = handleTorrentDownloadResult(result, resolvedDownloadUrl, torrentId, callback) || foundLink
+
+                    // Generate magnet from downloaded .torrent if we still don't have one
+                    if (generatedMagnet == null && result is TorrentDownloadResult.Success) {
+                        generatedMagnet = torrentToMagnet(result.bytes)
+                    }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Magnet conversion error: ${e.message}")
+                    Log.e(TAG, "Torrent download error: ${e.message}")
                 }
+            }
+
+            // === SOURCE 2: Magnet link via CS player (DHT may bypass tracker) ===
+            // When CS processes a magnet link, the BitTorrent spec says the
+            // private=1 flag (embedded in metadata) should disable DHT.
+            // However, some torrent engines (like Webbie) ignore this flag
+            // and keep DHT enabled, which prevents the tracker from counting
+            // the download. We add this source so you can test if CS's engine
+            // behaves the same way.
+            if (generatedMagnet != null) {
+                Log.d(TAG, "Adding magnet source (DHT)")
+                callback(
+                    newExtractorLink(
+                        source = "${this.name} DHT",
+                        name = "${this.name} (Magnet/DHT)",
+                        url = generatedMagnet,
+                        type = ExtractorLinkType.MAGNET
+                    )
+                )
+                foundLink = true
             }
 
             foundLink
