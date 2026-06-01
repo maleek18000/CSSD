@@ -43,7 +43,7 @@ class Arabp : MainAPI() {
 
         // Set to true to enable tracker proxy (modify .torrent announce URL → local proxy)
         // Set to false to serve original .torrent as-is (more reliable, but tracker counts downloads)
-        private const val ENABLE_TRACKER_PROXY = true
+        private const val ENABLE_TRACKER_PROXY = false
     }
 
     // Cached passkey extracted from .torrent announce URL or website
@@ -1136,12 +1136,7 @@ class Arabp : MainAPI() {
             is TorrentDownloadResult.DailyLimitExceeded -> {
                 Log.w(TAG, "DAILY DOWNLOAD LIMIT EXCEEDED, thanking uploader and retrying...")
                 // Thank the uploader first to bypass the daily limit
-                val thanked = thankUploader(torrentId, "")
-                Log.d(TAG, "Thank uploader (daily limit bypass): result = $thanked")
-                if (thanked) {
-                    // Small delay to let the server process the thank
-                    Thread.sleep(500)
-                }
+                thankUploader(torrentId, "")
                 val retryResult = downloadTorrentFile(downloadUrl)
                 when (retryResult) {
                     is TorrentDownloadResult.Success -> {
