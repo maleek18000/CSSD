@@ -44,12 +44,6 @@ class Arabp : MainAPI() {
         // Set to true to enable tracker proxy (modify .torrent announce URL → local proxy)
         // Set to false to serve original .torrent as-is (more reliable, but tracker counts downloads)
         private const val ENABLE_TRACKER_PROXY = false
-
-        // Set to true to detect multi-show torrents (containing multiple show folders)
-        // and display each show as a separate episode.
-        // This downloads .torrent files during loadFromTorrentData() to parse their file list.
-        // Set to false to always show each torrent as a single episode.
-        private const val ENABLE_MULTI_SHOW_EXPANSION = true
     }
 
     // Cached passkey extracted from .torrent announce URL or website
@@ -63,9 +57,6 @@ class Arabp : MainAPI() {
 
     // File info from a parsed .torrent
     private data class TorrentFileInfo(val path: String, val length: Long)
-
-    // Show group within a multi-show torrent
-    private data class ShowGroup(val showName: String, val files: List<TorrentFileInfo>)
 
     // Images require Referer header to avoid 403
     private val imageHeaders = mapOf(
@@ -541,7 +532,7 @@ class Arabp : MainAPI() {
                 val epName = cleanTitleText(nameLink.text())
                 val detailHref = nameLink.attr("href")
                 val torrentId = DIGITS.find(detailHref.substringAfter("id="))?.value ?: continue
-                var downloadHref = row.selectFirst("a[href*=download.php]")?.attr("href") ?: ""
+                val downloadHref = row.selectFirst("a[href*=download.php]")?.attr("href") ?: ""
                 val magnetHref = row.selectFirst("a[href^=magnet:]")?.attr("href") ?: ""
                 val isFree = isFreeTorrent(row)
                 val isExternal = isExternalTorrent(row)
@@ -557,66 +548,16 @@ class Arabp : MainAPI() {
                     if (seeders.isNotEmpty()) append(" | ▲$seeders")
                 }
 
-                // Try multi-show detection for this torrent
-                var expandedShows: List<ShowGroup>? = null
-                if (ENABLE_MULTI_SHOW_EXPANSION && !isExternal) {
-                    var absDownloadUrl = toAbsoluteUrl(downloadHref)
-
-                    // If listing row doesn't have a download link, try to resolve from detail page
-                    if (absDownloadUrl.isBlank() || !absDownloadUrl.contains("&f=")) {
-                        val resolved = resolveDownloadUrl(torrentId, toAbsoluteUrl(detailHref))
-                        if (resolved != null && resolved.contains("&f=")) {
-                            absDownloadUrl = resolved
-                            downloadHref = resolved  // Update for epData
-                        }
-                    }
-
-                    if (absDownloadUrl.contains("&f=")) {
-                        try {
-                            val files = tryParseTorrentFiles(torrentId, absDownloadUrl, isFree)
-                            if (files != null) {
-                                val groups = computeShowGroups(files)
-                                if (groups.size > 1) {
-                                    expandedShows = groups
-                                    Log.d(TAG, "Multi-show torrent detected in load(): ${groups.size} shows in torrent $torrentId")
-                                }
-                            }
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Multi-show detection failed for torrent $torrentId in load(): ${e.message}")
-                        }
-                    }
-                }
-
                 val epData = "$torrentId|${toAbsoluteUrl(detailHref)}|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
-
-                if (expandedShows != null) {
-                    // Multi-show torrent: create one episode per show within this season
-                    seasonNamesList.add(SeasonData(season = globalSeasonNum, name = displayName))
-                    var epNum = 1
-                    for (group in expandedShows) {
-                        val episodeName = "${group.showName} (${group.files.size} ملفات)"
-                        episodes.add(
-                            newEpisode(epData, fix = false, initializer = {
-                                name = episodeName
-                                season = globalSeasonNum
-                                episode = epNum
-                                this.posterUrl = absPosterUrl
-                            })
-                        )
-                        epNum++
-                    }
-                } else {
-                    // Single-show torrent: one episode per season
-                    seasonNamesList.add(SeasonData(season = globalSeasonNum, name = displayName))
-                    episodes.add(
-                        newEpisode(epData, fix = false, initializer = {
-                            name = displayName
-                            season = globalSeasonNum
-                            episode = 1
-                            this.posterUrl = absPosterUrl
-                        })
-                    )
-                }
+                seasonNamesList.add(SeasonData(season = globalSeasonNum, name = displayName))
+                episodes.add(
+                    newEpisode(epData, fix = false, initializer = {
+                        name = displayName
+                        season = globalSeasonNum
+                        episode = 1
+                        this.posterUrl = absPosterUrl
+                    })
+                )
                 globalSeasonNum++
             }
 
@@ -688,58 +629,7 @@ class Arabp : MainAPI() {
             }
         }
 
-        // Try to detect multi-show torrent by downloading and parsing the .torrent file
-        var absDownloadUrl = toAbsoluteUrl(downloadUrl)
-        if (ENABLE_MULTI_SHOW_EXPANSION && !isExternal) {
-            // If download URL is missing &f= parameter, try to resolve from detail page
-            if (absDownloadUrl.isBlank() || !absDownloadUrl.contains("&f=")) {
-                val resolved = resolveDownloadUrl(torrentId, detailUrl)
-                if (resolved != null && resolved.contains("&f=")) {
-                    absDownloadUrl = resolved
-                }
-            }
-
-            if (absDownloadUrl.contains("&f=")) {
-                try {
-                    val files = tryParseTorrentFiles(torrentId, absDownloadUrl, isFree)
-                    if (files != null) {
-                        val groups = computeShowGroups(files)
-                        if (groups.size > 1) {
-                            // Multi-show torrent: create one episode per show
-                            Log.d(TAG, "Multi-show torrent detected in loadFromTorrentData(): ${groups.size} shows in torrent $torrentId")
-                            val episodes = mutableListOf<Episode>()
-                            val seasonNamesList = mutableListOf<SeasonData>()
-
-                            seasonNamesList.add(SeasonData(season = 1, name = title))
-
-                            var epNum = 1
-                            for (group in groups) {
-                                val episodeName = "${group.showName} (${group.files.size} ملفات)"
-                                episodes.add(
-                                    newEpisode(data, fix = false, initializer = {
-                                        name = episodeName
-                                        season = 1
-                                        episode = epNum
-                                        this.posterUrl = absPosterUrl
-                                    })
-                                )
-                                epNum++
-                            }
-
-                            return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), episodes) {
-                                this.posterUrl = absPosterUrl
-                                this.posterHeaders = imageHeaders
-                                this.seasonNames = seasonNamesList
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Multi-show detection failed for torrent $torrentId: ${e.message}")
-                }
-            }
-        }
-
-        // Single-show torrent or detection failed: return as single-episode series.
+        // Return as single-episode series.
         // loadLinks() will serve the .torrent or convert → magnet when user clicks play.
         return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), listOf(
             newEpisode(data, fix = false, initializer = {
@@ -1200,34 +1090,6 @@ class Arabp : MainAPI() {
         } catch (e: Exception) {
             Log.e(TAG, "parseTorrentFileList error: ${e.message}")
             null
-        }
-    }
-
-    /**
-     * Groups torrent files by top-level folder to detect multi-show torrents.
-     * If all files share the same top-level folder (or have no folder), it's a single-show torrent.
-     * If there are multiple distinct top-level folders, each is treated as a separate show.
-     */
-    private fun computeShowGroups(files: List<TorrentFileInfo>): List<ShowGroup> {
-        if (files.isEmpty()) return emptyList()
-
-        // Group by top-level folder (first path component)
-        val groups = mutableMapOf<String, MutableList<TorrentFileInfo>>()
-
-        for (file in files) {
-            val topFolder = if (file.path.contains("/")) {
-                file.path.substringBefore("/")
-            } else {
-                // File at root level — use empty string as group
-                "__root__"
-            }
-            groups.getOrPut(topFolder) { mutableListOf() }.add(file)
-        }
-
-        // If only one group, it's a single-show torrent
-        return groups.map { (name, fileList) ->
-            val showName = if (name == "__root__") "ملفات" else name
-            ShowGroup(showName, fileList)
         }
     }
 
