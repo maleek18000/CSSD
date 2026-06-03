@@ -525,6 +525,11 @@ class StardimaProvider : MainAPI() {
                 val isM3u8 = videoUrl.contains(".m3u8") ||
                     (videoUrl.contains(".txt") && label.startsWith("hls"))
 
+                // Capture User-Agent BEFORE any builder lambdas.
+                // Inside newExtractorLink { ... }, `this` is the ExtractorLink,
+                // so `headers` would refer to ExtractorLink.headers (empty!), not our class field.
+                val ua = this.headers["User-Agent"]!!
+
                 if (isM3u8) {
                     // Use M3u8Helper.generateM3u8 for proper m3u8 parsing — it resolves
                     // relative URLs, handles variant playlists, and passes headers to ALL
@@ -538,7 +543,7 @@ class StardimaProvider : MainAPI() {
                             referer = url,
                             headers = mapOf(
                                 "Referer" to url,
-                                "User-Agent" to headers["User-Agent"]!!
+                                "User-Agent" to ua
                             ),
                             name = "$serverName ($label)"
                         ).forEach { link ->
@@ -567,10 +572,7 @@ class StardimaProvider : MainAPI() {
                             type = INFER_TYPE
                         ) {
                             this.referer = url
-                            this.headers = mapOf(
-                                "Referer" to url,
-                                "User-Agent" to headers["User-Agent"]!!
-                            )
+                            this.headers = mapOf("User-Agent" to ua)
                             this.quality = Qualities.Unknown.value
                         }
                     )
@@ -687,9 +689,12 @@ class StardimaProvider : MainAPI() {
     // that was used when the embed page was fetched. If ExoPlayer uses a
     // different User-Agent (e.g. "ExoPlayerLib/2.19.1"), the CDN returns 404,
     // which CloudStream reports as "io bad http status (2004)".
-    // FIX: Pass the same User-Agent via this.headers so ExoPlayer uses it.
-    // No Referer, cookies, or tracking calls are needed — only matching UA.
+    // FIX: Pass the same User-Agent via headers so ExoPlayer uses it.
     //
+    // IMPORTANT: Inside newExtractorLink's builder lambda, `this` refers to
+    // the ExtractorLink being built, NOT our class. So `headers["User-Agent"]`
+    // would read from ExtractorLink.headers (empty!) and crash with NPE.
+    // We must capture the UA value BEFORE entering the builder lambda.
     // We append "?.mp4" as a type hint since the URL has no .mp4 extension.
 
     private suspend fun extractKrakenfiles(
@@ -711,6 +716,11 @@ class StardimaProvider : MainAPI() {
                 // Append ?.mp4 as a type hint so CloudStream/ExoPlayer detects MP4
                 val hintUrl = if (videoUrl.contains(".mp4")) videoUrl else "$videoUrl?.mp4"
 
+                // CRITICAL: Capture User-Agent BEFORE the builder lambda.
+                // Inside newExtractorLink { ... }, `this` is the ExtractorLink,
+                // so `headers` would refer to ExtractorLink.headers (empty!), not our class field.
+                val ua = this.headers["User-Agent"]!!
+
                 callback.invoke(
                     newExtractorLink(
                         source = serverName,
@@ -718,9 +728,8 @@ class StardimaProvider : MainAPI() {
                         url = hintUrl,
                         type = INFER_TYPE
                     ) {
-                        this.headers = mapOf(
-                            "User-Agent" to headers["User-Agent"]!!
-                        )
+                        this.headers = mapOf("User-Agent" to ua)
+                        this.referer = url
                         this.quality = Qualities.Unknown.value
                     }
                 )
