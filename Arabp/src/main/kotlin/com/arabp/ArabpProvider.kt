@@ -140,8 +140,24 @@ class Arabp : MainAPI() {
     @Volatile
     private var isLoggedIn = false
 
+    /**
+     * Validate that our session is actually alive by checking if we have
+     * auth cookies and they still work. If session expired, reset and re-login.
+     */
+    private fun isSessionAlive(): Boolean {
+        if (!isLoggedIn) return false
+        val cookies = getSessionCookies()
+        // We need at least uid_ and pass_ cookies to be considered logged in
+        if (!cookies.contains("uid_") || !cookies.contains("pass_")) {
+            Log.w(TAG, "Session cookies missing, resetting isLoggedIn")
+            isLoggedIn = false
+            return false
+        }
+        return true
+    }
+
     private fun ensureLogin(): Boolean {
-        if (isLoggedIn) return true
+        if (isSessionAlive()) return true
 
         return try {
             val initRequest = Request.Builder()
@@ -166,19 +182,20 @@ class Arabp : MainAPI() {
 
             authClient.newCall(loginRequest).execute().use { response ->
                 val body = response.body?.string() ?: ""
-                Log.d(TAG, "Login response: code=${response.code}, cookies=${getSessionCookies()}")
+                val cookiesAfterLogin = getSessionCookies()
+                Log.d(TAG, "Login response: code=${response.code}, cookies=$cookiesAfterLogin")
 
                 val loginSuccess = response.code == 302 ||
+                        cookiesAfterLogin.contains("uid_") ||
                         body.contains("logout.php") ||
                         body.contains("page=logout") ||
-                        !body.contains("name=\"uid\"") ||
                         body.contains(LOGIN_USERNAME)
 
                 if (loginSuccess) {
                     isLoggedIn = true
-                    Log.d(TAG, "Login SUCCESS!")
+                    Log.d(TAG, "Login SUCCESS! Cookies: $cookiesAfterLogin")
                 } else {
-                    Log.e(TAG, "Login FAILED. Snippet: ${body.take(300)}")
+                    Log.e(TAG, "Login FAILED. Response code=${response.code}, snippet: ${body.take(300)}")
                 }
                 loginSuccess
             }
@@ -200,7 +217,10 @@ class Arabp : MainAPI() {
     // ==================== AUTH-AWARE DOCUMENT FETCHING ====================
 
     private fun fetchDocWithAuth(url: String): Document? {
-        if (!ensureLogin()) return null
+        if (!ensureLogin()) {
+            Log.e(TAG, "fetchDocWithAuth: login failed, cannot fetch $url")
+            return null
+        }
         return try {
             val request = Request.Builder()
                 .url(url)
@@ -208,7 +228,25 @@ class Arabp : MainAPI() {
                 .build()
             authClient.newCall(request).execute().use { response ->
                 val body = response.body?.string() ?: return null
-                Jsoup.parse(body, url)
+                val doc = Jsoup.parse(body, url)
+                // Check if we got a login page instead of real content
+                val hasListingContent = doc.select("div.listing_div1, table.lista2t, div.listing_div_id, table#listing_table").isNotEmpty()
+                if (!hasListingContent && body.contains("name=\"uid\"")) {
+                    Log.w(TAG, "fetchDocWithAuth: got login page for $url — session may have expired, retrying login")
+                    isLoggedIn = false
+                    if (ensureLogin()) {
+                        // Retry the request after re-login
+                        val retryRequest = Request.Builder()
+                            .url(url)
+                            .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
+                            .build()
+                        authClient.newCall(retryRequest).execute().use { retryResponse ->
+                            val retryBody = retryResponse.body?.string() ?: return null
+                            return Jsoup.parse(retryBody, url)
+                        }
+                    }
+                }
+                doc
             }
         } catch (e: Exception) {
             Log.e(TAG, "fetchDocWithAuth error for $url: ${e.message}")
@@ -218,25 +256,12 @@ class Arabp : MainAPI() {
 
     /**
      * Always use the authenticated client for ALL requests.
-     * The site may require session cookies even for public pages (anime-listing),
-     * and CloudStream's app.get() does not share our authClient cookies.
-     * If login fails, fall back to CloudStream's built-in client as a last resort.
+     * arabp2p.net requires session cookies for ALL listing pages (anime, TV, movies).
+     * CloudStream's app.get() does not share our authClient cookies, so it will always
+     * get the login page instead of listing content.
      */
     private suspend fun fetchDoc(url: String): Document? {
-        val authDoc = fetchDocWithAuth(url)
-        if (authDoc != null) {
-            // Verify we got real content, not a login redirect page
-            val hasListingContent = authDoc.select("div.listing_div1, table.lista2t, div.listing_div_id").isNotEmpty()
-            if (hasListingContent) return authDoc
-            Log.w(TAG, "fetchDoc: auth client returned page without listing content for $url, trying fallback")
-        }
-        // Fallback: use CloudStream's client (no auth cookies, but might work for public pages)
-        return try {
-            app.get(url).document
-        } catch (e: Exception) {
-            Log.e(TAG, "fetchDoc fallback error for $url: ${e.message}")
-            authDoc // return whatever we got from auth, even if it looks wrong
-        }
+        return fetchDocWithAuth(url)
     }
 
     // ==================== HOME PAGE ====================
@@ -249,12 +274,20 @@ class Arabp : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val url = if (page > 1) "${request.data}&pages=$page" else request.data
-        val doc = fetchDoc(url) ?: return newHomePageResponse(mutableListOf())
+        Log.d(TAG, "getMainPage: fetching $url for '${request.name}' (page=$page)")
+        val doc = fetchDoc(url)
+        if (doc == null) {
+            Log.e(TAG, "getMainPage: fetchDoc returned null for $url")
+            return newHomePageResponse(mutableListOf())
+        }
         val homeSets = mutableListOf<HomePageList>()
 
         try {
             val tvType = tvTypeFromPage(request.data)
-            val items = doc.select("div.listing_div1").mapNotNull { toSearchResult(it, tvType) }
+            val listingDivs = doc.select("div.listing_div1")
+            Log.d(TAG, "getMainPage: found ${listingDivs.size} listing_div1 elements for '${request.name}'")
+            val items = listingDivs.mapNotNull { toSearchResult(it, tvType) }
+            Log.d(TAG, "getMainPage: ${items.size} search results for '${request.name}'")
             if (items.isNotEmpty()) {
                 homeSets.add(HomePageList(request.name, items))
             }
