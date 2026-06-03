@@ -483,8 +483,7 @@ class Arabp : MainAPI() {
             val absPosterUrl = toAbsoluteUrl(posterUrl)
             val rows = doc.select("table#listing_table tr")
             val episodes = mutableListOf<Episode>()
-            val seasonNamesList = mutableListOf<SeasonData>()
-            var globalSeasonNum = 1
+            var episodeNum = 1
 
             for (row in rows) {
                 val nameLink = row.selectFirst("a[href*=torrent-details]") ?: continue
@@ -508,16 +507,15 @@ class Arabp : MainAPI() {
                 }
 
                 val epData = "$torrentId|${toAbsoluteUrl(detailHref)}|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
-                seasonNamesList.add(SeasonData(season = globalSeasonNum, name = displayName))
                 episodes.add(
                     newEpisode(epData, fix = false, initializer = {
                         name = displayName
-                        season = globalSeasonNum
-                        episode = 1
+                        season = 1
+                        episode = episodeNum
                         this.posterUrl = absPosterUrl
                     })
                 )
-                globalSeasonNum++
+                episodeNum++
             }
 
             val pageTvType = tvTypeFromPage(fullUrl)
@@ -531,7 +529,6 @@ class Arabp : MainAPI() {
                 newTvSeriesLoadResponse(title, fullUrl, pageTvType.toSeriesType(), episodes) {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
-                    this.seasonNames = seasonNamesList
                 }
             }
         } catch (e: Exception) {
