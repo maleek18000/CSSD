@@ -684,9 +684,13 @@ class StardimaProvider : MainAPI() {
     // No packed JS, no jwplayer.
     //
     // The CDN (krakencloud.net) serves MP4 with content-type: application/octet-stream.
-    // The URL has no .mp4 extension, so INFER_TYPE may not auto-detect the format.
-    // We add a ".mp4" query parameter to the URL as a hint so CloudStream/ExoPlayer
-    // recognizes it as an MP4 video file, preventing the "bad io http status (2004)" error.
+    // The URL has no .mp4 extension so INFER_TYPE can't auto-detect the format.
+    // We append ".mp4" as a fragment (#) so CloudStream recognizes the file type,
+    // but it's never sent to the server (fragments stay in the browser/client).
+    //
+    // CRITICAL: The CDN blocks ExoPlayer's default User-Agent. We must pass
+    // a browser User-Agent via the headers map so ExoPlayer uses it instead,
+    // otherwise the CDN returns 403 → "io bad http status (2004)".
 
     private suspend fun extractKrakenfiles(
         url: String, serverName: String,
@@ -704,9 +708,10 @@ class StardimaProvider : MainAPI() {
                 ?: Regex("""<source\s+src="(https?://[^"]+)"""").find(html)?.groupValues?.get(1)
 
             if (videoUrl != null) {
-                // Append .mp4 extension as a hint so CloudStream/ExoPlayer
-                // recognizes the content type (URL has no recognizable extension)
-                val hintUrl = if (videoUrl.contains(".mp4")) videoUrl else "$videoUrl?.mp4"
+                // Append #.mp4 fragment as a type hint for CloudStream/ExoPlayer.
+                // Fragment identifiers are never sent to the server, so the CDN
+                // sees the original URL, while CloudStream detects it as MP4.
+                val hintUrl = if (videoUrl.contains(".mp4")) videoUrl else "$videoUrl#.mp4"
 
                 callback.invoke(
                     newExtractorLink(
@@ -716,6 +721,9 @@ class StardimaProvider : MainAPI() {
                         type = INFER_TYPE
                     ) {
                         this.referer = url
+                        this.headers = mapOf(
+                            "User-Agent" to headers["User-Agent"]!!
+                        )
                         this.quality = Qualities.Unknown.value
                     }
                 )
