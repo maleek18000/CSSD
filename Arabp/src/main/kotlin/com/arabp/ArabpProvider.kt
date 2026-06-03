@@ -491,7 +491,23 @@ class Arabp : MainAPI() {
         return ext in VIDEO_EXTENSIONS
     }
 
+    /** Represents a folder within a torrent containing video files */
+    data class TorrentFolder(
+        val folderName: String,
+        val videoFiles: List<String>
+    )
+
     private fun parseTorrentFileList(torrentBytes: ByteArray): List<String> {
+        return parseTorrentFolders(torrentBytes).flatMap { it.videoFiles }
+    }
+
+    /**
+     * Parse a .torrent file and group video files by their top-level folder.
+     * Each folder becomes a TorrentFolder. Files in the root (no folder) go into
+     * a folder named "" (empty string). This allows torrents that contain multiple
+     * shows (each in its own subfolder) to be split into separate seasons.
+     */
+    private fun parseTorrentFolders(torrentBytes: ByteArray): List<TorrentFolder> {
         return try {
             val (root, _) = decodeBencode(torrentBytes, 0)
             val dict = root as? BencodeValue.BDict ?: return emptyList()
@@ -508,38 +524,43 @@ class Arabp : MainAPI() {
 
             if (filesEntry != null) {
                 val filesList = filesEntry.second as? BencodeValue.BList ?: return emptyList()
-                val videoFiles = mutableListOf<String>()
+                // Collect all video files with their top-level folder
+                val folderMap = linkedMapOf<String, MutableList<String>>()
                 for (item in filesList.items) {
                     val fileDict = item as? BencodeValue.BDict ?: continue
                     val pathEntry = fileDict.entries.find { (k, _) ->
                         k.bytes.contentEquals("path".toByteArray())
-                            ?: k.bytes.contentEquals("path.utf-8".toByteArray())
+                            || k.bytes.contentEquals("path.utf-8".toByteArray())
                     }
                     val pathParts = pathEntry?.second as? BencodeValue.BList ?: continue
-                    val fullPath = pathParts.items.mapNotNull {
+                    val pathSegments = pathParts.items.mapNotNull {
                         (it as? BencodeValue.BString)?.let { s -> String(s.bytes) }
-                    }.joinToString("/")
+                    }
+                    val fullPath = pathSegments.joinToString("/")
                     if (fullPath.isNotEmpty() && isVideoFile(fullPath)) {
-                        videoFiles.add(fullPath)
+                        // Top-level folder is the first path segment if there are multiple segments
+                        val topFolder = if (pathSegments.size > 1) pathSegments[0] else ""
+                        folderMap.getOrPut(topFolder) { mutableListOf() }.add(fullPath)
                     }
                 }
-                videoFiles
+                folderMap.map { (folder, files) -> TorrentFolder(folder, files) }
             } else {
+                // Single-file torrent (no "files" key)
                 val nameEntry = infoDict.entries.find { (k, _) ->
                     k.bytes.contentEquals("name".toByteArray())
-                        ?: k.bytes.contentEquals("name.utf-8".toByteArray())
+                        || k.bytes.contentEquals("name.utf-8".toByteArray())
                 }
                 val name = nameEntry?.second as? BencodeValue.BString
                     ?: return emptyList()
                 val nameStr = String(name.bytes)
                 if (nameStr.isNotEmpty() && isVideoFile(nameStr)) {
-                    listOf(nameStr)
+                    listOf(TorrentFolder("", listOf(nameStr)))
                 } else {
                     emptyList()
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "parseTorrentFileList error: ${e.message}")
+            Log.e(TAG, "parseTorrentFolders error: ${e.message}")
             emptyList()
         }
     }
@@ -606,7 +627,7 @@ class Arabp : MainAPI() {
 
             data class SplitResult(
                 val info: TorrentRowInfo,
-                val videoFiles: List<String>?
+                val folders: List<TorrentFolder>?
             )
 
             val splitResults = if (torrentInfos.isNotEmpty()) {
@@ -614,7 +635,7 @@ class Arabp : MainAPI() {
                     coroutineScope {
                         torrentInfos.map { info ->
                             async(Dispatchers.IO) {
-                                val videoFiles = try {
+                                val folders = try {
                                     if (!info.isExternal && info.downloadHref.isNotBlank()) {
                                         var resolvedUrl = toAbsoluteUrl(info.downloadHref)
                                         if (!resolvedUrl.contains("&f=")) {
@@ -637,9 +658,11 @@ class Arabp : MainAPI() {
                                             val dlResult = downloadTorrentFile(resolvedUrl)
                                             if (dlResult is TorrentDownloadResult.Success) {
                                                 cacheTorrent(info.torrentId, dlResult.bytes)
-                                                val files = parseTorrentFileList(dlResult.bytes)
-                                                Log.d(TAG, "Torrent #${info.torrentId} has ${files.size} video files")
-                                                if (files.size > 1) files else null
+                                                val parsedFolders = parseTorrentFolders(dlResult.bytes)
+                                                val totalVideos = parsedFolders.sumOf { it.videoFiles.size }
+                                                Log.d(TAG, "Torrent #${info.torrentId} has ${totalVideos} video files in ${parsedFolders.size} folders")
+                                                // Only split if there are multiple video files
+                                                if (totalVideos > 1) parsedFolders else null
                                             } else null
                                         } else null
                                     } else null
@@ -647,7 +670,7 @@ class Arabp : MainAPI() {
                                     Log.w(TAG, "Torrent split failed for #${info.torrentId}: ${e.message}")
                                     null
                                 }
-                                SplitResult(info, videoFiles)
+                                SplitResult(info, folders)
                             }
                         }.awaitAll()
                     }
@@ -665,30 +688,67 @@ class Arabp : MainAPI() {
 
             for (result in splitResults) {
                 val info = result.info
-                seasonNamesList.add(SeasonData(season = seasonNum, name = info.epName))
 
-                if (result.videoFiles != null) {
-                    for ((idx, filePath) in result.videoFiles.withIndex()) {
-                        val fileName = filePath.substringAfterLast("/")
-                        val epNameFromFile = fileName.substringBeforeLast(".")
-                            .replace(".", " ").replace("_", " ").trim()
-                        val epData = "${info.baseData}|${idx}"
-                        episodes.add(newEpisode(epData, fix = false, initializer = {
-                            name = epNameFromFile
-                            season = seasonNum
-                            episode = idx + 1
-                            this.posterUrl = absPosterUrl
-                        }))
+                if (result.folders != null) {
+                    val folders = result.folders
+                    // Only treat folders as separate seasons if there are 2+ named folders
+                    val hasMultipleFolders = folders.size > 1
+
+                    if (hasMultipleFolders) {
+                        // Each folder becomes its own season (each folder is a different show)
+                        for (folder in folders) {
+                            val seasonDisplayName = if (folder.folderName.isNotEmpty())
+                                folder.folderName else info.epName
+                            seasonNamesList.add(SeasonData(season = seasonNum, name = seasonDisplayName))
+
+                            // Build a global file index map so loadLinks can find the right file
+                            // We need the flat index across all video files for this torrent
+                            val globalOffset = folders.takeWhile { it != folder }
+                                .sumOf { it.videoFiles.size }
+
+                            for ((localIdx, filePath) in folder.videoFiles.withIndex()) {
+                                val fileName = filePath.substringAfterLast("/")
+                                val epNameFromFile = fileName.substringBeforeLast(".")
+                                    .replace(".", " ").replace("_", " ").trim()
+                                val globalIdx = globalOffset + localIdx
+                                val epData = "${info.baseData}|${globalIdx}"
+                                episodes.add(newEpisode(epData, fix = false, initializer = {
+                                    name = epNameFromFile
+                                    season = seasonNum
+                                    episode = localIdx + 1
+                                    this.posterUrl = absPosterUrl
+                                }))
+                            }
+                            seasonNum++
+                        }
+                    } else {
+                        // Single folder with videos (or all in root) — treat as one season
+                        seasonNamesList.add(SeasonData(season = seasonNum, name = info.epName))
+                        val allFiles = folders.flatMap { it.videoFiles }
+                        for ((idx, filePath) in allFiles.withIndex()) {
+                            val fileName = filePath.substringAfterLast("/")
+                            val epNameFromFile = fileName.substringBeforeLast(".")
+                                .replace(".", " ").replace("_", " ").trim()
+                            val epData = "${info.baseData}|${idx}"
+                            episodes.add(newEpisode(epData, fix = false, initializer = {
+                                name = epNameFromFile
+                                season = seasonNum
+                                episode = idx + 1
+                                this.posterUrl = absPosterUrl
+                            }))
+                        }
+                        seasonNum++
                     }
                 } else {
+                    seasonNamesList.add(SeasonData(season = seasonNum, name = info.epName))
                     episodes.add(newEpisode(info.baseData, fix = false, initializer = {
                         name = info.displayName
                         season = seasonNum
                         episode = 1
                         this.posterUrl = absPosterUrl
                     }))
+                    seasonNum++
                 }
-                seasonNum++
             }
 
             val pageTvType = tvTypeFromPage(fullUrl)
@@ -758,7 +818,7 @@ class Arabp : MainAPI() {
             }
         }
 
-        val splitEpisodes = try {
+        val folderResult = try {
             if (!isExternal && ensureLogin()) {
                 var resolvedUrl = toAbsoluteUrl(downloadUrl)
                 if (resolvedUrl.isBlank() || !resolvedUrl.contains("&f=")) {
@@ -781,36 +841,72 @@ class Arabp : MainAPI() {
                     val dlResult = downloadTorrentFile(resolvedUrl)
                     if (dlResult is TorrentDownloadResult.Success) {
                         cacheTorrent(torrentId, dlResult.bytes)
-                        val videoFiles = parseTorrentFileList(dlResult.bytes)
-                        Log.d(TAG, "loadFromTorrentData: Torrent #$torrentId has ${videoFiles.size} video files")
-                        if (videoFiles.size > 1) {
-                            val baseData = parts.joinToString("|")
-                            videoFiles.mapIndexed { idx, filePath ->
-                                val fileName = filePath.substringAfterLast("/")
-                                val epNameFromFile = fileName.substringBeforeLast(".")
-                                    .replace(".", " ").replace("_", " ").trim()
-                                val epData = "$baseData|${idx}"
-                                newEpisode(epData, fix = false, initializer = {
-                                    name = epNameFromFile
-                                    season = 1
-                                    episode = idx + 1
-                                    this.posterUrl = absPosterUrl
-                                })
-                            }
-                        } else { null }
-                    } else { null }
-                } else { null }
-            } else { null }
+                        val folders = parseTorrentFolders(dlResult.bytes)
+                        val totalVideos = folders.sumOf { it.videoFiles.size }
+                        Log.d(TAG, "loadFromTorrentData: Torrent #$torrentId has ${totalVideos} video files in ${folders.size} folders")
+                        if (totalVideos > 1) {
+                            Pair(folders, parts.joinToString("|"))
+                        } else null
+                    } else null
+                } else null
+            } else null
         } catch (e: Exception) {
             Log.w(TAG, "loadFromTorrentData split failed: ${e.message}")
             null
         }
 
-        if (splitEpisodes != null) {
-            return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), splitEpisodes) {
+        if (folderResult != null) {
+            val (folders, baseData) = folderResult
+            val episodes = mutableListOf<Episode>()
+            val seasonNamesList = mutableListOf<SeasonData>()
+            val hasMultipleFolders = folders.size > 1
+
+            var seasonNum = 1
+            if (hasMultipleFolders) {
+                // Each folder becomes its own season
+                for (folder in folders) {
+                    val seasonDisplayName = if (folder.folderName.isNotEmpty())
+                        folder.folderName else title
+                    seasonNamesList.add(SeasonData(season = seasonNum, name = seasonDisplayName))
+                    val globalOffset = folders.takeWhile { it != folder }
+                        .sumOf { it.videoFiles.size }
+                    for ((localIdx, filePath) in folder.videoFiles.withIndex()) {
+                        val fileName = filePath.substringAfterLast("/")
+                        val epNameFromFile = fileName.substringBeforeLast(".")
+                            .replace(".", " ").replace("_", " ").trim()
+                        val globalIdx = globalOffset + localIdx
+                        val epData = "$baseData|${globalIdx}"
+                        episodes.add(newEpisode(epData, fix = false, initializer = {
+                            name = epNameFromFile
+                            season = seasonNum
+                            episode = localIdx + 1
+                            this.posterUrl = absPosterUrl
+                        }))
+                    }
+                    seasonNum++
+                }
+            } else {
+                // Single folder or all files in root — one season
+                seasonNamesList.add(SeasonData(season = 1, name = title))
+                val allFiles = folders.flatMap { it.videoFiles }
+                for ((idx, filePath) in allFiles.withIndex()) {
+                    val fileName = filePath.substringAfterLast("/")
+                    val epNameFromFile = fileName.substringBeforeLast(".")
+                        .replace(".", " ").replace("_", " ").trim()
+                    val epData = "$baseData|${idx}"
+                    episodes.add(newEpisode(epData, fix = false, initializer = {
+                        name = epNameFromFile
+                        season = 1
+                        episode = idx + 1
+                        this.posterUrl = absPosterUrl
+                    }))
+                }
+            }
+
+            return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), episodes) {
                 this.posterUrl = absPosterUrl
                 this.posterHeaders = imageHeaders
-                this.seasonNames = listOf(SeasonData(season = 1, name = title))
+                this.seasonNames = seasonNamesList
             }
         }
 
