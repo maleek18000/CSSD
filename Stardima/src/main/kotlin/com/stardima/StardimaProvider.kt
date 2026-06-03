@@ -586,9 +586,16 @@ class StardimaProvider : MainAPI() {
 
             val afterBody = snippet.substring(bodyEndIdx + bodyEndMarker.length)
 
-            val argsPattern = Regex(",(\\d+),(\\d+),")
+            // Use specific pattern that includes surrounding quotes to avoid matching
+            // digit sequences inside the payload (e.g. SVG path data like ",0,0,").
+            // The packed JS format is: }('PAYLOAD',BASE,COUNT,'DICT'.split('|'))
+            // So the args are always between the closing quote of the payload and the
+            // opening quote of the dictionary: ',BASE,COUNT,'
+            val argsPattern = Regex("',(\\d+),(\\d+),'")
             val argsMatch = argsPattern.find(afterBody) ?: return null
 
+            // The payload ends right before the quote+comma:  ...PAYLOAD',BASE,COUNT,'DICT...
+            // argsMatch starts at the ', so payload ends at argsMatch.range.first
             val payloadEnd = argsMatch.range.first
             val payloadRaw = afterBody.substring(0, payloadEnd)
             val base = argsMatch.groupValues[1].toIntOrNull() ?: return null
@@ -599,21 +606,24 @@ class StardimaProvider : MainAPI() {
                 .replace("\\'", "'")
                 .replace("\\\\", "\\")
 
-            val afterCount = afterBody.substring(argsMatch.range.last + 1)
+            // After the args pattern ',BASE,COUNT,' the dictionary content follows
+            // immediately (the trailing ' of the pattern is the opening quote of DICT).
+            // Format: ...',BASE,COUNT,'DICT'.split('|'))
+            val afterArgs = afterBody.substring(argsMatch.range.last + 1)
 
-            val dictStart = afterCount.indexOf("'")
-            if (dictStart < 0) return null
-
-            val afterDictStart = afterCount.substring(dictStart + 1)
-
+            // Find the closing quote of the dictionary string, then verify '.split('
             val splitMarker = "'.split('"
-            val dictEnd = afterDictStart.indexOf(splitMarker)
-            val dictStr = if (dictEnd >= 0) {
-                afterDictStart.substring(0, dictEnd)
+            val splitIdx = afterArgs.indexOf(splitMarker)
+            val dictStr = if (splitIdx >= 0) {
+                afterArgs.substring(0, splitIdx)
             } else {
-                val standardEnd = afterDictStart.indexOf("')")
-                if (standardEnd < 0) return null
-                afterDictStart.substring(0, standardEnd)
+                // Fallback: look for closing ')'
+                val closeIdx = afterArgs.indexOf("')")
+                if (closeIdx < 0) return null
+                // Back up to find the closing quote before ')'
+                val dictCloseQuote = afterArgs.lastIndexOf("'", closeIdx)
+                if (dictCloseQuote < 0) return null
+                afterArgs.substring(0, dictCloseQuote)
             }
 
             val cleanDict = dictStr
