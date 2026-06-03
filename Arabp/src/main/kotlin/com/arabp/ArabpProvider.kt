@@ -140,8 +140,24 @@ class Arabp : MainAPI() {
     @Volatile
     private var isLoggedIn = false
 
+    /**
+     * Validate that our session is actually alive by checking if we have
+     * auth cookies and they still work. If session expired, reset and re-login.
+     */
+    private fun isSessionAlive(): Boolean {
+        if (!isLoggedIn) return false
+        val cookies = getSessionCookies()
+        // We need at least uid_ and pass_ cookies to be considered logged in
+        if (!cookies.contains("uid_") || !cookies.contains("pass_")) {
+            Log.w(TAG, "Session cookies missing, resetting isLoggedIn")
+            isLoggedIn = false
+            return false
+        }
+        return true
+    }
+
     private fun ensureLogin(): Boolean {
-        if (isLoggedIn) return true
+        if (isSessionAlive()) return true
 
         return try {
             val initRequest = Request.Builder()
@@ -166,19 +182,20 @@ class Arabp : MainAPI() {
 
             authClient.newCall(loginRequest).execute().use { response ->
                 val body = response.body?.string() ?: ""
-                Log.d(TAG, "Login response: code=${response.code}, cookies=${getSessionCookies()}")
+                val cookiesAfterLogin = getSessionCookies()
+                Log.d(TAG, "Login response: code=${response.code}, cookies=$cookiesAfterLogin")
 
                 val loginSuccess = response.code == 302 ||
+                        cookiesAfterLogin.contains("uid_") ||
                         body.contains("logout.php") ||
                         body.contains("page=logout") ||
-                        !body.contains("name=\"uid\"") ||
                         body.contains(LOGIN_USERNAME)
 
                 if (loginSuccess) {
                     isLoggedIn = true
-                    Log.d(TAG, "Login SUCCESS!")
+                    Log.d(TAG, "Login SUCCESS! Cookies: $cookiesAfterLogin")
                 } else {
-                    Log.e(TAG, "Login FAILED. Snippet: ${body.take(300)}")
+                    Log.e(TAG, "Login FAILED. Response code=${response.code}, snippet: ${body.take(300)}")
                 }
                 loginSuccess
             }
@@ -199,12 +216,11 @@ class Arabp : MainAPI() {
 
     // ==================== AUTH-AWARE DOCUMENT FETCHING ====================
 
-    private fun requiresAuth(url: String): Boolean {
-        return url.contains("tv-listing") || url.contains("movies-listing")
-    }
-
     private fun fetchDocWithAuth(url: String): Document? {
-        if (!ensureLogin()) return null
+        if (!ensureLogin()) {
+            Log.e(TAG, "fetchDocWithAuth: login failed, cannot fetch $url")
+            return null
+        }
         return try {
             val request = Request.Builder()
                 .url(url)
@@ -212,7 +228,25 @@ class Arabp : MainAPI() {
                 .build()
             authClient.newCall(request).execute().use { response ->
                 val body = response.body?.string() ?: return null
-                Jsoup.parse(body, url)
+                val doc = Jsoup.parse(body, url)
+                // Check if we got a login page instead of real content
+                val hasListingContent = doc.select("div.listing_div1, table.lista2t, div.listing_div_id, table#listing_table").isNotEmpty()
+                if (!hasListingContent && body.contains("name=\"uid\"")) {
+                    Log.w(TAG, "fetchDocWithAuth: got login page for $url — session may have expired, retrying login")
+                    isLoggedIn = false
+                    if (ensureLogin()) {
+                        // Retry the request after re-login
+                        val retryRequest = Request.Builder()
+                            .url(url)
+                            .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
+                            .build()
+                        authClient.newCall(retryRequest).execute().use { retryResponse ->
+                            val retryBody = retryResponse.body?.string() ?: return null
+                            return Jsoup.parse(retryBody, url)
+                        }
+                    }
+                }
+                doc
             }
         } catch (e: Exception) {
             Log.e(TAG, "fetchDocWithAuth error for $url: ${e.message}")
@@ -220,12 +254,14 @@ class Arabp : MainAPI() {
         }
     }
 
+    /**
+     * Always use the authenticated client for ALL requests.
+     * arabp2p.net requires session cookies for ALL listing pages (anime, TV, movies).
+     * CloudStream's app.get() does not share our authClient cookies, so it will always
+     * get the login page instead of listing content.
+     */
     private suspend fun fetchDoc(url: String): Document? {
-        return if (requiresAuth(url)) {
-            fetchDocWithAuth(url)
-        } else {
-            app.get(url).document
-        }
+        return fetchDocWithAuth(url)
     }
 
     // ==================== HOME PAGE ====================
@@ -238,12 +274,20 @@ class Arabp : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val url = if (page > 1) "${request.data}&pages=$page" else request.data
-        val doc = fetchDoc(url) ?: return newHomePageResponse(mutableListOf())
+        Log.d(TAG, "getMainPage: fetching $url for '${request.name}' (page=$page)")
+        val doc = fetchDoc(url)
+        if (doc == null) {
+            Log.e(TAG, "getMainPage: fetchDoc returned null for $url")
+            return newHomePageResponse(mutableListOf())
+        }
         val homeSets = mutableListOf<HomePageList>()
 
         try {
             val tvType = tvTypeFromPage(request.data)
-            val items = doc.select("div.listing_div1").mapNotNull { toSearchResult(it, tvType) }
+            val listingDivs = doc.select("div.listing_div1")
+            Log.d(TAG, "getMainPage: found ${listingDivs.size} listing_div1 elements for '${request.name}'")
+            val items = listingDivs.mapNotNull { toSearchResult(it, tvType) }
+            Log.d(TAG, "getMainPage: ${items.size} search results for '${request.name}'")
             if (items.isNotEmpty()) {
                 homeSets.add(HomePageList(request.name, items))
             }
@@ -491,7 +535,7 @@ class Arabp : MainAPI() {
         return ext in VIDEO_EXTENSIONS
     }
 
-    /** A folder within a torrent containing video files */
+    /** Represents a folder within a torrent containing video files */
     data class TorrentFolder(
         val folderName: String,
         val videoFiles: List<String>
@@ -503,9 +547,9 @@ class Arabp : MainAPI() {
 
     /**
      * Parse a .torrent file and group video files by their top-level folder.
-     * Files in the root (no folder) go into a folder named "" (empty string).
-     * This allows torrents containing multiple shows (each in its own subfolder)
-     * to be split into separate seasons later.
+     * Each folder becomes a TorrentFolder. Files in the root (no folder) go into
+     * a folder named "" (empty string). This allows torrents that contain multiple
+     * shows (each in its own subfolder) to be split into separate seasons.
      */
     private fun parseTorrentFolders(torrentBytes: ByteArray): List<TorrentFolder> {
         return try {
@@ -524,6 +568,7 @@ class Arabp : MainAPI() {
 
             if (filesEntry != null) {
                 val filesList = filesEntry.second as? BencodeValue.BList ?: return emptyList()
+                // Collect all video files with their top-level folder
                 val folderMap = linkedMapOf<String, MutableList<String>>()
                 for (item in filesList.items) {
                     val fileDict = item as? BencodeValue.BDict ?: continue
@@ -537,12 +582,14 @@ class Arabp : MainAPI() {
                     }
                     val fullPath = pathSegments.joinToString("/")
                     if (fullPath.isNotEmpty() && isVideoFile(fullPath)) {
+                        // Top-level folder is the first path segment if there are multiple segments
                         val topFolder = if (pathSegments.size > 1) pathSegments[0] else ""
                         folderMap.getOrPut(topFolder) { mutableListOf() }.add(fullPath)
                     }
                 }
                 folderMap.map { (folder, files) -> TorrentFolder(folder, files) }
             } else {
+                // Single-file torrent (no "files" key)
                 val nameEntry = infoDict.entries.find { (k, _) ->
                     k.bytes.contentEquals("name".toByteArray())
                         || k.bytes.contentEquals("name.utf-8".toByteArray())
@@ -658,6 +705,7 @@ class Arabp : MainAPI() {
                                                 val parsedFolders = parseTorrentFolders(dlResult.bytes)
                                                 val totalVideos = parsedFolders.sumOf { it.videoFiles.size }
                                                 Log.d(TAG, "Torrent #${info.torrentId} has ${totalVideos} video files in ${parsedFolders.size} folders")
+                                                // Only split if there are multiple video files
                                                 if (totalVideos > 1) parsedFolders else null
                                             } else null
                                         } else null
@@ -685,37 +733,42 @@ class Arabp : MainAPI() {
             for (result in splitResults) {
                 val info = result.info
 
-                if (result.folders != null && result.folders.size > 1) {
-                    // Multiple folders = multiple shows, each folder becomes its own season
-                    for (folder in result.folders) {
-                        val seasonDisplayName = if (folder.folderName.isNotEmpty())
-                            folder.folderName else info.epName
-                        seasonNamesList.add(SeasonData(season = seasonNum, name = seasonDisplayName))
+                if (result.folders != null) {
+                    val folders = result.folders
+                    // Only treat folders as separate seasons if there are 2+ named folders
+                    val hasMultipleFolders = folders.size > 1
 
-                        val globalOffset = result.folders.takeWhile { it != folder }
-                            .sumOf { it.videoFiles.size }
+                    if (hasMultipleFolders) {
+                        // Each folder becomes its own season (each folder is a different show)
+                        for (folder in folders) {
+                            val seasonDisplayName = if (folder.folderName.isNotEmpty())
+                                folder.folderName else info.epName
+                            seasonNamesList.add(SeasonData(season = seasonNum, name = seasonDisplayName))
 
-                        for ((localIdx, filePath) in folder.videoFiles.withIndex()) {
-                            val fileName = filePath.substringAfterLast("/")
-                            val epNameFromFile = fileName.substringBeforeLast(".")
-                                .replace(".", " ").replace("_", " ").trim()
-                            val globalIdx = globalOffset + localIdx
-                            val epData = "${info.baseData}|${globalIdx}"
-                            episodes.add(newEpisode(epData, fix = false, initializer = {
-                                name = epNameFromFile
-                                season = seasonNum
-                                episode = localIdx + 1
-                                this.posterUrl = absPosterUrl
-                            }))
+                            // Build a global file index map so loadLinks can find the right file
+                            // We need the flat index across all video files for this torrent
+                            val globalOffset = folders.takeWhile { it != folder }
+                                .sumOf { it.videoFiles.size }
+
+                            for ((localIdx, filePath) in folder.videoFiles.withIndex()) {
+                                val fileName = filePath.substringAfterLast("/")
+                                val epNameFromFile = fileName.substringBeforeLast(".")
+                                    .replace(".", " ").replace("_", " ").trim()
+                                val globalIdx = globalOffset + localIdx
+                                val epData = "${info.baseData}|${globalIdx}"
+                                episodes.add(newEpisode(epData, fix = false, initializer = {
+                                    name = epNameFromFile
+                                    season = seasonNum
+                                    episode = localIdx + 1
+                                    this.posterUrl = absPosterUrl
+                                }))
+                            }
+                            seasonNum++
                         }
-                        seasonNum++
-                    }
-                } else {
-                    // Single folder or no folders — same as before: one season per torrent
-                    seasonNamesList.add(SeasonData(season = seasonNum, name = info.epName))
-
-                    if (result.folders != null) {
-                        val allFiles = result.folders.flatMap { it.videoFiles }
+                    } else {
+                        // Single folder with videos (or all in root) — treat as one season
+                        seasonNamesList.add(SeasonData(season = seasonNum, name = info.epName))
+                        val allFiles = folders.flatMap { it.videoFiles }
                         for ((idx, filePath) in allFiles.withIndex()) {
                             val fileName = filePath.substringAfterLast("/")
                             val epNameFromFile = fileName.substringBeforeLast(".")
@@ -728,14 +781,16 @@ class Arabp : MainAPI() {
                                 this.posterUrl = absPosterUrl
                             }))
                         }
-                    } else {
-                        episodes.add(newEpisode(info.baseData, fix = false, initializer = {
-                            name = info.displayName
-                            season = seasonNum
-                            episode = 1
-                            this.posterUrl = absPosterUrl
-                        }))
+                        seasonNum++
                     }
+                } else {
+                    seasonNamesList.add(SeasonData(season = seasonNum, name = info.epName))
+                    episodes.add(newEpisode(info.baseData, fix = false, initializer = {
+                        name = info.displayName
+                        season = seasonNum
+                        episode = 1
+                        this.posterUrl = absPosterUrl
+                    }))
                     seasonNum++
                 }
             }
@@ -848,10 +903,11 @@ class Arabp : MainAPI() {
             val (folders, baseData) = folderResult
             val episodes = mutableListOf<Episode>()
             val seasonNamesList = mutableListOf<SeasonData>()
+            val hasMultipleFolders = folders.size > 1
 
-            if (folders.size > 1) {
-                // Multiple folders = multiple shows, each folder becomes its own season
-                var seasonNum = 1
+            var seasonNum = 1
+            if (hasMultipleFolders) {
+                // Each folder becomes its own season
                 for (folder in folders) {
                     val seasonDisplayName = if (folder.folderName.isNotEmpty())
                         folder.folderName else title
@@ -874,7 +930,7 @@ class Arabp : MainAPI() {
                     seasonNum++
                 }
             } else {
-                // Single folder — one season (same as before)
+                // Single folder or all files in root — one season
                 seasonNamesList.add(SeasonData(season = 1, name = title))
                 val allFiles = folders.flatMap { it.videoFiles }
                 for ((idx, filePath) in allFiles.withIndex()) {
