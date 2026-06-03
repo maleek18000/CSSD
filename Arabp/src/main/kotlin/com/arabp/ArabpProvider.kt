@@ -199,10 +199,6 @@ class Arabp : MainAPI() {
 
     // ==================== AUTH-AWARE DOCUMENT FETCHING ====================
 
-    private fun requiresAuth(url: String): Boolean {
-        return url.contains("tv-listing") || url.contains("movies-listing")
-    }
-
     private fun fetchDocWithAuth(url: String): Document? {
         if (!ensureLogin()) return null
         return try {
@@ -220,11 +216,26 @@ class Arabp : MainAPI() {
         }
     }
 
+    /**
+     * Always use the authenticated client for ALL requests.
+     * The site may require session cookies even for public pages (anime-listing),
+     * and CloudStream's app.get() does not share our authClient cookies.
+     * If login fails, fall back to CloudStream's built-in client as a last resort.
+     */
     private suspend fun fetchDoc(url: String): Document? {
-        return if (requiresAuth(url)) {
-            fetchDocWithAuth(url)
-        } else {
+        val authDoc = fetchDocWithAuth(url)
+        if (authDoc != null) {
+            // Verify we got real content, not a login redirect page
+            val hasListingContent = authDoc.select("div.listing_div1, table.lista2t, div.listing_div_id").isNotEmpty()
+            if (hasListingContent) return authDoc
+            Log.w(TAG, "fetchDoc: auth client returned page without listing content for $url, trying fallback")
+        }
+        // Fallback: use CloudStream's client (no auth cookies, but might work for public pages)
+        return try {
             app.get(url).document
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchDoc fallback error for $url: ${e.message}")
+            authDoc // return whatever we got from auth, even if it looks wrong
         }
     }
 
