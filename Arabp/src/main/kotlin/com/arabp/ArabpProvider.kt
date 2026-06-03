@@ -7,7 +7,6 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.SubtitleFile
 import okhttp3.FormBody
-import okhttp3.Headers.Companion.toHeaders
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.jsoup.Jsoup
@@ -16,8 +15,6 @@ import org.jsoup.nodes.Element
 import java.net.CookieManager
 import java.net.CookiePolicy
 import java.net.HttpCookie
-import java.net.ServerSocket
-import java.net.Socket
 import java.net.URI
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
@@ -187,7 +184,7 @@ class Arabp : MainAPI() {
         return try {
             val request = Request.Builder()
                 .url(url)
-                .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
+                .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
                 .build()
             authClient.newCall(request).execute().use { response ->
                 val body = response.body?.string() ?: return null
@@ -337,7 +334,7 @@ class Arabp : MainAPI() {
                 val torrentsUrl = "$mainUrl/index.php?page=torrents&search=$encoded&category=0&active=0"
                 val request = Request.Builder()
                     .url(torrentsUrl)
-                    .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
+                    .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
                     .build()
 
                 authClient.newCall(request).execute().use { response ->
@@ -507,6 +504,8 @@ class Arabp : MainAPI() {
                     if (seeders.isNotEmpty()) append(" | ▲$seeders")
                 }
 
+                // Each torrent row becomes one episode with pipe-delimited data.
+                // loadLinks() will convert .torrent → magnet when user clicks play.
                 val epData = "$torrentId|${toAbsoluteUrl(detailHref)}|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
                 seasonNamesList.add(SeasonData(season = globalSeasonNum, name = displayName))
                 episodes.add(
@@ -559,7 +558,7 @@ class Arabp : MainAPI() {
             if (ensureLogin() && detailUrl.isNotBlank()) {
                 val request = Request.Builder()
                     .url(toAbsoluteUrl(detailUrl))
-                    .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
+                    .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
                     .build()
 
                 authClient.newCall(request).execute().use { response ->
@@ -603,140 +602,18 @@ class Arabp : MainAPI() {
         }
     }
 
-    // ==================== LOCAL TORRENT SERVER ====================
-    //
-    // CloudStream3's built-in torrent player uses a local Go server (anacrolix/torrent)
-    // that fetches .torrent files directly via HTTP. It does NOT forward the
-    // ExtractorLink headers (cookies/auth) — they are discarded with emptyMap().
-    // This means private tracker .torrent URLs requiring auth will always fail.
-    //
-    // Solution: Download the .torrent file ourselves (with auth), then serve it
-    // from a local HTTP server on 127.0.0.1. CS3's Go server can fetch from
-    // localhost without auth, and the .torrent file already contains the passkey
-    // tracker URL inside it.
-    //
-    // The server auto-stops after 90 seconds of inactivity.
-
-    private var localServerSocket: ServerSocket? = null
-    private var localServerPort: Int = 0
-    private var localServerThread: Thread? = null
-    @Volatile
-    private var servedTorrentBytes: ByteArray? = null
-    @Volatile
-    private var lastServerActivity: Long = 0
-
-    /**
-     * Starts (or reuses) a local HTTP server that serves the given .torrent bytes.
-     * Returns the local URL (e.g. http://127.0.0.1:PORT/torrent.torrent) or null on error.
-     */
-    private fun startLocalTorrentServer(bytes: ByteArray): String? {
-        servedTorrentBytes = bytes
-        lastServerActivity = System.currentTimeMillis()
-
-        // If server is already running, just update bytes and return the URL
-        if (localServerSocket != null && localServerPort > 0 && localServerThread?.isAlive == true) {
-            Log.d(TAG, "Local torrent server: reusing existing server on port $localServerPort")
-            return "http://127.0.0.1:$localServerPort/torrent.torrent"
-        }
-
-        // Stop any stale server
-        stopLocalTorrentServer()
-
-        try {
-            val socket = ServerSocket(0) // random available port
-            socket.reuseAddress = true
-            socket.soTimeout = 5000 // accept() timeout — check for shutdown every 5s
-            localServerSocket = socket
-            localServerPort = socket.localPort
-
-            localServerThread = Thread({
-                try {
-                    while (!Thread.currentThread().isInterrupted) {
-                        // Auto-stop after 90 seconds of inactivity
-                        if (System.currentTimeMillis() - lastServerActivity > 90_000) {
-                            Log.d(TAG, "Local torrent server: shutting down after 90s inactivity")
-                            break
-                        }
-                        try {
-                            val client = socket.accept()
-                            lastServerActivity = System.currentTimeMillis()
-                            handleLocalServerRequest(client)
-                        } catch (_: java.net.SocketTimeoutException) {
-                            // Normal — loop back and check inactivity / interrupt
-                            continue
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.d(TAG, "Local torrent server stopped: ${e.message}")
-                } finally {
-                    stopLocalTorrentServer()
-                }
-            }, "ArabpLocalServer")
-            localServerThread?.start()
-
-            Log.d(TAG, "Local torrent server started on port $localServerPort")
-            return "http://127.0.0.1:$localServerPort/torrent.torrent"
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start local torrent server: ${e.message}")
-            return null
-        }
-    }
-
-    private fun handleLocalServerRequest(socket: Socket) {
-        try {
-            val input = socket.getInputStream()
-            val output = socket.getOutputStream()
-
-            // Read and discard the HTTP request headers
-            val buffer = ByteArray(4096)
-            input.read(buffer)
-
-            val bytes = servedTorrentBytes
-            if (bytes == null) {
-                val response = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"
-                output.write(response.toByteArray())
-            } else {
-                val response = "HTTP/1.1 200 OK\r\n" +
-                        "Content-Type: application/x-bittorrent\r\n" +
-                        "Content-Length: ${bytes.size}\r\n" +
-                        "Connection: close\r\n\r\n"
-                output.write(response.toByteArray())
-                output.write(bytes)
-                Log.d(TAG, "Local server: served .torrent file (${bytes.size} bytes)")
-            }
-            output.flush()
-        } catch (e: Exception) {
-            Log.e(TAG, "Local server request error: ${e.message}")
-        } finally {
-            try { socket.close() } catch (_: Exception) {}
-        }
-    }
-
-    private fun stopLocalTorrentServer() {
-        try { localServerSocket?.close() } catch (_: Exception) {}
-        try { localServerThread?.interrupt() } catch (_: Exception) {}
-        localServerSocket = null
-        localServerPort = 0
-        localServerThread = null
-    }
-
     // ==================== LOAD LINKS ====================
     //
-    // Downloads the .torrent file with auth → serves it via local HTTP server → returns sources.
-    //
-    // IMPORTANT: CloudStream3's built-in torrent player uses a local Go server
-    // (anacrolix/torrent) that fetches .torrent files via HTTP. It does NOT forward
-    // the ExtractorLink headers — they are discarded. So private tracker .torrent
-    // URLs requiring authentication will always fail with CS3's built-in player.
-    //
-    // Solution: We download the .torrent file ourselves (with auth cookies), then
-    // serve it from a local HTTP server on 127.0.0.1. CS3's Go server fetches from
-    // localhost without needing auth.
+    // Downloads the .torrent file → converts to magnet link → returns sources.
+    // No TorrServe needed! CloudStream handles both magnet and .torrent natively.
     //
     // Three sources provided:
-    // 1. "Arabp (Torrent)" — local server serving the .torrent file → CS3 built-in player
-    // 2. "Arabp (Magnet)" — magnet link with passkey trackers → external players
-    // 3. "Arabp (Amnis)" — magnet link for Amnis Player (long-press → open in Amnis)
+    // 1. "Arabp (Torrent)" — the .torrent file URL (CloudStream's built-in player
+    //    handles .torrent files better than magnets for private trackers)
+    // 2. "Arabp (Magnet)" — magnet link with passkey trackers (works with
+    //    external players like Amnis, BiglyBT, etc.)
+    // 3. "Amnis Player" — same magnet link, dedicated for Amnis Player.
+    //    Long-press this source → "Play with..." → Amnis Player opens the torrent.
 
     override suspend fun loadLinks(
         data: String,
@@ -778,9 +655,10 @@ class Arabp : MainAPI() {
                         type = ExtractorLinkType.MAGNET
                     )
                 )
+                // Source 3: Amnis Player — same magnet, dedicated for Amnis Player
                 callback(
                     newExtractorLink(
-                        source = "Amnis",
+                        source = "Amnis Player",
                         name = "Amnis Player",
                         url = magnetUrl,
                         type = ExtractorLinkType.MAGNET
@@ -789,7 +667,7 @@ class Arabp : MainAPI() {
                 return true
             }
 
-            // === INTERNAL TORRENTS: download .torrent → serve via local server + magnet ===
+            // === INTERNAL TORRENTS: download .torrent → convert to magnet ===
             var resolvedDownloadUrl = downloadUrl
 
             // Step 1: Resolve download URL with &f= parameter
@@ -800,7 +678,7 @@ class Arabp : MainAPI() {
                 try {
                     val request = Request.Builder()
                         .url(toAbsoluteUrl(detailPageUrl))
-                        .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
+                        .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
                         .build()
 
                     authClient.newCall(request).execute().use { response ->
@@ -826,9 +704,10 @@ class Arabp : MainAPI() {
                                         type = ExtractorLinkType.MAGNET
                                     )
                                 )
+                                // Amnis Player source
                                 callback(
                                     newExtractorLink(
-                                        source = "Amnis",
+                                        source = "Amnis Player",
                                         name = "Amnis Player",
                                         url = pageMagnet,
                                         type = ExtractorLinkType.MAGNET
@@ -851,11 +730,123 @@ class Arabp : MainAPI() {
                 Log.d(TAG, "loadLinks: thank uploader result = $thanked for torrent $torrentId")
             }
 
-            // Step 2: Download .torrent → serve via local server + generate magnet
+            // Step 2: Download .torrent → convert to magnet
             if (resolvedDownloadUrl.isNotBlank() && resolvedDownloadUrl.contains("&f=")) {
                 try {
                     val result = downloadTorrentFile(resolvedDownloadUrl)
-                    foundLink = handleTorrentDownloadResult(result, resolvedDownloadUrl, callback) || foundLink
+                    when (result) {
+                        is TorrentDownloadResult.Success -> {
+                            Log.d(TAG, "Downloaded .torrent: ${result.bytes.size} bytes, converting to magnet...")
+
+                            // Source 1: .torrent file URL — CloudStream's built-in player
+                            // handles .torrent files better than magnets for private trackers
+                            val torrentUrl = toAbsoluteUrl(resolvedDownloadUrl)
+                            callback(
+                                newExtractorLink(
+                                    source = this.name,
+                                    name = "${this.name} (Torrent)",
+                                    url = torrentUrl,
+                                    type = ExtractorLinkType.TORRENT
+                                ) {
+                                    headers = getAuthHeaders(referer = "$mainUrl/")
+                                }
+                            )
+                            foundLink = true
+
+                            // Source 2: Magnet link — works with external players
+                            val magnet = torrentToMagnet(result.bytes)
+                            if (magnet != null) {
+                                Log.d(TAG, "Generated magnet: ${magnet.take(150)}...")
+                                callback(
+                                    newExtractorLink(
+                                        source = this.name,
+                                        name = "${this.name} (Magnet)",
+                                        url = magnet,
+                                        type = ExtractorLinkType.MAGNET
+                                    )
+                                )
+                                // Source 3: Amnis Player — same magnet, dedicated for Amnis Player
+                                callback(
+                                    newExtractorLink(
+                                        source = "Amnis Player",
+                                        name = "Amnis Player",
+                                        url = magnet,
+                                        type = ExtractorLinkType.MAGNET
+                                    )
+                                )
+                                foundLink = true
+                            }
+                        }
+                        is TorrentDownloadResult.DailyLimitExceeded -> {
+                            Log.w(TAG, "DAILY DOWNLOAD LIMIT EXCEEDED for torrent id=$torrentId, thanking and retrying...")
+                            val thankDetailUrl = if (detailUrl.isNotBlank()) detailUrl
+                                else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
+                            thankUploader(torrentId, thankDetailUrl)
+
+                            val retryResult = downloadTorrentFile(resolvedDownloadUrl)
+                            when (retryResult) {
+                                is TorrentDownloadResult.Success -> {
+                                    Log.d(TAG, "Retry succeeded! Converting to magnet...")
+
+                                    // .torrent file URL
+                                    val torrentUrl = toAbsoluteUrl(resolvedDownloadUrl)
+                                    callback(
+                                        newExtractorLink(
+                                            source = this.name,
+                                            name = "${this.name} (Torrent)",
+                                            url = torrentUrl,
+                                            type = ExtractorLinkType.TORRENT
+                                        ) {
+                                            headers = getAuthHeaders(referer = "$mainUrl/")
+                                        }
+                                    )
+                                    foundLink = true
+
+                                    // Magnet link
+                                    val magnet = torrentToMagnet(retryResult.bytes)
+                                    if (magnet != null) {
+                                        callback(
+                                            newExtractorLink(
+                                                source = this.name,
+                                                name = "${this.name} (Magnet)",
+                                                url = magnet,
+                                                type = ExtractorLinkType.MAGNET
+                                            )
+                                        )
+                                        // Amnis Player source
+                                        callback(
+                                            newExtractorLink(
+                                                source = "Amnis Player",
+                                                name = "Amnis Player",
+                                                url = magnet,
+                                                type = ExtractorLinkType.MAGNET
+                                            )
+                                        )
+                                        foundLink = true
+                                    }
+                                }
+                                else -> {
+                                    Log.e(TAG, "Download still failed after thank + retry for torrent id=$torrentId")
+                                    callback(
+                                        newExtractorLink(
+                                            source = this.name,
+                                            name = "\u274C تجاوزت الحد اليومي للتحميل",
+                                            url = "$mainUrl/",
+                                            type = ExtractorLinkType.VIDEO
+                                        )
+                                    )
+                                    foundLink = true
+                                }
+                            }
+                        }
+                        is TorrentDownloadResult.NotLoggedIn -> {
+                            isLoggedIn = false
+                            Log.e(TAG, "Session expired for torrent id=$torrentId")
+                        }
+                        is TorrentDownloadResult.Error -> {
+                            Log.e(TAG, "Download error for torrent id=$torrentId: ${result.message}")
+                        }
+                    }
                 } catch (e: Exception) {
                     Log.e(TAG, "Magnet conversion error: ${e.message}")
                 }
@@ -866,128 +857,6 @@ class Arabp : MainAPI() {
             Log.e(TAG, "loadLinks Error: ${e.message}")
             false
         }
-    }
-
-    /**
-     * Processes a TorrentDownloadResult: serves .torrent via local server and
-     * generates a magnet link. Returns true if at least one source was added.
-     */
-    private suspend fun handleTorrentDownloadResult(
-        result: TorrentDownloadResult,
-        downloadUrl: String,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        var foundLink = false
-
-        when (result) {
-            is TorrentDownloadResult.Success -> {
-                Log.d(TAG, "Downloaded .torrent: ${result.bytes.size} bytes")
-
-                // Source 1: Serve .torrent via local HTTP server
-                // CS3's Go torrent server fetches from localhost — no auth needed!
-                val localUrl = startLocalTorrentServer(result.bytes)
-                if (localUrl != null) {
-                    Log.d(TAG, "Serving .torrent via local server: $localUrl")
-                    callback(
-                        newExtractorLink(
-                            source = this.name,
-                            name = "${this.name} (Torrent)",
-                            url = localUrl,
-                            type = ExtractorLinkType.TORRENT
-                        )
-                    )
-                    foundLink = true
-                }
-
-                // Source 2: Magnet link — works with external players
-                val magnet = torrentToMagnet(result.bytes)
-                if (magnet != null) {
-                    Log.d(TAG, "Generated magnet: ${magnet.take(150)}...")
-                    callback(
-                        newExtractorLink(
-                            source = this.name,
-                            name = "${this.name} (Magnet)",
-                            url = magnet,
-                            type = ExtractorLinkType.MAGNET
-                        )
-                    )
-                    // Source 3: Amnis Player — long-press to open magnet in Amnis
-                    callback(
-                        newExtractorLink(
-                            source = "Amnis",
-                            name = "Amnis Player",
-                            url = magnet,
-                            type = ExtractorLinkType.MAGNET
-                        )
-                    )
-                    foundLink = true
-                }
-            }
-            is TorrentDownloadResult.DailyLimitExceeded -> {
-                Log.w(TAG, "DAILY DOWNLOAD LIMIT EXCEEDED, thanking and retrying...")
-                val retryResult = downloadTorrentFile(downloadUrl)
-                when (retryResult) {
-                    is TorrentDownloadResult.Success -> {
-                        Log.d(TAG, "Retry succeeded!")
-
-                        val localUrl = startLocalTorrentServer(retryResult.bytes)
-                        if (localUrl != null) {
-                            callback(
-                                newExtractorLink(
-                                    source = this.name,
-                                    name = "${this.name} (Torrent)",
-                                    url = localUrl,
-                                    type = ExtractorLinkType.TORRENT
-                                )
-                            )
-                            foundLink = true
-                        }
-
-                        val magnet = torrentToMagnet(retryResult.bytes)
-                        if (magnet != null) {
-                            callback(
-                                newExtractorLink(
-                                    source = this.name,
-                                    name = "${this.name} (Magnet)",
-                                    url = magnet,
-                                    type = ExtractorLinkType.MAGNET
-                                )
-                            )
-                            callback(
-                                newExtractorLink(
-                                    source = "Amnis",
-                                    name = "Amnis Player",
-                                    url = magnet,
-                                    type = ExtractorLinkType.MAGNET
-                                )
-                            )
-                            foundLink = true
-                        }
-                    }
-                    else -> {
-                        Log.e(TAG, "Download still failed after thank + retry")
-                        callback(
-                            newExtractorLink(
-                                source = this.name,
-                                name = "\u274C تجاوزت الحد اليومي للتحميل",
-                                url = "$mainUrl/",
-                                type = ExtractorLinkType.VIDEO
-                            )
-                        )
-                        foundLink = true
-                    }
-                }
-            }
-            is TorrentDownloadResult.NotLoggedIn -> {
-                isLoggedIn = false
-                Log.e(TAG, "Session expired")
-            }
-            is TorrentDownloadResult.Error -> {
-                Log.e(TAG, "Download error: ${result.message}")
-            }
-        }
-
-        return foundLink
     }
 
     // ==================== THANK UPLOADER ====================
@@ -1007,7 +876,7 @@ class Arabp : MainAPI() {
             val thankRequest = Request.Builder()
                 .url("$mainUrl/thanks.php")
                 .post(thankFormBody)
-                .headers(getAuthHeaders(referer = pageUrl).toHeaders())
+                .headers(getAuthHeaders(referer = pageUrl).toOkHttpHeaders())
                 .header("X-Requested-With", "XMLHttpRequest")
                 .build()
 
@@ -1035,7 +904,7 @@ class Arabp : MainAPI() {
         return try {
             val request = Request.Builder()
                 .url(toAbsoluteUrl(url))
-                .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
+                .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
                 .build()
 
             authClient.newCall(request).execute().use { response ->
@@ -1238,7 +1107,7 @@ class Arabp : MainAPI() {
             while (pos < data.size && data[pos] != 'e'.code.toByte()) {
                 // Parse the key (must be a bencode string)
                 val (key, afterKey) = decodeBencodeString(data, pos)
-                val keyStr = String((key as BencodeValue.BString).bytes)
+                val keyStr = String(key.bytes)
 
                 if (keyStr == "info") {
                     // Found the "info" key! The value starts at afterKey.
@@ -1280,7 +1149,7 @@ class Arabp : MainAPI() {
             // Try fetching user profile page to find passkey
             val profileRequest = Request.Builder()
                 .url("$mainUrl/index.php?page=usercp")
-                .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
+                .headers(getAuthHeaders(referer = "$mainUrl/").toOkHttpHeaders())
                 .build()
 
             authClient.newCall(profileRequest).execute().use { response ->
@@ -1353,7 +1222,7 @@ class Arabp : MainAPI() {
     // ==================== BENCODE PARSER ====================
     //
     // Minimal bencode parser/encoder for .torrent files.
-    // Handles: strings (<n>:<bytes>), integers (i<n>e), lists (l...e), dicts (d...e)
+    // Handles: strings (d<n>:<bytes>), integers (i<n>e), lists (l...e), dicts (d...e)
 
     sealed class BencodeValue {
         data class BString(val bytes: ByteArray) : BencodeValue()
@@ -1362,80 +1231,101 @@ class Arabp : MainAPI() {
         data class BDict(val entries: MutableList<Pair<BString, BencodeValue>>) : BencodeValue()
     }
 
-    private data class BencodeParseResult(val value: BencodeValue, val nextPos: Int)
-
-    private fun decodeBencode(data: ByteArray, startPos: Int): BencodeParseResult {
-        if (startPos >= data.size) throw IllegalArgumentException("Unexpected end of data at $startPos")
-
-        val firstByte = data[startPos].toInt().toChar()
-
+    private fun decodeBencode(data: ByteArray, offset: Int): Pair<BencodeValue, Int> {
+        val byte = data[offset].toInt().toChar()
         return when {
-            firstByte == 'd' -> { // Dictionary
-                var pos = startPos + 1
-                val entries = mutableListOf<Pair<BencodeValue.BString, BencodeValue>>()
-
-                while (pos < data.size && data[pos].toInt().toChar() != 'e') {
-                    val (key, afterKey) = decodeBencode(data, pos)
-                    val keyStr = key as? BencodeValue.BString
-                        ?: throw IllegalArgumentException("Dict key must be string at $pos")
-                    val (value, afterValue) = decodeBencode(data, afterKey)
-                    entries.add(keyStr to value)
-                    pos = afterValue
-                }
-
-                BencodeParseResult(BencodeValue.BDict(entries), pos + 1) // skip 'e'
-            }
-
-            firstByte == 'l' -> { // List
-                var pos = startPos + 1
-                val items = mutableListOf<BencodeValue>()
-
-                while (pos < data.size && data[pos].toInt().toChar() != 'e') {
-                    val (item, afterItem) = decodeBencode(data, pos)
-                    items.add(item)
-                    pos = afterItem
-                }
-
-                BencodeParseResult(BencodeValue.BList(items), pos + 1) // skip 'e'
-            }
-
-            firstByte == 'i' -> { // Integer
-                val endPos = indexOfByte(data, 'e'.code.toByte(), startPos + 1)
-                val numStr = String(data, startPos + 1, endPos - startPos - 1)
-                BencodeParseResult(BencodeValue.BInt(numStr.toLong()), endPos + 1)
-            }
-
-            firstByte in '0'..'9' -> { // String
-                decodeBencodeString(data, startPos)
-            }
-
-            else -> throw IllegalArgumentException("Unexpected byte '${firstByte}' at $startPos")
+            byte in '0'..'9' -> decodeBencodeString(data, offset)
+            byte == 'i' -> decodeBencodeInt(data, offset)
+            byte == 'l' -> decodeBencodeList(data, offset)
+            byte == 'd' -> decodeBencodeDict(data, offset)
+            else -> throw IllegalArgumentException("Invalid bencode at offset $offset: '$byte'")
         }
     }
 
-    private fun decodeBencodeString(data: ByteArray, startPos: Int): BencodeParseResult {
-        // Format: <length>:<bytes>
-        val colonPos = indexOfByte(data, ':'.code.toByte(), startPos)
-        val lengthStr = String(data, startPos, colonPos - startPos)
-        val length = lengthStr.toInt()
-        val stringStart = colonPos + 1
-        val bytes = data.sliceArray(stringStart until stringStart + length)
-        return BencodeParseResult(BencodeValue.BString(bytes), stringStart + length)
+    private fun decodeBencodeString(data: ByteArray, offset: Int): Pair<BencodeValue.BString, Int> {
+        var colon = -1
+        for (i in offset until data.size) { if (data[i] == ':'.code.toByte()) { colon = i; break } }
+        if (colon < 0) throw IllegalArgumentException("No colon found")
+        val len = String(data, offset, colon - offset).toInt()
+        val strStart = colon + 1
+        return Pair(BencodeValue.BString(data.sliceArray(strStart until strStart + len)), strStart + len)
     }
 
-    private fun indexOfByte(data: ByteArray, target: Byte, startPos: Int): Int {
-        for (i in startPos until data.size) {
-            if (data[i] == target) return i
+    private fun decodeBencodeInt(data: ByteArray, offset: Int): Pair<BencodeValue.BInt, Int> {
+        var end = -1
+        for (i in offset until data.size) { if (data[i] == 'e'.code.toByte()) { end = i; break } }
+        val value = String(data, offset + 1, end - offset - 1).toLong()
+        return Pair(BencodeValue.BInt(value), end + 1)
+    }
+
+    private fun decodeBencodeList(data: ByteArray, offset: Int): Pair<BencodeValue.BList, Int> {
+        var pos = offset + 1
+        val items = mutableListOf<BencodeValue>()
+        while (data[pos].toInt().toChar() != 'e') {
+            val (item, newPos) = decodeBencode(data, pos)
+            items.add(item)
+            pos = newPos
         }
-        throw IllegalArgumentException("Byte '${target.toInt().toChar()}' not found after $startPos")
+        return Pair(BencodeValue.BList(items), pos + 1)
     }
 
-    // ==================== UTILITY ====================
+    private fun decodeBencodeDict(data: ByteArray, offset: Int): Pair<BencodeValue.BDict, Int> {
+        var pos = offset + 1
+        val entries = mutableListOf<Pair<BencodeValue.BString, BencodeValue>>()
+        while (data[pos].toInt().toChar() != 'e') {
+            val (key, newPos1) = decodeBencodeString(data, pos)
+            val (value, newPos2) = decodeBencode(data, newPos1)
+            entries.add(Pair(key, value))
+            pos = newPos2
+        }
+        return Pair(BencodeValue.BDict(entries), pos + 1)
+    }
+
+    private fun encodeBencode(value: BencodeValue): ByteArray {
+        return when (value) {
+            is BencodeValue.BString -> {
+                val len = value.bytes.size.toString().toByteArray()
+                len + ":".toByteArray() + value.bytes
+            }
+            is BencodeValue.BInt -> "i${value.value}e".toByteArray()
+            is BencodeValue.BList -> {
+                val parts = mutableListOf<ByteArray>("l".toByteArray())
+                for (item in value.items) parts.add(encodeBencode(item))
+                parts.add("e".toByteArray())
+                parts.reduce { acc, bytes -> acc + bytes }
+            }
+            is BencodeValue.BDict -> {
+                val parts = mutableListOf<ByteArray>("d".toByteArray())
+                for ((key, val_) in value.entries) {
+                    parts.add(encodeBencode(key))
+                    parts.add(encodeBencode(val_))
+                }
+                parts.add("e".toByteArray())
+                parts.reduce { acc, bytes -> acc + bytes }
+            }
+        }
+    }
+
+    // ==================== UTILITY FUNCTIONS ====================
 
     private fun cleanTitleText(text: String): String {
         return text
-            .replace(Regex("<[^>]*>"), "")
-            .replace(Regex("\\s+"), " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#039;", "'")
+            .replace("&nbsp;", " ")
             .trim()
+    }
+
+    // ==================== OKHTTP HELPERS ====================
+
+    private fun Map<String, String>.toOkHttpHeaders(): okhttp3.Headers {
+        val builder = okhttp3.Headers.Builder()
+        for ((key, value) in this) {
+            builder.add(key, value)
+        }
+        return builder.build()
     }
 }
