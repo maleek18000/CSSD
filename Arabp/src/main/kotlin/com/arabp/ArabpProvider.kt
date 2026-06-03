@@ -21,6 +21,10 @@ import java.net.Socket
 import java.net.URI
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.Dispatchers
 
 class Arabp : MainAPI() {
     override var mainUrl = "https://www.arabp2p.net"
@@ -38,6 +42,23 @@ class Arabp : MainAPI() {
 
         // Base32 alphabet for magnet info hash encoding
         private const val BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+        private const val MAX_TORRENT_CACHE = 10
+    }
+
+    // LRU cache for downloaded .torrent bytes (key = torrent ID, thread-safe)
+    private val torrentCacheLock = Any()
+    private val torrentCache = object : LinkedHashMap<String, ByteArray>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>): Boolean {
+            return size > MAX_TORRENT_CACHE
+        }
+    }
+
+    private fun getCachedTorrent(id: String): ByteArray? = synchronized(torrentCacheLock) {
+        torrentCache[id]
+    }
+
+    private fun cacheTorrent(id: String, bytes: ByteArray) = synchronized(torrentCacheLock) {
+        torrentCache[id] = bytes
     }
 
     // Cached passkey extracted from .torrent announce URL or website
@@ -310,7 +331,6 @@ class Arabp : MainAPI() {
         val results = mutableListOf<SearchResponse>()
         val queryLower = query.lowercase().trim()
 
-        // Source 1: LISTINGS (anime=public, tv/movies=require auth)
         val listingPages = listOf(
             Triple("$mainUrl/index.php?page=anime-listing&search=$encoded", "anime", TvType.Anime),
             Triple("$mainUrl/index.php?page=tv-listing&search=$encoded", "tv", TvType.TvSeries),
@@ -331,7 +351,6 @@ class Arabp : MainAPI() {
             }
         }
 
-        // Source 2: PRIVATE torrents page (supports search natively)
         if (ensureLogin()) {
             try {
                 val torrentsUrl = "$mainUrl/index.php?page=torrents&search=$encoded&category=0&active=0"
@@ -472,12 +491,6 @@ class Arabp : MainAPI() {
         return ext in VIDEO_EXTENSIONS
     }
 
-    /**
-     * Parse a .torrent file and return the list of video file paths.
-     * For multi-file torrents, reads info.files[].path.
-     * For single-file torrents, reads info.name.
-     * Returns empty list on error.
-     */
     private fun parseTorrentFileList(torrentBytes: ByteArray): List<String> {
         return try {
             val (root, _) = decodeBencode(torrentBytes, 0)
@@ -489,13 +502,11 @@ class Arabp : MainAPI() {
 
             val infoDict = infoEntry.second as? BencodeValue.BDict ?: return emptyList()
 
-            // Check if multi-file (has "files" key) or single-file
             val filesEntry = infoDict.entries.find { (k, _) ->
                 k.bytes.contentEquals("files".toByteArray())
             }
 
             if (filesEntry != null) {
-                // Multi-file torrent: info.files[]
                 val filesList = filesEntry.second as? BencodeValue.BList ?: return emptyList()
                 val videoFiles = mutableListOf<String>()
                 for (item in filesList.items) {
@@ -514,7 +525,6 @@ class Arabp : MainAPI() {
                 }
                 videoFiles
             } else {
-                // Single-file torrent: info.name
                 val nameEntry = infoDict.entries.find { (k, _) ->
                     k.bytes.contentEquals("name".toByteArray())
                         ?: k.bytes.contentEquals("name.utf-8".toByteArray())
@@ -553,15 +563,24 @@ class Arabp : MainAPI() {
 
             val absPosterUrl = toAbsoluteUrl(posterUrl)
             val rows = doc.select("table#listing_table tr")
-            val episodes = mutableListOf<Episode>()
-            var globalSeasonNum = 1
-            var globalEpisodeNum = 1
 
-            for (row in rows) {
-                val nameLink = row.selectFirst("a[href*=torrent-details]") ?: continue
+            data class TorrentRowInfo(
+                val epName: String,
+                val displayName: String,
+                val torrentId: String,
+                val detailHref: String,
+                val downloadHref: String,
+                val magnetHref: String,
+                val isFree: Boolean,
+                val isExternal: Boolean,
+                val baseData: String
+            )
+
+            val torrentInfos = rows.mapNotNull { row ->
+                val nameLink = row.selectFirst("a[href*=torrent-details]") ?: return@mapNotNull null
                 val epName = cleanTitleText(nameLink.text())
                 val detailHref = nameLink.attr("href")
-                val torrentId = DIGITS.find(detailHref.substringAfter("id="))?.value ?: continue
+                val torrentId = DIGITS.find(detailHref.substringAfter("id="))?.value ?: return@mapNotNull null
                 val downloadHref = row.selectFirst("a[href*=download.php]")?.attr("href") ?: ""
                 val magnetHref = row.selectFirst("a[href^=magnet:]")?.attr("href") ?: ""
                 val isFree = isFreeTorrent(row)
@@ -580,77 +599,96 @@ class Arabp : MainAPI() {
 
                 val baseData = "$torrentId|${toAbsoluteUrl(detailHref)}|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
 
-                // Try to download .torrent and split into individual episodes
-                val splitEpisodes = try {
-                    if (!isExternal && ensureLogin() && downloadHref.isNotBlank()) {
-                        var resolvedUrl = toAbsoluteUrl(downloadHref)
-                        if (!resolvedUrl.contains("&f=")) {
-                            val detailPageUrl = toAbsoluteUrl(detailHref)
-                            val detailRequest = Request.Builder()
-                                .url(detailPageUrl)
-                                .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
-                                .build()
-                            authClient.newCall(detailRequest).execute().use { resp ->
-                                val body = resp.body?.string() ?: ""
-                                val detailDoc = Jsoup.parse(body, detailPageUrl)
-                                val dlLink = detailDoc.selectFirst("a[href*=download.php]")
-                                    ?: detailDoc.selectFirst("td#Title h1 a[href*=download.php]")
-                                if (dlLink != null) {
-                                    resolvedUrl = toAbsoluteUrl(dlLink.attr("href"))
-                                }
-                            }
-                        }
-                        if (resolvedUrl.contains("&f=")) {
-                            val dlResult = downloadTorrentFile(resolvedUrl)
-                            if (dlResult is TorrentDownloadResult.Success) {
-                                // Thank uploader to avoid hitting daily download limit
-                                if (!isFree) {
-                                    thankUploader(torrentId, toAbsoluteUrl(detailHref))
-                                }
-                                val videoFiles = parseTorrentFileList(dlResult.bytes)
-                                Log.d(TAG, "Torrent #$torrentId has ${videoFiles.size} video files")
-                                if (videoFiles.size > 1) {
-                                    // Multi-file: create one episode per video file
-                                    videoFiles.mapIndexed { idx, filePath ->
-                                        val fileName = filePath.substringAfterLast("/")
-                                        val epNameFromFile = fileName.substringBeforeLast(".")
-                                            .replace(".", " ").replace("_", " ").trim()
-                                        val epData = "$baseData|${idx}"
-                                        newEpisode(epData, fix = false, initializer = {
-                                            name = epNameFromFile
-                                            season = globalSeasonNum
-                                            episode = idx + 1
-                                            this.posterUrl = absPosterUrl
-                                        })
-                                    }
-                                } else {
-                                    null // single file — use default
-                                }
-                            } else { null }
-                        } else { null }
-                    } else { null }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Torrent split failed for #$torrentId: ${e.message}")
-                    null
-                }
+                TorrentRowInfo(epName, displayName, torrentId, detailHref, downloadHref, magnetHref, isFree, isExternal, baseData)
+            }
 
-                if (splitEpisodes != null) {
-                    episodes.addAll(splitEpisodes)
-                    globalSeasonNum++
-                    globalEpisodeNum += splitEpisodes.size
-                } else {
-                    // Single episode or fallback
-                    episodes.add(
-                        newEpisode(baseData, fix = false, initializer = {
-                            name = displayName
-                            season = globalSeasonNum
-                            episode = 1
-                            this.posterUrl = absPosterUrl
-                        })
-                    )
-                    globalSeasonNum++
-                    globalEpisodeNum++
+            ensureLogin()
+
+            data class SplitResult(
+                val info: TorrentRowInfo,
+                val videoFiles: List<String>?
+            )
+
+            val splitResults = if (torrentInfos.isNotEmpty()) {
+                try {
+                    coroutineScope {
+                        torrentInfos.map { info ->
+                            async(Dispatchers.IO) {
+                                val videoFiles = try {
+                                    if (!info.isExternal && info.downloadHref.isNotBlank()) {
+                                        var resolvedUrl = toAbsoluteUrl(info.downloadHref)
+                                        if (!resolvedUrl.contains("&f=")) {
+                                            val detailPageUrl = toAbsoluteUrl(info.detailHref)
+                                            val detailRequest = Request.Builder()
+                                                .url(detailPageUrl)
+                                                .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
+                                                .build()
+                                            authClient.newCall(detailRequest).execute().use { resp ->
+                                                val body = resp.body?.string() ?: ""
+                                                val detailDoc = Jsoup.parse(body, detailPageUrl)
+                                                val dlLink = detailDoc.selectFirst("a[href*=download.php]")
+                                                    ?: detailDoc.selectFirst("td#Title h1 a[href*=download.php]")
+                                                if (dlLink != null) {
+                                                    resolvedUrl = toAbsoluteUrl(dlLink.attr("href"))
+                                                }
+                                            }
+                                        }
+                                        if (resolvedUrl.contains("&f=")) {
+                                            val dlResult = downloadTorrentFile(resolvedUrl)
+                                            if (dlResult is TorrentDownloadResult.Success) {
+                                                cacheTorrent(info.torrentId, dlResult.bytes)
+                                                val files = parseTorrentFileList(dlResult.bytes)
+                                                Log.d(TAG, "Torrent #${info.torrentId} has ${files.size} video files")
+                                                if (files.size > 1) files else null
+                                            } else null
+                                        } else null
+                                    } else null
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "Torrent split failed for #${info.torrentId}: ${e.message}")
+                                    null
+                                }
+                                SplitResult(info, videoFiles)
+                            }
+                        }.awaitAll()
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Parallel download failed, using fallback: ${e.message}")
+                    torrentInfos.map { SplitResult(it, null) }
                 }
+            } else {
+                emptyList()
+            }
+
+            val episodes = mutableListOf<Episode>()
+            val seasonNamesList = mutableListOf<SeasonData>()
+            var seasonNum = 1
+
+            for (result in splitResults) {
+                val info = result.info
+                seasonNamesList.add(SeasonData(season = seasonNum, name = info.epName))
+
+                if (result.videoFiles != null) {
+                    for ((idx, filePath) in result.videoFiles.withIndex()) {
+                        val fileName = filePath.substringAfterLast("/")
+                        val epNameFromFile = fileName.substringBeforeLast(".")
+                            .replace(".", " ").replace("_", " ").trim()
+                        val epData = "${info.baseData}|${idx}"
+                        episodes.add(newEpisode(epData, fix = false, initializer = {
+                            name = epNameFromFile
+                            season = seasonNum
+                            episode = idx + 1
+                            this.posterUrl = absPosterUrl
+                        }))
+                    }
+                } else {
+                    episodes.add(newEpisode(info.baseData, fix = false, initializer = {
+                        name = info.displayName
+                        season = seasonNum
+                        episode = 1
+                        this.posterUrl = absPosterUrl
+                    }))
+                }
+                seasonNum++
             }
 
             val pageTvType = tvTypeFromPage(fullUrl)
@@ -664,6 +702,7 @@ class Arabp : MainAPI() {
                 newTvSeriesLoadResponse(title, fullUrl, pageTvType.toSeriesType(), episodes) {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
+                    this.seasonNames = seasonNamesList
                 }
             }
         } catch (e: Exception) {
@@ -687,7 +726,6 @@ class Arabp : MainAPI() {
         var title = "Torrent #$torrentId"
         var posterUrl = ""
 
-        // Fetch title and poster from detail page
         try {
             if (ensureLogin() && detailUrl.isNotBlank()) {
                 val request = Request.Builder()
@@ -713,7 +751,6 @@ class Arabp : MainAPI() {
             else if (detailUrl.contains("anime-listing")) TvType.Anime
             else tvTypeFromTitle(title)
 
-        // External torrents with magnet: return as movie with magnet data
         if (isExternal && magnetUrl.startsWith("magnet:")) {
             return newMovieLoadResponse(title, data, pageTvType.toMovieType(), data) {
                 this.posterUrl = absPosterUrl
@@ -721,7 +758,6 @@ class Arabp : MainAPI() {
             }
         }
 
-        // Try to download .torrent and split into individual episodes
         val splitEpisodes = try {
             if (!isExternal && ensureLogin()) {
                 var resolvedUrl = toAbsoluteUrl(downloadUrl)
@@ -744,10 +780,7 @@ class Arabp : MainAPI() {
                 if (resolvedUrl.contains("&f=")) {
                     val dlResult = downloadTorrentFile(resolvedUrl)
                     if (dlResult is TorrentDownloadResult.Success) {
-                        // Thank uploader to avoid hitting daily download limit
-                        if (!isFree) {
-                            thankUploader(torrentId, toAbsoluteUrl(detailUrl))
-                        }
+                        cacheTorrent(torrentId, dlResult.bytes)
                         val videoFiles = parseTorrentFileList(dlResult.bytes)
                         Log.d(TAG, "loadFromTorrentData: Torrent #$torrentId has ${videoFiles.size} video files")
                         if (videoFiles.size > 1) {
@@ -777,10 +810,10 @@ class Arabp : MainAPI() {
             return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), splitEpisodes) {
                 this.posterUrl = absPosterUrl
                 this.posterHeaders = imageHeaders
+                this.seasonNames = listOf(SeasonData(season = 1, name = title))
             }
         }
 
-        // Fallback: single-episode series
         return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), listOf(
             newEpisode(data, fix = false, initializer = {
                 name = title
@@ -791,22 +824,11 @@ class Arabp : MainAPI() {
         )) {
             this.posterUrl = absPosterUrl
             this.posterHeaders = imageHeaders
+            this.seasonNames = listOf(SeasonData(season = 1, name = title))
         }
     }
 
     // ==================== LOCAL TORRENT SERVER ====================
-    //
-    // CloudStream3's built-in torrent player uses a local Go server (anacrolix/torrent)
-    // that fetches .torrent files directly via HTTP. It does NOT forward the
-    // ExtractorLink headers (cookies/auth) — they are discarded with emptyMap().
-    // This means private tracker .torrent URLs requiring auth will always fail.
-    //
-    // Solution: Download the .torrent file ourselves (with auth), then serve it
-    // from a local HTTP server on 127.0.0.1. CS3's Go server can fetch from
-    // localhost without auth, and the .torrent file already contains the passkey
-    // tracker URL inside it.
-    //
-    // The server auto-stops after 90 seconds of inactivity.
 
     private var localServerSocket: ServerSocket? = null
     private var localServerPort: Int = 0
@@ -816,34 +838,27 @@ class Arabp : MainAPI() {
     @Volatile
     private var lastServerActivity: Long = 0
 
-    /**
-     * Starts (or reuses) a local HTTP server that serves the given .torrent bytes.
-     * Returns the local URL (e.g. http://127.0.0.1:PORT/torrent.torrent) or null on error.
-     */
     private fun startLocalTorrentServer(bytes: ByteArray): String? {
         servedTorrentBytes = bytes
         lastServerActivity = System.currentTimeMillis()
 
-        // If server is already running, just update bytes and return the URL
         if (localServerSocket != null && localServerPort > 0 && localServerThread?.isAlive == true) {
             Log.d(TAG, "Local torrent server: reusing existing server on port $localServerPort")
             return "http://127.0.0.1:$localServerPort/torrent.torrent"
         }
 
-        // Stop any stale server
         stopLocalTorrentServer()
 
         try {
-            val socket = ServerSocket(0) // random available port
+            val socket = ServerSocket(0)
             socket.reuseAddress = true
-            socket.soTimeout = 5000 // accept() timeout — check for shutdown every 5s
+            socket.soTimeout = 5000
             localServerSocket = socket
             localServerPort = socket.localPort
 
             localServerThread = Thread({
                 try {
                     while (!Thread.currentThread().isInterrupted) {
-                        // Auto-stop after 90 seconds of inactivity
                         if (System.currentTimeMillis() - lastServerActivity > 90_000) {
                             Log.d(TAG, "Local torrent server: shutting down after 90s inactivity")
                             break
@@ -853,7 +868,6 @@ class Arabp : MainAPI() {
                             lastServerActivity = System.currentTimeMillis()
                             handleLocalServerRequest(client)
                         } catch (_: java.net.SocketTimeoutException) {
-                            // Normal — loop back and check inactivity / interrupt
                             continue
                         }
                     }
@@ -878,7 +892,6 @@ class Arabp : MainAPI() {
             val input = socket.getInputStream()
             val output = socket.getOutputStream()
 
-            // Read and discard the HTTP request headers
             val buffer = ByteArray(4096)
             input.read(buffer)
 
@@ -912,21 +925,6 @@ class Arabp : MainAPI() {
     }
 
     // ==================== LOAD LINKS ====================
-    //
-    // Downloads the .torrent file with auth → serves it via local HTTP server → returns sources.
-    //
-    // IMPORTANT: CloudStream3's built-in torrent player uses a local Go server
-    // (anacrolix/torrent) that fetches .torrent files via HTTP. It does NOT forward
-    // the ExtractorLink headers — they are discarded. So private tracker .torrent
-    // URLs requiring authentication will always fail with CS3's built-in player.
-    //
-    // Solution: We download the .torrent file ourselves (with auth cookies), then
-    // serve it from a local HTTP server on 127.0.0.1. CS3's Go server fetches from
-    // localhost without needing auth.
-    //
-    // Two sources provided:
-    // 1. "Arabp (Torrent)" — local server serving the .torrent file → CS3 built-in player
-    // 2. "Arabp (Magnet)" — magnet link with passkey trackers → external players
 
     override suspend fun loadLinks(
         data: String,
@@ -942,7 +940,6 @@ class Arabp : MainAPI() {
         val magnetUrl = parts.getOrNull(3) ?: ""
         val isFree = parts.getOrNull(4) == "1"
         val isExternal = parts.getOrNull(5) == "1"
-        // fileIndex: if present (7th field), this is a split episode pointing to a specific file
         val fileIndex = dataParts.getOrNull(6)?.toIntOrNull()
 
         Log.d(TAG, "loadLinks: id=$torrentId, free=$isFree, external=$isExternal, fileIndex=$fileIndex")
@@ -953,14 +950,12 @@ class Arabp : MainAPI() {
                 return false
             }
 
-            // Try to fetch passkey from website as fallback (before we need it)
             if (cachedPasskey == null) {
                 fetchPasskeyFromWebsite()
             }
 
             var foundLink = false
 
-            // === EXTERNAL TORRENTS: pass magnet link directly ===
             if (isExternal && magnetUrl.startsWith("magnet:")) {
                 Log.d(TAG, "External torrent — passing magnet link")
                 callback(
@@ -974,10 +969,25 @@ class Arabp : MainAPI() {
                 return true
             }
 
-            // === INTERNAL TORRENTS: download .torrent → serve via local server + magnet ===
+            if (!isFree) {
+                val thankDetailUrl = if (detailUrl.isNotBlank()) detailUrl
+                    else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
+                val thanked = thankUploader(torrentId, thankDetailUrl)
+                Log.d(TAG, "loadLinks: thank uploader result = $thanked for torrent $torrentId")
+            }
+
+            val cachedBytes = getCachedTorrent(torrentId)
+            if (cachedBytes != null) {
+                Log.d(TAG, "Using cached .torrent for #$torrentId (${cachedBytes.size} bytes)")
+                foundLink = handleTorrentDownloadResult(
+                    TorrentDownloadResult.Success(cachedBytes),
+                    "", callback, fileIndex
+                )
+                return foundLink
+            }
+
             var resolvedDownloadUrl = downloadUrl
 
-            // Step 1: Resolve download URL with &f= parameter
             if (resolvedDownloadUrl.isBlank() || !resolvedDownloadUrl.contains("&f=")) {
                 val detailPageUrl = if (detailUrl.isNotBlank()) detailUrl
                     else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
@@ -998,7 +1008,6 @@ class Arabp : MainAPI() {
                             resolvedDownloadUrl = toAbsoluteUrl(dlLink.attr("href"))
                         }
 
-                        // Also check for magnet link on detail page as fallback
                         val magnetEl = detailDoc.selectFirst("a[href^=magnet:]")
                         if (magnetEl != null) {
                             val pageMagnet = magnetEl.attr("href")
@@ -1020,18 +1029,12 @@ class Arabp : MainAPI() {
                 }
             }
 
-            // Step 1.5: Thank the uploader for non-free torrents
-            if (!isFree) {
-                val thankDetailUrl = if (detailUrl.isNotBlank()) detailUrl
-                    else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
-                val thanked = thankUploader(torrentId, thankDetailUrl)
-                Log.d(TAG, "loadLinks: thank uploader result = $thanked for torrent $torrentId")
-            }
-
-            // Step 2: Download .torrent → serve via local server + generate magnet
             if (resolvedDownloadUrl.isNotBlank() && resolvedDownloadUrl.contains("&f=")) {
                 try {
                     val result = downloadTorrentFile(resolvedDownloadUrl)
+                    if (result is TorrentDownloadResult.Success) {
+                        cacheTorrent(torrentId, result.bytes)
+                    }
                     foundLink = handleTorrentDownloadResult(result, resolvedDownloadUrl, callback, fileIndex) || foundLink
                 } catch (e: Exception) {
                     Log.e(TAG, "Magnet conversion error: ${e.message}")
@@ -1045,10 +1048,6 @@ class Arabp : MainAPI() {
         }
     }
 
-    /**
-     * Processes a TorrentDownloadResult: serves .torrent via local server and
-     * generates a magnet link. Returns true if at least one source was added.
-     */
     private suspend fun handleTorrentDownloadResult(
         result: TorrentDownloadResult,
         downloadUrl: String,
@@ -1061,9 +1060,6 @@ class Arabp : MainAPI() {
             is TorrentDownloadResult.Success -> {
                 Log.d(TAG, "Downloaded .torrent: ${result.bytes.size} bytes")
 
-                // Source 1: Serve .torrent via local HTTP server
-                // CS3's Go torrent server fetches from localhost — no auth needed!
-                // If fileIndex is set, append &file_index= so CS plays only that file
                 val localUrl = startLocalTorrentServer(result.bytes)
                 if (localUrl != null) {
                     val torrentUrl = if (fileIndex != null) "$localUrl&file_index=$fileIndex" else localUrl
@@ -1079,7 +1075,6 @@ class Arabp : MainAPI() {
                     foundLink = true
                 }
 
-                // Source 2: Magnet link — works with external players
                 val magnet = torrentToMagnet(result.bytes)
                 if (magnet != null) {
                     Log.d(TAG, "Generated magnet: ${magnet.take(150)}...")
@@ -1233,41 +1228,21 @@ class Arabp : MainAPI() {
     }
 
     // ==================== TORRENT → MAGNET CONVERSION ====================
-    //
-    // Converts a .torrent file to a magnet URI link.
-    // Matches fosstorrents.com/t2m/ conversion:
-    //   1. Find the raw "info" dict bytes in the .torrent file
-    //   2. SHA1 hash those exact raw bytes → info hash (NO re-encoding!)
-    //   3. Base32-encode the hash → magnet xt parameter
-    //   4. Build magnet URI with xt, dn, and standard &tr= parameters
-    //
-    // CRITICAL: We hash the RAW bytes of the info dict from the original file,
-    // NOT a re-encoded version. Re-encoding can produce different bytes → wrong hash.
-    //
-    // Tracker URLs always include BOTH:
-    //   &tr= non-passkey announce (e.g. http://www.arabp2p.net:2052/announce)
-    //   &tr= passkey announce (e.g. http://www.arabp2p.net:2052/3d365.../announce)
-    // Using standard &tr= format (not tr.N) for maximum client compatibility.
 
     private fun torrentToMagnet(torrentBytes: ByteArray): String? {
         return try {
-            // === Step 1: Find the raw info dict bytes ===
             val infoBytesResult = findInfoDictBytes(torrentBytes)
             if (infoBytesResult == null) {
                 Log.e(TAG, "torrentToMagnet: could not find info dict in .torrent file")
                 return null
             }
 
-            // === Step 2: SHA1 hash the raw info dict bytes ===
             val sha1 = java.security.MessageDigest.getInstance("SHA-1").digest(infoBytesResult.bytes)
-
-            // === Step 3: Convert to Base32 ===
             val infoHashBase32 = base32Encode(sha1)
 
             Log.d(TAG, "torrentToMagnet: info hash (hex) = ${sha1.joinToString("") { "%02x".format(it) }}")
             Log.d(TAG, "torrentToMagnet: info hash (base32) = $infoHashBase32")
 
-            // === Step 4: Parse the torrent for metadata (name, trackers) ===
             val (root, _) = decodeBencode(torrentBytes, 0)
             val dict = root as? BencodeValue.BDict ?: return null
 
@@ -1275,10 +1250,8 @@ class Arabp : MainAPI() {
                 k.bytes.contentEquals("info".toByteArray())
             } ?: return null
 
-            // Build magnet URI
             val magnet = StringBuilder("magnet:?xt=urn:btih:$infoHashBase32")
 
-            // Add display name (dn)
             val nameEntry = (infoEntry.second as? BencodeValue.BDict)?.entries?.find { (k, _) ->
                 k.bytes.contentEquals("name".toByteArray())
             }
@@ -1287,10 +1260,8 @@ class Arabp : MainAPI() {
                 magnet.append("&dn=").append(URLEncoder.encode(name, "UTF-8"))
             }
 
-            // === Collect all tracker URLs from the .torrent file ===
             val trackerUrls = mutableListOf<String>()
 
-            // Single announce URL
             val announceEntry = dict.entries.find { (k, _) ->
                 k.bytes.contentEquals("announce".toByteArray())
             }
@@ -1298,7 +1269,6 @@ class Arabp : MainAPI() {
                 trackerUrls.add(String((announceEntry.second as BencodeValue.BString).bytes))
             }
 
-            // Announce-list (multiple trackers)
             val announceListEntry = dict.entries.find { (k, _) ->
                 k.bytes.contentEquals("announce-list".toByteArray())
             }
@@ -1315,7 +1285,6 @@ class Arabp : MainAPI() {
                 }
             }
 
-            // === Extract passkey from tracker URLs and cache it ===
             for (url in trackerUrls) {
                 val match = PASSKEY_REGEX.find(url)
                 if (match != null) {
@@ -1325,14 +1294,10 @@ class Arabp : MainAPI() {
                 }
             }
 
-            // === Build tracker parameters ===
-            // Always include BOTH non-passkey and passkey announce URLs.
-            // Use standard &tr= format (not tr.N) for maximum client compatibility.
             val seenUrls = mutableSetOf<String>()
 
             for (url in trackerUrls) {
                 if (!url.contains("arabp2p.net")) {
-                    // Non-arabp2p tracker (e.g. public tracker) — add as-is
                     if (seenUrls.add(url)) {
                         magnet.append("&tr=").append(URLEncoder.encode(url, "UTF-8"))
                     }
@@ -1341,24 +1306,19 @@ class Arabp : MainAPI() {
 
                 val passkeyMatch = PASSKEY_REGEX.find(url)
                 if (passkeyMatch != null) {
-                    // URL HAS a passkey (e.g. http://www.arabp2p.net:2052/3d365.../announce)
                     val pk = passkeyMatch.groupValues[1]
                     val nonPasskeyUrl = url.replace("/$pk/announce", "/announce")
 
-                    // Add non-passkey first
                     if (seenUrls.add(nonPasskeyUrl)) {
                         magnet.append("&tr=").append(URLEncoder.encode(nonPasskeyUrl, "UTF-8"))
                     }
-                    // Add passkey version
                     if (seenUrls.add(url)) {
                         magnet.append("&tr=").append(URLEncoder.encode(url, "UTF-8"))
                     }
                 } else {
-                    // URL does NOT have a passkey
                     if (seenUrls.add(url)) {
                         magnet.append("&tr=").append(URLEncoder.encode(url, "UTF-8"))
                     }
-                    // Also add passkey version if we have a cached passkey
                     val pk = cachedPasskey
                     if (pk != null) {
                         val passkeyUrl = url.replace("/announce", "/$pk/announce")
@@ -1369,7 +1329,6 @@ class Arabp : MainAPI() {
                 }
             }
 
-            // If no tracker URLs were found, construct from cached passkey
             if (trackerUrls.isEmpty() && cachedPasskey != null) {
                 val nonPasskeyUrl = "http://www.arabp2p.net:2052/announce"
                 val passkeyUrl = "http://www.arabp2p.net:2052/${cachedPasskey}/announce"
@@ -1386,10 +1345,6 @@ class Arabp : MainAPI() {
     }
 
     // ==================== FIND INFO DICT RAW BYTES ====================
-    //
-    // Extracts the exact raw bytes of the "info" dictionary from the .torrent file.
-    // This is critical: we must hash the ORIGINAL bytes, not a re-encoded version.
-    // Re-encoding can produce slightly different bytes → completely different SHA1 hash.
 
     private data class InfoBytesResult(val bytes: ByteArray, val startOffset: Int, val endOffset: Int)
 
@@ -1397,26 +1352,21 @@ class Arabp : MainAPI() {
         return try {
             if (data.isEmpty() || data[0] != 'd'.code.toByte()) return null
 
-            var pos = 1 // skip opening 'd'
+            var pos = 1
 
             while (pos < data.size && data[pos] != 'e'.code.toByte()) {
-                // Parse the key (must be a bencode string)
                 val (key, afterKey) = decodeBencodeString(data, pos)
                 val keyStr = String((key as BencodeValue.BString).bytes)
 
                 if (keyStr == "info") {
-                    // Found the "info" key! The value starts at afterKey.
                     val valueStart = afterKey
-                    // Parse the value to find where it ends
                     val (_, valueEnd) = decodeBencode(data, valueStart)
 
-                    // Extract the exact raw bytes of the info dict
                     val infoBytes = data.sliceArray(valueStart until valueEnd)
                     Log.d(TAG, "findInfoDictBytes: found info dict at offset $valueStart..$valueEnd (${infoBytes.size} bytes)")
                     return InfoBytesResult(infoBytes, valueStart, valueEnd)
                 }
 
-                // Not the "info" key — skip over this key's value
                 val (_, afterValue) = decodeBencode(data, afterKey)
                 pos = afterValue
             }
@@ -1430,18 +1380,12 @@ class Arabp : MainAPI() {
     }
 
     // ==================== PASSKEY FETCH FROM WEBSITE ====================
-    //
-    // Fallback: if the .torrent file doesn't contain the passkey,
-    // try to extract it from the user's profile page on arabp2p.
-    // The passkey is usually shown in the user control panel or
-    // can be derived from the tracker URL shown on torrent detail pages.
 
     private fun fetchPasskeyFromWebsite(): String? {
         if (cachedPasskey != null) return cachedPasskey
         if (!ensureLogin()) return null
 
         return try {
-            // Try fetching user profile page to find passkey
             val profileRequest = Request.Builder()
                 .url("$mainUrl/index.php?page=usercp")
                 .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
@@ -1451,8 +1395,6 @@ class Arabp : MainAPI() {
                 val body = response.body?.string() ?: return null
                 val doc = Jsoup.parse(body, "$mainUrl/index.php?page=usercp")
 
-                // Look for passkey in the page (usually shown as a 32-char hex string)
-                // Try various selectors where xbtit-based trackers show passkey
                 val passkeyElements = doc.select("td:contains(passkey) + td, td:contains(Passkey) + td, " +
                     "td:contains(مفتاح) + td, span.passkey, #passkey")
                 for (el in passkeyElements) {
@@ -1464,7 +1406,6 @@ class Arabp : MainAPI() {
                     }
                 }
 
-                // Fallback: search entire page for 32-char hex string that looks like a passkey
                 val bodyMatch = Regex("[0-9a-f]{32}").find(body)
                 if (bodyMatch != null) {
                     cachedPasskey = bodyMatch.groupValues[0]
@@ -1482,9 +1423,6 @@ class Arabp : MainAPI() {
     }
 
     // ==================== BASE32 ENCODING ====================
-    //
-    // Standard Base32 encoding (RFC 4648) used for magnet URI info hashes.
-    // Converts binary data to a string using the alphabet A-Z2-7.
 
     private fun base32Encode(data: ByteArray): String {
         var result = StringBuilder()
@@ -1507,17 +1445,10 @@ class Arabp : MainAPI() {
             result.append(BASE32_ALPHABET[index])
         }
 
-        // Note: For SHA1 (20 bytes), we get exactly 32 Base32 chars (160 bits / 5 = 32),
-        // which is already a multiple of 8, so no padding is needed.
-        // We skip padding because some torrent clients reject '=' in magnet URIs.
-
         return result.toString()
     }
 
     // ==================== BENCODE PARSER ====================
-    //
-    // Minimal bencode parser/encoder for .torrent files.
-    // Handles: strings (<n>:<bytes>), integers (i<n>e), lists (l...e), dicts (d...e)
 
     sealed class BencodeValue {
         data class BString(val bytes: ByteArray) : BencodeValue()
@@ -1534,7 +1465,7 @@ class Arabp : MainAPI() {
         val firstByte = data[startPos].toInt().toChar()
 
         return when {
-            firstByte == 'd' -> { // Dictionary
+            firstByte == 'd' -> {
                 var pos = startPos + 1
                 val entries = mutableListOf<Pair<BencodeValue.BString, BencodeValue>>()
 
@@ -1547,10 +1478,10 @@ class Arabp : MainAPI() {
                     pos = afterValue
                 }
 
-                BencodeParseResult(BencodeValue.BDict(entries), pos + 1) // skip 'e'
+                BencodeParseResult(BencodeValue.BDict(entries), pos + 1)
             }
 
-            firstByte == 'l' -> { // List
+            firstByte == 'l' -> {
                 var pos = startPos + 1
                 val items = mutableListOf<BencodeValue>()
 
@@ -1560,16 +1491,16 @@ class Arabp : MainAPI() {
                     pos = afterItem
                 }
 
-                BencodeParseResult(BencodeValue.BList(items), pos + 1) // skip 'e'
+                BencodeParseResult(BencodeValue.BList(items), pos + 1)
             }
 
-            firstByte == 'i' -> { // Integer
+            firstByte == 'i' -> {
                 val endPos = indexOfByte(data, 'e'.code.toByte(), startPos + 1)
                 val numStr = String(data, startPos + 1, endPos - startPos - 1)
                 BencodeParseResult(BencodeValue.BInt(numStr.toLong()), endPos + 1)
             }
 
-            firstByte in '0'..'9' -> { // String
+            firstByte in '0'..'9' -> {
                 decodeBencodeString(data, startPos)
             }
 
@@ -1578,7 +1509,6 @@ class Arabp : MainAPI() {
     }
 
     private fun decodeBencodeString(data: ByteArray, startPos: Int): BencodeParseResult {
-        // Format: <length>:<bytes>
         val colonPos = indexOfByte(data, ':'.code.toByte(), startPos)
         val lengthStr = String(data, startPos, colonPos - startPos)
         val length = lengthStr.toInt()
