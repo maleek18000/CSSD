@@ -480,7 +480,7 @@ class StardimaProvider : MainAPI() {
 
     // ==================== PACKED EMBED EXTRACTOR ====================
     // Universal extractor for embed pages that use Dean Edwards packed JS.
-    // Works for lulustream, uqload, hgplaycdn, darkibox, etc.
+    // Works for lulustream, uqload, hgplaycdn, darkibox, earnvids/minochinos, etc.
     //
     // IMPORTANT: Many video CDNs (lulustream/tnmr.org, uqload) use anti-hotlinking
     // protection. The embed page JS calls a "view tracking" URL (/dl?op=view&...)
@@ -488,6 +488,11 @@ class StardimaProvider : MainAPI() {
     // returns 403 for encryption keys and .ts segments, causing ExoPlayer error
     // "io bad http status (2004)". We must extract and call this tracking URL
     // BEFORE returning the ExtractorLink.
+    //
+    // Some hosts (Earnvids/VidHide/Minochinos) provide multiple CDN URLs in
+    // a var links={...} object. We extract ALL URLs and add them as separate
+    // ExtractorLinks so the user can try alternatives if one fails.
+    // Example: hls2 may return 403 while hls3 works — we include both.
 
     private suspend fun extractPackedEmbed(
         url: String, serverName: String,
@@ -499,17 +504,27 @@ class StardimaProvider : MainAPI() {
             // Decode packed JS to get both video URL and view tracking URL
             val decoded = decodePackedFromHtml(html)
 
-            // Extract video URL from decoded JS
-            val videoUrl = decoded?.let { extractVideoUrlFromDecoded(it) }
-                ?: Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""").find(html)?.groupValues?.get(1)
-                ?: Regex("""(https?://[^\s"'<>]+\.mp4[^\s"'<>]*)""").find(html)?.groupValues?.get(1)
+            // CRITICAL: Call the view tracking URL to register this IP with the CDN.
+            // Without this, the CDN returns 403 for segments/keys.
+            decoded?.let { callViewTracking(it, url) }
 
-            if (videoUrl != null) {
-                // CRITICAL: Call the view tracking URL to register this IP with the CDN.
-                // Without this, the CDN returns 403 for segments/keys.
-                decoded?.let { callViewTracking(it, url) }
+            // Extract ALL video URLs from decoded JS (may be multiple for VidHide hosts)
+            val videoUrls = decoded?.let { extractAllVideoUrlsFromDecoded(it) } ?: emptyList()
 
-                val isM3u8 = videoUrl.contains(".m3u8")
+            // If no URLs from packed JS, try regex on raw HTML
+            val allUrls = if (videoUrls.isNotEmpty()) {
+                videoUrls
+            } else {
+                val fallbackUrl = Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""").find(html)?.groupValues?.get(1)
+                    ?: Regex("""(https?://[^\s"'<>]+\.mp4[^\s"'<>]*)""").find(html)?.groupValues?.get(1)
+                if (fallbackUrl != null) listOf(Pair(serverName, fallbackUrl)) else emptyList()
+            }
+
+            for ((label, videoUrl) in allUrls) {
+                // Detect HLS streams: .m3u8 extension OR .txt from var links (disguised m3u8)
+                val isM3u8 = videoUrl.contains(".m3u8") ||
+                    (videoUrl.contains(".txt") && label.startsWith("hls"))
+
                 if (isM3u8) {
                     // Use M3u8Helper.generateM3u8 for proper m3u8 parsing — it resolves
                     // relative URLs, handles variant playlists, and passes headers to ALL
@@ -525,7 +540,7 @@ class StardimaProvider : MainAPI() {
                                 "Referer" to url,
                                 "User-Agent" to headers["User-Agent"]!!
                             ),
-                            name = serverName
+                            name = "$serverName ($label)"
                         ).forEach { link ->
                             callback.invoke(link)
                         }
@@ -534,7 +549,7 @@ class StardimaProvider : MainAPI() {
                         callback.invoke(
                             newExtractorLink(
                                 source = serverName,
-                                name = serverName,
+                                name = "$serverName ($label)",
                                 url = videoUrl,
                                 type = ExtractorLinkType.M3U8
                             ) {
@@ -547,11 +562,15 @@ class StardimaProvider : MainAPI() {
                     callback.invoke(
                         newExtractorLink(
                             source = serverName,
-                            name = serverName,
+                            name = "$serverName ($label)",
                             url = videoUrl,
                             type = INFER_TYPE
                         ) {
                             this.referer = url
+                            this.headers = mapOf(
+                                "Referer" to url,
+                                "User-Agent" to headers["User-Agent"]!!
+                            )
                             this.quality = Qualities.Unknown.value
                         }
                     )
@@ -589,31 +608,26 @@ class StardimaProvider : MainAPI() {
     }
 
     /**
-     * Extract the video URL from already-decoded packed JS.
+     * Extract ALL video URLs from already-decoded packed JS.
+     * Returns a list of (label, url) pairs.
      *
-     * Two formats are supported:
-     * 1. Direct literal: file:"https://..." or sources:[{file:"https://..."...}]
-     * 2. Variable reference: var links={"hls2":"https://...","hls3":"https://..."};
+     * Formats supported:
+     * 1. var links={"hls2":"https://...","hls3":"https://..."};
      *    sources:[{file:links.hls4||links.hls3||links.hls2,type:"hls"}]
-     *    In this case, the file property is a JS expression, not a string.
-     *    We extract the links object and pick the best URL (prefer .m3u8 over .txt).
+     *    → Returns ALL URLs from the links object as separate entries.
+     *    This is important because some CDN mirrors (hls2) may return 403
+     *    while others (hls3) work fine. By including all URLs, the user can
+     *    try alternatives.
+     * 2. Direct literal: file:"https://..." or sources:[{file:"https://..."...}]
+     * 3. Fallback: any .m3u8 URL found in the decoded text
      */
-    private fun extractVideoUrlFromDecoded(decoded: String): String? {
-        // 1. Try direct literal patterns (Lulustream, Uqload style)
-        val literalPatterns = listOf(
-            Regex("file:\\s*[\"'](https?://[^\"']+\\.m3u8[^\"']*)"),
-            Regex("file:\\s*[\"'](https?://[^\"']+)[\"']"),
-            Regex("sources:\\s*\\[\\{file:\\s*[\"'](https?://[^\"']+)[\"']"),
-            Regex("[\"']src[\"']:\\s*[\"'](https?://[^\"']+\\.m3u8[^\"']*)")
-        )
-        for (pattern in literalPatterns) {
-            val match = pattern.find(decoded)
-            if (match != null) return match.groupValues[1]
-        }
+    private fun extractAllVideoUrlsFromDecoded(decoded: String): List<Pair<String, String>> {
+        val results = mutableListOf<Pair<String, String>>()
 
-        // 2. Try variable reference pattern (Streamhg, Earnvids/VidHide style)
-        //    var links={"hls2":"https://...master.m3u8?...","hls3":"https://...master.txt"}
-        //    sources:[{file:links.hls4||links.hls3||links.hls2,type:"hls"}]
+        // 1. Try var links pattern (VidHide/Earnvids/Minochinos/Streamhg style)
+        //    This pattern provides multiple CDN URLs — we include ALL of them
+        //    because some mirrors may be 403 while others work.
+        //    Order: hls4 > hls3 > hls2 (higher number = usually better/preferred by player)
         val linksMatch = Regex("var\\s+links\\s*=\\s*\\{([^}]+)\\}").find(decoded)
         if (linksMatch != null) {
             val linksBody = linksMatch.groupValues[1]
@@ -621,26 +635,58 @@ class StardimaProvider : MainAPI() {
             Regex("\"(\\w+)\"\\s*:\\s*\"(https?://[^\"]+)\"").findAll(linksBody).forEach { m ->
                 urlEntries.add(Pair(m.groupValues[1], m.groupValues[2]))
             }
-            // Prefer hls2 (.m3u8) over hls3 (.txt), then any other URL
-            val hls2 = urlEntries.find { it.first == "hls2" }?.second
-            if (!hls2.isNullOrBlank()) return hls2
-            val anyM3u8 = urlEntries.find { it.second.contains(".m3u8") }?.second
-            if (!anyM3u8.isNullOrBlank()) return anyM3u8
-            val firstUrl = urlEntries.firstOrNull()?.second
-            if (!firstUrl.isNullOrBlank()) return firstUrl
+            // Sort: hls4 first (best), then hls3, then hls2, then others
+            val sorted = urlEntries.sortedByDescending { (key, _) ->
+                when {
+                    key == "hls4" -> 4
+                    key == "hls3" -> 3
+                    key == "hls2" -> 2
+                    key.startsWith("hls") -> 1
+                    else -> 0
+                }
+            }
+            for (entry in sorted) {
+                results.add(Pair(entry.first, entry.second))
+            }
+        }
+
+        // 2. Try direct literal patterns (Lulustream, Uqload style)
+        if (results.isEmpty()) {
+            val literalPatterns = listOf(
+                Regex("file:\\s*[\"'](https?://[^\"']+\\.m3u8[^\"']*)"),
+                Regex("file:\\s*[\"'](https?://[^\"']+)[\"']"),
+                Regex("sources:\\s*\\[\\{file:\\s*[\"'](https?://[^\"']+)[\"']"),
+                Regex("[\"']src[\"']:\\s*[\"'](https?://[^\"']+\\.m3u8[^\"']*)")
+            )
+            for (pattern in literalPatterns) {
+                val match = pattern.find(decoded)
+                if (match != null) {
+                    results.add(Pair("Video", match.groupValues[1]))
+                    break
+                }
+            }
         }
 
         // 3. Last resort: scan for any .m3u8 URL in the decoded text
-        val m3u8Match = Regex("(https?://[^\\s\"'<>]+\\.m3u8[^\\s\"'<>]*)").find(decoded)
-        if (m3u8Match != null) return m3u8Match.groupValues[1]
+        if (results.isEmpty()) {
+            val m3u8Match = Regex("(https?://[^\\s\"'<>]+\\.m3u8[^\\s\"'<>]*)").find(decoded)
+            if (m3u8Match != null) {
+                results.add(Pair("Video", m3u8Match.groupValues[1]))
+            }
+        }
 
-        return null
+        return results
     }
 
     // ==================== KRAKENFILES EXTRACTOR ====================
     // Krakenfiles uses a simple HTML5 <video> with <source> tag instead of
     // packed JS. The video URL is in the src attribute of <source>.
-    // No packed JS, no jwplayer, no view tracking needed.
+    // No packed JS, no jwplayer.
+    //
+    // The CDN (krakencloud.net) serves MP4 with content-type: application/octet-stream.
+    // We must use ExtractorLinkType.VIDEO explicitly because INFER_TYPE can't
+    // detect the video format from the URL (no .mp4 extension).
+    // We also pass explicit headers (Referer + User-Agent) to prevent 403/2004 errors.
 
     private suspend fun extractKrakenfiles(
         url: String, serverName: String,
@@ -663,9 +709,13 @@ class StardimaProvider : MainAPI() {
                         source = serverName,
                         name = serverName,
                         url = videoUrl,
-                        type = INFER_TYPE
+                        type = ExtractorLinkType.VIDEO
                     ) {
                         this.referer = url
+                        this.headers = mapOf(
+                            "Referer" to url,
+                            "User-Agent" to headers["User-Agent"]!!
+                        )
                         this.quality = Qualities.Unknown.value
                     }
                 )
