@@ -683,15 +683,14 @@ class StardimaProvider : MainAPI() {
     // packed JS. The video URL is in the src attribute of <source>.
     // No packed JS, no jwplayer.
     //
-    // The CDN (krakencloud.net) serves MP4 with content-type: application/octet-stream.
-    // The URL has no .mp4 extension so INFER_TYPE can't auto-detect the format.
-    // We append "?.mp4" as a type hint so CloudStream recognizes the file type.
-    // The CDN ignores unknown query parameters and serves the video normally.
+    // The CDN (krakencloud.net) binds the video URL token to the User-Agent
+    // that was used when the embed page was fetched. If ExoPlayer uses a
+    // different User-Agent (e.g. "ExoPlayerLib/2.19.1"), the CDN returns 404,
+    // which CloudStream reports as "io bad http status (2004)".
+    // FIX: Pass the same User-Agent via this.headers so ExoPlayer uses it.
+    // No Referer, cookies, or tracking calls are needed — only matching UA.
     //
-    // CRITICAL: The CDN may block ExoPlayer's default User-Agent. To prevent
-    // 403/2004 errors, we "warm up" the CDN by making a HEAD request to the
-    // video URL with browser-like headers before returning the ExtractorLink.
-    // This registers our IP/User-Agent with the CDN so ExoPlayer can stream.
+    // We append "?.mp4" as a type hint since the URL has no .mp4 extension.
 
     private suspend fun extractKrakenfiles(
         url: String, serverName: String,
@@ -709,15 +708,6 @@ class StardimaProvider : MainAPI() {
                 ?: Regex("""<source\s+src="(https?://[^"]+)"""").find(html)?.groupValues?.get(1)
 
             if (videoUrl != null) {
-                // Warm up the CDN: request just the first byte with browser headers
-                // so the CDN registers our IP. This prevents 403/2004 when ExoPlayer streams.
-                try {
-                    app.get(videoUrl, headers = headers + mapOf(
-                        "Referer" to url,
-                        "Range" to "bytes=0-0"
-                    ))
-                } catch (_: Exception) {}
-
                 // Append ?.mp4 as a type hint so CloudStream/ExoPlayer detects MP4
                 val hintUrl = if (videoUrl.contains(".mp4")) videoUrl else "$videoUrl?.mp4"
 
@@ -728,7 +718,9 @@ class StardimaProvider : MainAPI() {
                         url = hintUrl,
                         type = INFER_TYPE
                     ) {
-                        this.referer = url
+                        this.headers = mapOf(
+                            "User-Agent" to headers["User-Agent"]!!
+                        )
                         this.quality = Qualities.Unknown.value
                     }
                 )
