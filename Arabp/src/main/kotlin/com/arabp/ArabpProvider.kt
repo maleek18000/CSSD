@@ -271,7 +271,8 @@ class Arabp : MainAPI() {
         "$mainUrl/index.php?page=tv-listing" to "مسلسلات عربية",
         "$mainUrl/index.php?page=movies-listing" to "أفلام عربية",
         "$mainUrl/index.php?page=torrents&category=19" to "وثائقيات",
-        "$mainUrl/index.php?page=torrents&category=88" to "أفلام مدبلجة للعربية"
+        "$mainUrl/index.php?page=torrents&category=88" to "أفلام مدبلجة للعربية",
+        "$mainUrl/index.php?page=torrents&category=90" to "برامج و مسابقات"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
@@ -326,6 +327,7 @@ class Arabp : MainAPI() {
             pageUrl.contains("tv-listing") -> TvType.TvSeries
             pageUrl.contains("category=19") -> TvType.TvSeries
             pageUrl.contains("category=88") -> TvType.Movie
+            pageUrl.contains("category=90") -> TvType.TvSeries
             else -> TvType.Anime
         }
     }
