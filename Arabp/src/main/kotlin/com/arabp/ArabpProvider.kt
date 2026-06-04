@@ -291,12 +291,19 @@ class Arabp : MainAPI() {
 
             // For torrent category pages (e.g. documentaries), try torrent table parsing
             val allItems = if (items.isEmpty() && request.data.contains("category=")) {
-                val tableResults = doc.select("table.lista2t tr.lista2, table tr:has(a[href*=torrent-details])")
-                    .mapNotNull { torrentRowToSearchResult(it, tvType) }
+                // Modern torrent pages use div.file-header — prefer these as they give
+                // one result per torrent. Avoid table tr selectors here because the
+                // new page layout has a single tr containing ALL file-headers, which
+                // would produce duplicate/wrong results.
                 val modernResults = doc.select("div.file-header")
                     .mapNotNull { modernTorrentRowToSearchResult(it, tvType) }
-                Log.d(TAG, "getMainPage: torrent table found ${tableResults.size} + ${modernResults.size} results for '${request.name}'")
-                tableResults + modernResults
+                // Fallback: old-style table rows (only if no file-header found)
+                val tableResults = if (modernResults.isEmpty()) {
+                    doc.select("table.lista2t tr.lista2")
+                        .mapNotNull { torrentRowToSearchResult(it, tvType) }
+                } else emptyList()
+                Log.d(TAG, "getMainPage: torrent page found ${modernResults.size} modern + ${tableResults.size} table results for '${request.name}'")
+                modernResults + tableResults
             } else {
                 items
             }
@@ -422,12 +429,15 @@ class Arabp : MainAPI() {
                     val body = response.body?.string() ?: ""
                     val torrentsDoc = Jsoup.parse(body, torrentsUrl)
 
-                    val tableResults = torrentsDoc.select("table.lista2t tr.lista2, table tr:has(a[href*=torrent-details])")
-                        .mapNotNull { torrentRowToSearchResult(it) }
+                    // Prefer modern file-header format; fall back to old table format
                     val modernResults = torrentsDoc.select("div.file-header")
                         .mapNotNull { modernTorrentRowToSearchResult(it) }
+                    val tableResults = if (modernResults.isEmpty()) {
+                        torrentsDoc.select("table.lista2t tr.lista2")
+                            .mapNotNull { torrentRowToSearchResult(it) }
+                    } else emptyList()
 
-                    val allTorrentResults = tableResults + modernResults
+                    val allTorrentResults = modernResults + tableResults
                     Log.d(TAG, "Torrents search: found ${allTorrentResults.size} results")
                     results.addAll(allTorrentResults)
                 }
@@ -495,13 +505,18 @@ class Arabp : MainAPI() {
                 ?: nameLink.attr("rel")
                 ?: ""
 
-            val epData = "$torrentId|${detailHref}|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
+            // Use detailHref as the search result URL (a clean, valid HTTP URL)
+            // instead of pipe-delimited data which CloudStream may not handle properly
+            // in search result URLs. The torrent metadata is encoded as a URL parameter.
+            val torrentData = "$torrentId|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
+            val encodedData = URLEncoder.encode(torrentData, "UTF-8")
+            val searchUrl = "${detailHref}&arabp_data=$encodedData"
             when (tvType) {
-                TvType.TvSeries -> newTvSeriesSearchResponse(displayName, epData, tvType) {
+                TvType.TvSeries -> newTvSeriesSearchResponse(displayName, searchUrl, tvType) {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
                     this.posterHeaders = imageHeaders
                 }
-                else -> newAnimeSearchResponse(displayName, epData, tvType) {
+                else -> newAnimeSearchResponse(displayName, searchUrl, tvType) {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
                     this.posterHeaders = imageHeaders
                 }
@@ -539,13 +554,18 @@ class Arabp : MainAPI() {
                 ?: nameLink.attr("rel")
                 ?: ""
 
-            val epData = "$torrentId|${detailHref}|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
+            // Use detailHref as the search result URL (a clean, valid HTTP URL)
+            // instead of pipe-delimited data which CloudStream may not handle properly
+            // in search result URLs. The torrent metadata is encoded as a URL parameter.
+            val torrentData = "$torrentId|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
+            val encodedData = URLEncoder.encode(torrentData, "UTF-8")
+            val searchUrl = "${detailHref}&arabp_data=$encodedData"
             when (tvType) {
-                TvType.TvSeries -> newTvSeriesSearchResponse(displayName, epData, tvType) {
+                TvType.TvSeries -> newTvSeriesSearchResponse(displayName, searchUrl, tvType) {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
                     this.posterHeaders = imageHeaders
                 }
-                else -> newAnimeSearchResponse(displayName, epData, tvType) {
+                else -> newAnimeSearchResponse(displayName, searchUrl, tvType) {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
                     this.posterHeaders = imageHeaders
                 }
@@ -698,6 +718,10 @@ class Arabp : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse? {
         if (url.contains("|")) return loadFromTorrentData(url)
+
+        // Handle torrent detail pages (e.g. from documentary/category listings)
+        // These use arabp_data URL parameter instead of pipe-delimited data
+        if (url.contains("arabp_data=")) return loadFromTorrentDetailUrl(url)
 
         val fullUrl = toAbsoluteUrl(url)
         val doc = fetchDoc(fullUrl) ?: return null
@@ -1111,6 +1135,220 @@ class Arabp : MainAPI() {
         val baseData = parts.joinToString("|")
         val epData = "$baseData|0"
         return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), listOf(
+            newEpisode(epData, fix = false, initializer = {
+                name = title
+                season = 1
+                episode = 1
+                this.posterUrl = absPosterUrl
+            })
+        )) {
+            this.posterUrl = absPosterUrl
+            this.posterHeaders = imageHeaders
+            this.seasonNames = listOf(SeasonData(season = 1, name = title))
+        }
+    }
+
+    // ==================== LOAD FROM TORRENT DETAIL URL ====================
+
+    /**
+     * Handle URLs from torrent category pages (documentaries, etc.) that use
+     * a real torrent-detail URL with an arabp_data query parameter containing
+     * encoded torrent metadata. This follows the same pattern as the anime
+     * listing pages: fetch detail page, find download link, download .torrent,
+     * parse it, and create episodes.
+     */
+    private suspend fun loadFromTorrentDetailUrl(url: String): LoadResponse? {
+        // Extract the actual detail page URL (strip the arabp_data parameter)
+        val detailUrl = url.substringBefore("&arabp_data=")
+        // Decode the torrent metadata
+        val encodedData = url.substringAfter("arabp_data=", "")
+        val torrentData = try {
+            java.net.URLDecoder.decode(encodedData, "UTF-8")
+        } catch (e: Exception) {
+            Log.e(TAG, "loadFromTorrentDetailUrl: failed to decode arabp_data: ${e.message}")
+            return null
+        }
+
+        // torrentData format: torrentId|downloadUrl|magnetUrl|isFree|isExternal
+        val dataParts = torrentData.split("|")
+        val torrentId = dataParts.getOrNull(0) ?: "0"
+        val downloadUrl = dataParts.getOrNull(1) ?: ""
+        val magnetUrl = dataParts.getOrNull(2) ?: ""
+        val isFree = dataParts.getOrNull(3) == "1"
+        val isExternal = dataParts.getOrNull(4) == "1"
+
+        Log.d(TAG, "loadFromTorrentDetailUrl: id=$torrentId, free=$isFree, external=$isExternal, detailUrl=$detailUrl")
+
+        // Build the full baseData in the same format as anime episodes use:
+        // torrentId|detailUrl|downloadUrl|magnetUrl|isFree|isExternal
+        val baseData = "$torrentId|$detailUrl|$downloadUrl|$magnetUrl|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
+
+        var title = "Torrent #$torrentId"
+        var posterUrl = ""
+
+        // Fetch the detail page for title and poster
+        try {
+            if (ensureLogin() && detailUrl.isNotBlank()) {
+                val request = Request.Builder()
+                    .url(toAbsoluteUrl(detailUrl))
+                    .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
+                    .build()
+                authClient.newCall(request).execute().use { response ->
+                    val body = response.body?.string() ?: ""
+                    val detailDoc = Jsoup.parse(body, toAbsoluteUrl(detailUrl))
+                    title = detailDoc.selectFirst("td#Title h1")?.text()?.trim() ?: title
+                    posterUrl = detailDoc.selectFirst("img.listing_poster")?.attr("src")
+                        ?: detailDoc.selectFirst("img[src*=poster]")?.attr("src")
+                        ?: ""
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "loadFromTorrentDetailUrl detail fetch error: ${e.message}")
+        }
+
+        val absPosterUrl = toAbsoluteUrl(posterUrl)
+        val pageTvType = tvTypeFromTitle(title)
+
+        // Handle external torrents with magnet links
+        if (isExternal && magnetUrl.startsWith("magnet:")) {
+            val epData = "$baseData|0"
+            return newMovieLoadResponse(title, url, pageTvType.toMovieType(), epData) {
+                this.posterUrl = absPosterUrl
+                this.posterHeaders = imageHeaders
+            }
+        }
+
+        // Download and parse the .torrent file — same logic as anime listing pages
+        val folderResult = try {
+            if (!isExternal && ensureLogin()) {
+                var resolvedUrl = toAbsoluteUrl(downloadUrl)
+
+                // If we don't have a valid download URL with &f=, try to find one from the detail page
+                if (resolvedUrl.isBlank() || !resolvedUrl.contains("&f=")) {
+                    val detailPageUrl = toAbsoluteUrl(detailUrl)
+                    val detailRequest = Request.Builder()
+                        .url(detailPageUrl)
+                        .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
+                        .build()
+                    authClient.newCall(detailRequest).execute().use { resp ->
+                        val body = resp.body?.string() ?: ""
+                        val detailDoc = Jsoup.parse(body, detailPageUrl)
+                        val dlLink = detailDoc.selectFirst("a[href*=download.php]")
+                            ?: detailDoc.selectFirst("td#Title h1 a[href*=download.php]")
+                        if (dlLink != null) {
+                            resolvedUrl = toAbsoluteUrl(dlLink.attr("href"))
+                        }
+                    }
+                }
+
+                if (resolvedUrl.contains("&f=")) {
+                    var dlResult = downloadTorrentFile(resolvedUrl)
+
+                    // Handle daily limit: thank uploader and retry once
+                    if (dlResult is TorrentDownloadResult.DailyLimitExceeded) {
+                        Log.w(TAG, "loadFromTorrentDetailUrl: Daily limit hit for #$torrentId, thanking and retrying...")
+                        thankUploader(torrentId, detailUrl)
+                        dlResult = downloadTorrentFile(resolvedUrl)
+                    }
+
+                    if (dlResult is TorrentDownloadResult.Success) {
+                        cacheTorrent(torrentId, dlResult.bytes)
+                        val folders = parseTorrentFolders(dlResult.bytes)
+                        val totalVideos = folders.sumOf { it.videoFiles.size }
+                        Log.d(TAG, "loadFromTorrentDetailUrl: Torrent #$torrentId has ${totalVideos} video files in ${folders.size} folders")
+                        if (totalVideos >= 1) {
+                            Pair(folders, baseData)
+                        } else null
+                    } else null
+                } else null
+            } else null
+        } catch (e: Exception) {
+            Log.w(TAG, "loadFromTorrentDetailUrl download failed: ${e.message}")
+            null
+        }
+
+        // Fallback: parse file list from details page when .torrent download failed
+        val fallbackFileNames = if (folderResult == null && !isExternal) {
+            parseFileListFromDetailPage(detailUrl)
+        } else null
+
+        if (folderResult != null) {
+            val (folders, baseDataStr) = folderResult
+            val episodes = mutableListOf<Episode>()
+            val seasonNamesList = mutableListOf<SeasonData>()
+            val hasMultipleFolders = folders.size > 1
+
+            var seasonNum = 1
+            if (hasMultipleFolders) {
+                for (folder in folders) {
+                    val seasonDisplayName = if (folder.folderName.isNotEmpty())
+                        folder.folderName else title
+                    seasonNamesList.add(SeasonData(season = seasonNum, name = seasonDisplayName))
+                    val globalOffset = folders.takeWhile { it != folder }
+                        .sumOf { it.videoFiles.size }
+                    for ((localIdx, filePath) in folder.videoFiles.withIndex()) {
+                        val fileName = filePath.substringAfterLast("/")
+                        val epNameFromFile = fileName.substringBeforeLast(".")
+                            .replace(".", " ").replace("_", " ").trim()
+                        val globalIdx = globalOffset + localIdx
+                        val epData = "$baseDataStr|${globalIdx}"
+                        episodes.add(newEpisode(epData, fix = false, initializer = {
+                            name = epNameFromFile
+                            season = seasonNum
+                            episode = localIdx + 1
+                            this.posterUrl = absPosterUrl
+                        }))
+                    }
+                    seasonNum++
+                }
+            } else {
+                seasonNamesList.add(SeasonData(season = 1, name = title))
+                val allFiles = folders.flatMap { it.videoFiles }
+                for ((idx, filePath) in allFiles.withIndex()) {
+                    val fileName = filePath.substringAfterLast("/")
+                    val epNameFromFile = fileName.substringBeforeLast(".")
+                        .replace(".", " ").replace("_", " ").trim()
+                    val epData = "$baseDataStr|${idx}"
+                    episodes.add(newEpisode(epData, fix = false, initializer = {
+                        name = epNameFromFile
+                        season = 1
+                        episode = idx + 1
+                        this.posterUrl = absPosterUrl
+                    }))
+                }
+            }
+
+            return newTvSeriesLoadResponse(title, url, pageTvType.toSeriesType(), episodes) {
+                this.posterUrl = absPosterUrl
+                this.posterHeaders = imageHeaders
+                this.seasonNames = seasonNamesList
+            }
+        }
+
+        // Fallback: use file names from details page
+        if (fallbackFileNames != null && fallbackFileNames.size > 1) {
+            val episodes = mutableListOf<Episode>()
+            for ((idx, fileName) in fallbackFileNames.withIndex()) {
+                val epNameFromFile = fileName.substringBeforeLast(".")
+                    .replace(".", " ").replace("_", " ").trim()
+                val epData = "$baseData|${idx}"
+                episodes.add(newEpisode(epData, fix = false, initializer = {
+                    name = epNameFromFile
+                    season = 1
+                    episode = idx + 1
+                    this.posterUrl = absPosterUrl
+                }))
+            }
+            return newTvSeriesLoadResponse(title, url, pageTvType.toSeriesType(), episodes) {
+                this.posterUrl = absPosterUrl
+                this.posterHeaders = imageHeaders
+                this.seasonNames = listOf(SeasonData(season = 1, name = title))
+            }
+        }
+
+        // Single episode fallback
+        val epData = "$baseData|0"
+        return newTvSeriesLoadResponse(title, url, pageTvType.toSeriesType(), listOf(
             newEpisode(epData, fix = false, initializer = {
                 name = title
                 season = 1
