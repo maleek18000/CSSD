@@ -31,7 +31,7 @@ class Arabp : MainAPI() {
     override var name = "Arabp"
     override val hasMainPage = true
     override var lang = "ar"
-    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA, TvType.TvSeries, TvType.Movie, TvType.Documentary)
+    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA, TvType.TvSeries, TvType.Movie)
 
     companion object {
         private const val TAG = "Arabp_Log"
@@ -214,11 +214,6 @@ class Arabp : MainAPI() {
         }
     }
 
-    /** Strip the #doc marker from a detail URL before making HTTP requests */
-    private fun cleanDetailUrl(url: String): String {
-        return url.removeSuffix("#doc")
-    }
-
     // ==================== AUTH-AWARE DOCUMENT FETCHING ====================
 
     private fun fetchDocWithAuth(url: String): Document? {
@@ -321,7 +316,7 @@ class Arabp : MainAPI() {
         return when {
             pageUrl.contains("movies-listing") -> TvType.Movie
             pageUrl.contains("tv-listing") -> TvType.TvSeries
-            pageUrl.contains("category=19") -> TvType.Documentary
+            pageUrl.contains("category=19") -> TvType.TvSeries
             else -> TvType.Anime
         }
     }
@@ -336,14 +331,12 @@ class Arabp : MainAPI() {
     private fun TvType.toMovieType(): TvType = when (this) {
         TvType.Movie -> TvType.Movie
         TvType.Anime -> TvType.AnimeMovie
-        TvType.Documentary -> TvType.Documentary
         else -> TvType.Movie
     }
 
     private fun TvType.toSeriesType(): TvType = when (this) {
         TvType.TvSeries -> TvType.TvSeries
         TvType.Anime -> TvType.Anime
-        TvType.Documentary -> TvType.Documentary
         else -> TvType.TvSeries
     }
 
@@ -375,7 +368,7 @@ class Arabp : MainAPI() {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
                     this.posterHeaders = imageHeaders
                 }
-                TvType.TvSeries, TvType.Documentary -> newTvSeriesSearchResponse(title, href, tvType) {
+                TvType.TvSeries -> newTvSeriesSearchResponse(title, href, tvType) {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
                     this.posterHeaders = imageHeaders
                 }
@@ -486,8 +479,8 @@ class Arabp : MainAPI() {
             val tvType = when {
                 categoryName.contains("فيلم", ignoreCase = true) || categoryName.contains("Movie", ignoreCase = true) ||
                         name.contains("فيلم", ignoreCase = true) -> TvType.AnimeMovie
-                categoryName.contains("وثائق", ignoreCase = true) || categoryName.contains("Documentary", ignoreCase = true) -> TvType.Documentary
-                fallbackTvType == TvType.Documentary -> TvType.Documentary
+                categoryName.contains("وثائق", ignoreCase = true) || categoryName.contains("Documentary", ignoreCase = true) -> TvType.TvSeries
+                fallbackTvType == TvType.TvSeries -> TvType.TvSeries
                 else -> fallbackTvType
             }
 
@@ -502,10 +495,9 @@ class Arabp : MainAPI() {
                 ?: nameLink.attr("rel")
                 ?: ""
 
-            val docMarker = if (tvType == TvType.Documentary) "#doc" else ""
-            val epData = "$torrentId|${detailHref}${docMarker}|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
+            val epData = "$torrentId|${detailHref}|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
             when (tvType) {
-                TvType.Documentary -> newTvSeriesSearchResponse(displayName, epData, tvType) {
+                TvType.TvSeries -> newTvSeriesSearchResponse(displayName, epData, tvType) {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
                     this.posterHeaders = imageHeaders
                 }
@@ -534,7 +526,7 @@ class Arabp : MainAPI() {
             val isExternal = isExternalTorrent(row)
             val tvType = when {
                 name.contains("فيلم", ignoreCase = true) || name.contains("Movie", ignoreCase = true) -> TvType.AnimeMovie
-                fallbackTvType == TvType.Documentary -> TvType.Documentary
+                fallbackTvType == TvType.TvSeries -> TvType.TvSeries
                 else -> fallbackTvType
             }
 
@@ -547,10 +539,9 @@ class Arabp : MainAPI() {
                 ?: nameLink.attr("rel")
                 ?: ""
 
-            val docMarker = if (tvType == TvType.Documentary) "#doc" else ""
-            val epData = "$torrentId|${detailHref}${docMarker}|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
+            val epData = "$torrentId|${detailHref}|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
             when (tvType) {
-                TvType.Documentary -> newTvSeriesSearchResponse(displayName, epData, tvType) {
+                TvType.TvSeries -> newTvSeriesSearchResponse(displayName, epData, tvType) {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
                     this.posterHeaders = imageHeaders
                 }
@@ -957,18 +948,16 @@ class Arabp : MainAPI() {
         var title = "Torrent #$torrentId"
         var posterUrl = ""
 
-        val cleanedDetailUrl = cleanDetailUrl(detailUrl)
-
         try {
-            if (ensureLogin() && cleanedDetailUrl.isNotBlank()) {
+            if (ensureLogin() && detailUrl.isNotBlank()) {
                 val request = Request.Builder()
-                    .url(toAbsoluteUrl(cleanedDetailUrl))
+                    .url(toAbsoluteUrl(detailUrl))
                     .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
                     .build()
 
                 authClient.newCall(request).execute().use { response ->
                     val body = response.body?.string() ?: ""
-                    val detailDoc = Jsoup.parse(body, toAbsoluteUrl(cleanedDetailUrl))
+                    val detailDoc = Jsoup.parse(body, toAbsoluteUrl(detailUrl))
                     title = detailDoc.selectFirst("td#Title h1")?.text()?.trim() ?: title
                     posterUrl = detailDoc.selectFirst("img.listing_poster")?.attr("src") ?: ""
                 }
@@ -982,7 +971,6 @@ class Arabp : MainAPI() {
         val pageTvType = if (detailUrl.contains("movies-listing")) TvType.Movie
             else if (detailUrl.contains("tv-listing")) TvType.TvSeries
             else if (detailUrl.contains("anime-listing")) TvType.Anime
-            else if (detailUrl.contains("#doc")) TvType.Documentary
             else tvTypeFromTitle(title)
 
         if (isExternal && magnetUrl.startsWith("magnet:")) {
@@ -996,7 +984,7 @@ class Arabp : MainAPI() {
             if (!isExternal && ensureLogin()) {
                 var resolvedUrl = toAbsoluteUrl(downloadUrl)
                 if (resolvedUrl.isBlank() || !resolvedUrl.contains("&f=")) {
-                    val detailPageUrl = toAbsoluteUrl(cleanedDetailUrl)
+                    val detailPageUrl = toAbsoluteUrl(detailUrl)
                     val detailRequest = Request.Builder()
                         .url(detailPageUrl)
                         .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
@@ -1017,7 +1005,7 @@ class Arabp : MainAPI() {
                     // Handle daily limit: thank uploader and retry once
                     if (dlResult is TorrentDownloadResult.DailyLimitExceeded) {
                         Log.w(TAG, "loadFromTorrentData: Daily limit hit for #$torrentId, thanking and retrying...")
-                        thankUploader(torrentId, cleanedDetailUrl)
+                        thankUploader(torrentId, detailUrl)
                         dlResult = downloadTorrentFile(resolvedUrl)
                     }
 
@@ -1039,7 +1027,7 @@ class Arabp : MainAPI() {
 
         // Fallback: parse file list from details page when .torrent download failed
         val fallbackFileNames = if (folderResult == null && !isExternal) {
-            parseFileListFromDetailPage(cleanedDetailUrl)
+            parseFileListFromDetailPage(detailUrl)
         } else null
 
         if (folderResult != null) {
@@ -1247,9 +1235,6 @@ class Arabp : MainAPI() {
         val isExternal = parts.getOrNull(5) == "1"
         val fileIndex = dataParts.getOrNull(6)?.toIntOrNull()
 
-        // Strip #doc marker from detailUrl before any HTTP requests
-        val cleanedDetailUrl = cleanDetailUrl(detailUrl)
-
         Log.d(TAG, "loadLinks: id=$torrentId, free=$isFree, external=$isExternal, fileIndex=$fileIndex")
 
         return try {
@@ -1278,7 +1263,7 @@ class Arabp : MainAPI() {
             }
 
             if (!isFree) {
-                val thankDetailUrl = if (cleanedDetailUrl.isNotBlank()) cleanedDetailUrl
+                val thankDetailUrl = if (detailUrl.isNotBlank()) detailUrl
                     else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
                 val thanked = thankUploader(torrentId, thankDetailUrl)
                 Log.d(TAG, "loadLinks: thank uploader result = $thanked for torrent $torrentId")
@@ -1297,7 +1282,7 @@ class Arabp : MainAPI() {
             var resolvedDownloadUrl = downloadUrl
 
             if (resolvedDownloadUrl.isBlank() || !resolvedDownloadUrl.contains("&f=")) {
-                val detailPageUrl = if (cleanedDetailUrl.isNotBlank()) cleanedDetailUrl
+                val detailPageUrl = if (detailUrl.isNotBlank()) detailUrl
                     else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
 
                 try {
