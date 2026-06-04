@@ -273,7 +273,11 @@ class Arabp : MainAPI() {
         "$mainUrl/index.php?page=torrents&category=19" to "وثائقيات",
         "$mainUrl/index.php?page=torrents&category=88" to "أفلام مدبلجة للعربية",
         "$mainUrl/index.php?page=torrents&category=90" to "برامج و مسابقات",
-        "$mainUrl/index.php?page=torrents&category=93" to "وثائقيات مترجمة"
+        "$mainUrl/index.php?page=torrents&category=93" to "وثائقيات مترجمة",
+        "$mainUrl/index.php?page=torrents&active=0&category=113" to "مسلسلات لاتينية",
+        "$mainUrl/index.php?page=torrents&active=0&category=57" to "مسلسلات آسيوية",
+        "$mainUrl/index.php?page=torrents&active=0&category=71" to "مسلسلات مدبلجة للعربية",
+        "$mainUrl/index.php?page=torrents&active=0&category=115" to "مسلسلات تركية"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
@@ -330,6 +334,10 @@ class Arabp : MainAPI() {
             pageUrl.contains("category=88") -> TvType.Movie
             pageUrl.contains("category=90") -> TvType.TvSeries
             pageUrl.contains("category=93") -> TvType.TvSeries
+            pageUrl.contains("category=113") -> TvType.TvSeries
+            pageUrl.contains("category=57") -> TvType.TvSeries
+            pageUrl.contains("category=71") -> TvType.TvSeries
+            pageUrl.contains("category=115") -> TvType.TvSeries
             else -> TvType.Anime
         }
     }
