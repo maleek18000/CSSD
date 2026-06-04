@@ -270,7 +270,8 @@ class Arabp : MainAPI() {
         "$mainUrl/index.php?page=anime-listing" to "قائمة الانمي",
         "$mainUrl/index.php?page=tv-listing" to "مسلسلات عربية",
         "$mainUrl/index.php?page=movies-listing" to "أفلام عربية",
-        "$mainUrl/index.php?page=torrents&category=19" to "وثائقيات"
+        "$mainUrl/index.php?page=torrents&category=19" to "وثائقيات",
+        "$mainUrl/index.php?page=torrents&category=88" to "أفلام مدبلجة للعربية"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
@@ -324,6 +325,7 @@ class Arabp : MainAPI() {
             pageUrl.contains("movies-listing") -> TvType.Movie
             pageUrl.contains("tv-listing") -> TvType.TvSeries
             pageUrl.contains("category=19") -> TvType.TvSeries
+            pageUrl.contains("category=88") -> TvType.Movie
             else -> TvType.Anime
         }
     }
@@ -488,7 +490,9 @@ class Arabp : MainAPI() {
             val isExternal = isExternalTorrent(row)
             val tvType = when {
                 categoryName.contains("فيلم", ignoreCase = true) || categoryName.contains("Movie", ignoreCase = true) ||
-                        name.contains("فيلم", ignoreCase = true) -> TvType.AnimeMovie
+                        name.contains("فيلم", ignoreCase = true) -> {
+                    if (fallbackTvType == TvType.Anime) TvType.AnimeMovie else TvType.Movie
+                }
                 categoryName.contains("وثائق", ignoreCase = true) || categoryName.contains("Documentary", ignoreCase = true) -> TvType.TvSeries
                 fallbackTvType == TvType.TvSeries -> TvType.TvSeries
                 else -> fallbackTvType
@@ -516,6 +520,10 @@ class Arabp : MainAPI() {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
                     this.posterHeaders = imageHeaders
                 }
+                TvType.Movie -> newMovieSearchResponse(displayName, searchUrl, tvType) {
+                    this.posterUrl = toAbsoluteUrl(posterUrl)
+                    this.posterHeaders = imageHeaders
+                }
                 else -> newAnimeSearchResponse(displayName, searchUrl, tvType) {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
                     this.posterHeaders = imageHeaders
@@ -540,7 +548,9 @@ class Arabp : MainAPI() {
             val isFree = isFreeTorrent(row)
             val isExternal = isExternalTorrent(row)
             val tvType = when {
-                name.contains("فيلم", ignoreCase = true) || name.contains("Movie", ignoreCase = true) -> TvType.AnimeMovie
+                name.contains("فيلم", ignoreCase = true) || name.contains("Movie", ignoreCase = true) -> {
+                    if (fallbackTvType == TvType.Anime) TvType.AnimeMovie else TvType.Movie
+                }
                 fallbackTvType == TvType.TvSeries -> TvType.TvSeries
                 else -> fallbackTvType
             }
@@ -562,6 +572,10 @@ class Arabp : MainAPI() {
             val searchUrl = "${detailHref}&arabp_data=$encodedData"
             when (tvType) {
                 TvType.TvSeries -> newTvSeriesSearchResponse(displayName, searchUrl, tvType) {
+                    this.posterUrl = toAbsoluteUrl(posterUrl)
+                    this.posterHeaders = imageHeaders
+                }
+                TvType.Movie -> newMovieSearchResponse(displayName, searchUrl, tvType) {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
                     this.posterHeaders = imageHeaders
                 }
