@@ -1014,7 +1014,7 @@ class Arabp : MainAPI() {
                         val folders = parseTorrentFolders(dlResult.bytes)
                         val totalVideos = folders.sumOf { it.videoFiles.size }
                         Log.d(TAG, "loadFromTorrentData: Torrent #$torrentId has ${totalVideos} video files in ${folders.size} folders")
-                        if (totalVideos > 1) {
+                        if (totalVideos >= 1) {
                             Pair(folders, parts.joinToString("|"))
                         } else null
                     } else null
@@ -1107,8 +1107,11 @@ class Arabp : MainAPI() {
             }
         }
 
+        // Single episode fallback — use baseData with file index 0 for consistency
+        val baseData = parts.joinToString("|")
+        val epData = "$baseData|0"
         return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), listOf(
-            newEpisode(data, fix = false, initializer = {
+            newEpisode(epData, fix = false, initializer = {
                 name = title
                 season = 1
                 episode = 1
@@ -1324,7 +1327,17 @@ class Arabp : MainAPI() {
 
             if (resolvedDownloadUrl.isNotBlank() && resolvedDownloadUrl.contains("&f=")) {
                 try {
-                    val result = downloadTorrentFile(resolvedDownloadUrl)
+                    var result = downloadTorrentFile(resolvedDownloadUrl)
+
+                    // Handle daily limit: thank uploader and retry once
+                    if (result is TorrentDownloadResult.DailyLimitExceeded) {
+                        Log.w(TAG, "loadLinks: Daily limit hit for #$torrentId, thanking and retrying...")
+                        val thankDetailUrl = if (detailUrl.isNotBlank()) detailUrl
+                            else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
+                        thankUploader(torrentId, thankDetailUrl)
+                        result = downloadTorrentFile(resolvedDownloadUrl)
+                    }
+
                     if (result is TorrentDownloadResult.Success) {
                         cacheTorrent(torrentId, result.bytes)
                     }
@@ -1383,52 +1396,9 @@ class Arabp : MainAPI() {
                 }
             }
             is TorrentDownloadResult.DailyLimitExceeded -> {
-                Log.w(TAG, "DAILY DOWNLOAD LIMIT EXCEEDED, thanking and retrying...")
-                val retryResult = downloadTorrentFile(downloadUrl)
-                when (retryResult) {
-                    is TorrentDownloadResult.Success -> {
-                        Log.d(TAG, "Retry succeeded!")
-
-                        val localUrl = startLocalTorrentServer(retryResult.bytes)
-                        if (localUrl != null) {
-                            val torrentUrl = if (fileIndex != null) "$localUrl&file_index=$fileIndex" else localUrl
-                            callback(
-                                newExtractorLink(
-                                    source = this.name,
-                                    name = "${this.name} (Torrent)",
-                                    url = torrentUrl,
-                                    type = ExtractorLinkType.TORRENT
-                                )
-                            )
-                            foundLink = true
-                        }
-
-                        val magnet = torrentToMagnet(retryResult.bytes)
-                        if (magnet != null) {
-                            callback(
-                                newExtractorLink(
-                                    source = this.name,
-                                    name = "${this.name} (Magnet)",
-                                    url = magnet,
-                                    type = ExtractorLinkType.MAGNET
-                                )
-                            )
-                            foundLink = true
-                        }
-                    }
-                    else -> {
-                        Log.e(TAG, "Download still failed after thank + retry")
-                        callback(
-                            newExtractorLink(
-                                source = this.name,
-                                name = "\u274C تجاوزت الحد اليومي للتحميل",
-                                url = "$mainUrl/",
-                                type = ExtractorLinkType.VIDEO
-                            )
-                        )
-                        foundLink = true
-                    }
-                }
+                // This is reached if loadLinks already thanked+retry and still hit the limit
+                // Do NOT create a broken VIDEO link to mainUrl (causes ExoPlayer "parsing container unsupported" error)
+                Log.e(TAG, "DAILY DOWNLOAD LIMIT EXCEEDED even after thank + retry")
             }
             is TorrentDownloadResult.NotLoggedIn -> {
                 isLoggedIn = false
