@@ -31,7 +31,7 @@ class Arabp : MainAPI() {
     override var name = "Arabp"
     override val hasMainPage = true
     override var lang = "ar"
-    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA, TvType.TvSeries, TvType.Movie)
+    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA, TvType.TvSeries, TvType.Movie, TvType.Documentary)
 
     companion object {
         private const val TAG = "Arabp_Log"
@@ -269,7 +269,8 @@ class Arabp : MainAPI() {
     override val mainPage = mainPageOf(
         "$mainUrl/index.php?page=anime-listing" to "قائمة الانمي",
         "$mainUrl/index.php?page=tv-listing" to "مسلسلات عربية",
-        "$mainUrl/index.php?page=movies-listing" to "أفلام عربية"
+        "$mainUrl/index.php?page=movies-listing" to "أفلام عربية",
+        "$mainUrl/index.php?page=torrents&category=19" to "وثائقيات"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
@@ -284,6 +285,21 @@ class Arabp : MainAPI() {
 
         try {
             val tvType = tvTypeFromPage(request.data)
+
+            // Torrents category pages (e.g. documentaries) use table rows, not listing divs
+            if (request.data.contains("page=torrents")) {
+                val tableResults = doc.select("table.lista2t tr.lista2, table tr:has(a[href*=torrent-details])")
+                    .mapNotNull { torrentRowToSearchResult(it, tvType) }
+                val modernResults = doc.select("div.file-header")
+                    .mapNotNull { modernTorrentRowToSearchResult(it, tvType) }
+                val items = tableResults + modernResults
+                Log.d(TAG, "getMainPage: ${items.size} torrent results for '${request.name}'")
+                if (items.isNotEmpty()) {
+                    homeSets.add(HomePageList(request.name, items))
+                }
+                return newHomePageResponse(homeSets, items.isNotEmpty())
+            }
+
             val listingDivs = doc.select("div.listing_div1")
             Log.d(TAG, "getMainPage: found ${listingDivs.size} listing_div1 elements for '${request.name}'")
             val items = listingDivs.mapNotNull { toSearchResult(it, tvType) }
@@ -302,6 +318,7 @@ class Arabp : MainAPI() {
         return when {
             pageUrl.contains("movies-listing") -> TvType.Movie
             pageUrl.contains("tv-listing") -> TvType.TvSeries
+            pageUrl.contains("category=19") -> TvType.Documentary
             else -> TvType.Anime
         }
     }
@@ -309,6 +326,7 @@ class Arabp : MainAPI() {
     private fun tvTypeFromTitle(title: String): TvType {
         return when {
             title.contains("فيلم", ignoreCase = true) || title.contains("Movie", ignoreCase = true) -> TvType.Movie
+            title.contains("وثائقي", ignoreCase = true) || title.contains("Documentary", ignoreCase = true) -> TvType.Documentary
             else -> TvType.TvSeries
         }
     }
@@ -316,12 +334,14 @@ class Arabp : MainAPI() {
     private fun TvType.toMovieType(): TvType = when (this) {
         TvType.Movie -> TvType.Movie
         TvType.Anime -> TvType.AnimeMovie
+        TvType.Documentary -> TvType.Documentary
         else -> TvType.Movie
     }
 
     private fun TvType.toSeriesType(): TvType = when (this) {
         TvType.TvSeries -> TvType.TvSeries
         TvType.Anime -> TvType.Anime
+        TvType.Documentary -> TvType.Documentary
         else -> TvType.TvSeries
     }
 
@@ -353,7 +373,7 @@ class Arabp : MainAPI() {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
                     this.posterHeaders = imageHeaders
                 }
-                TvType.TvSeries -> newTvSeriesSearchResponse(title, href, tvType) {
+                TvType.TvSeries, TvType.Documentary -> newTvSeriesSearchResponse(title, href, tvType) {
                     this.posterUrl = toAbsoluteUrl(posterUrl)
                     this.posterHeaders = imageHeaders
                 }
@@ -444,7 +464,7 @@ class Arabp : MainAPI() {
         return false
     }
 
-    private fun torrentRowToSearchResult(row: Element): SearchResponse? {
+    private fun torrentRowToSearchResult(row: Element, fallbackTvType: TvType = TvType.Anime): SearchResponse? {
         return try {
             val nameLink = row.selectFirst("a[href*=torrent-details]") ?: return null
             val name = cleanTitleText(nameLink.text())
@@ -463,8 +483,11 @@ class Arabp : MainAPI() {
             val isExternal = isExternalTorrent(row)
             val tvType = when {
                 categoryName.contains("فيلم", ignoreCase = true) || categoryName.contains("Movie", ignoreCase = true) ||
-                        name.contains("فيلم", ignoreCase = true) -> TvType.AnimeMovie
-                else -> TvType.Anime
+                        name.contains("فيلم", ignoreCase = true) -> {
+                    if (fallbackTvType == TvType.Anime) TvType.AnimeMovie else TvType.Movie
+                }
+                categoryName.contains("وثائقي", ignoreCase = true) || categoryName.contains("Documentary", ignoreCase = true) -> TvType.Documentary
+                else -> fallbackTvType
             }
 
             val displayName = buildString {
@@ -479,9 +502,19 @@ class Arabp : MainAPI() {
                 ?: ""
 
             val epData = "$torrentId|${toAbsoluteUrl(detailHref)}|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
-            newAnimeSearchResponse(displayName, epData, tvType) {
-                this.posterUrl = toAbsoluteUrl(posterUrl)
-                this.posterHeaders = imageHeaders
+            when (tvType) {
+                TvType.Documentary -> newTvSeriesSearchResponse(displayName, epData, tvType) {
+                    this.posterUrl = toAbsoluteUrl(posterUrl)
+                    this.posterHeaders = imageHeaders
+                }
+                TvType.Movie -> newMovieSearchResponse(displayName, epData, tvType) {
+                    this.posterUrl = toAbsoluteUrl(posterUrl)
+                    this.posterHeaders = imageHeaders
+                }
+                else -> newAnimeSearchResponse(displayName, epData, tvType) {
+                    this.posterUrl = toAbsoluteUrl(posterUrl)
+                    this.posterHeaders = imageHeaders
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "torrentRowToSearchResult Error: ${e.message}")
@@ -489,7 +522,7 @@ class Arabp : MainAPI() {
         }
     }
 
-    private fun modernTorrentRowToSearchResult(row: Element): SearchResponse? {
+    private fun modernTorrentRowToSearchResult(row: Element, fallbackTvType: TvType = TvType.Anime): SearchResponse? {
         return try {
             val nameLink = row.selectFirst("a[name=t_url], a[href*=torrent-details]") ?: return null
             val name = cleanTitleText(nameLink.text())
@@ -502,8 +535,11 @@ class Arabp : MainAPI() {
             val isFree = isFreeTorrent(row)
             val isExternal = isExternalTorrent(row)
             val tvType = when {
-                name.contains("فيلم", ignoreCase = true) || name.contains("Movie", ignoreCase = true) -> TvType.AnimeMovie
-                else -> TvType.Anime
+                name.contains("فيلم", ignoreCase = true) || name.contains("Movie", ignoreCase = true) -> {
+                    if (fallbackTvType == TvType.Anime) TvType.AnimeMovie else TvType.Movie
+                }
+                name.contains("وثائقي", ignoreCase = true) || name.contains("Documentary", ignoreCase = true) -> TvType.Documentary
+                else -> fallbackTvType
             }
 
             val displayName = buildString {
@@ -516,9 +552,19 @@ class Arabp : MainAPI() {
                 ?: ""
 
             val epData = "$torrentId|${toAbsoluteUrl(detailHref)}|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
-            newAnimeSearchResponse(displayName, epData, tvType) {
-                this.posterUrl = toAbsoluteUrl(posterUrl)
-                this.posterHeaders = imageHeaders
+            when (tvType) {
+                TvType.Documentary -> newTvSeriesSearchResponse(displayName, epData, tvType) {
+                    this.posterUrl = toAbsoluteUrl(posterUrl)
+                    this.posterHeaders = imageHeaders
+                }
+                TvType.Movie -> newMovieSearchResponse(displayName, epData, tvType) {
+                    this.posterUrl = toAbsoluteUrl(posterUrl)
+                    this.posterHeaders = imageHeaders
+                }
+                else -> newAnimeSearchResponse(displayName, epData, tvType) {
+                    this.posterUrl = toAbsoluteUrl(posterUrl)
+                    this.posterHeaders = imageHeaders
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "modernTorrentRowToSearchResult Error: ${e.message}")
@@ -941,6 +987,7 @@ class Arabp : MainAPI() {
         val pageTvType = if (detailUrl.contains("movies-listing")) TvType.Movie
             else if (detailUrl.contains("tv-listing")) TvType.TvSeries
             else if (detailUrl.contains("anime-listing")) TvType.Anime
+            else if (detailUrl.contains("category=19")) TvType.Documentary
             else tvTypeFromTitle(title)
 
         if (isExternal && magnetUrl.startsWith("magnet:")) {
