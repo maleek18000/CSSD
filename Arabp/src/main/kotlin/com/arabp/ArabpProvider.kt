@@ -31,7 +31,7 @@ class Arabp : MainAPI() {
     override var name = "Arabp"
     override val hasMainPage = true
     override var lang = "ar"
-    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA, TvType.TvSeries, TvType.Movie, TvType.Documentary)
+    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA, TvType.TvSeries, TvType.Movie)
 
     companion object {
         private const val TAG = "Arabp_Log"
@@ -269,8 +269,7 @@ class Arabp : MainAPI() {
     override val mainPage = mainPageOf(
         "$mainUrl/index.php?page=anime-listing" to "قائمة الانمي",
         "$mainUrl/index.php?page=tv-listing" to "مسلسلات عربية",
-        "$mainUrl/index.php?page=movies-listing" to "أفلام عربية",
-        "$mainUrl/index.php?page=torrents&category=19" to "وثائقيات"
+        "$mainUrl/index.php?page=movies-listing" to "أفلام عربية"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
@@ -285,21 +284,6 @@ class Arabp : MainAPI() {
 
         try {
             val tvType = tvTypeFromPage(request.data)
-
-            // Torrents category pages (e.g. documentaries) use table rows, not listing divs
-            if (request.data.contains("page=torrents")) {
-                val tableResults = doc.select("table.lista2t tr.lista2, table tr:has(a[href*=torrent-details])")
-                    .mapNotNull { torrentRowToSearchResult(it, tvType) }
-                val modernResults = doc.select("div.file-header")
-                    .mapNotNull { modernTorrentRowToSearchResult(it, tvType) }
-                val items = tableResults + modernResults
-                Log.d(TAG, "getMainPage: ${items.size} torrent results for '${request.name}'")
-                if (items.isNotEmpty()) {
-                    homeSets.add(HomePageList(request.name, items))
-                }
-                return newHomePageResponse(homeSets, items.isNotEmpty())
-            }
-
             val listingDivs = doc.select("div.listing_div1")
             Log.d(TAG, "getMainPage: found ${listingDivs.size} listing_div1 elements for '${request.name}'")
             val items = listingDivs.mapNotNull { toSearchResult(it, tvType) }
@@ -318,7 +302,6 @@ class Arabp : MainAPI() {
         return when {
             pageUrl.contains("movies-listing") -> TvType.Movie
             pageUrl.contains("tv-listing") -> TvType.TvSeries
-            pageUrl.contains("category=19") -> TvType.TvSeries
             else -> TvType.Anime
         }
     }
@@ -461,7 +444,7 @@ class Arabp : MainAPI() {
         return false
     }
 
-    private fun torrentRowToSearchResult(row: Element, fallbackTvType: TvType = TvType.Anime): SearchResponse? {
+    private fun torrentRowToSearchResult(row: Element): SearchResponse? {
         return try {
             val nameLink = row.selectFirst("a[href*=torrent-details]") ?: return null
             val name = cleanTitleText(nameLink.text())
@@ -481,7 +464,7 @@ class Arabp : MainAPI() {
             val tvType = when {
                 categoryName.contains("فيلم", ignoreCase = true) || categoryName.contains("Movie", ignoreCase = true) ||
                         name.contains("فيلم", ignoreCase = true) -> TvType.AnimeMovie
-                else -> fallbackTvType
+                else -> TvType.Anime
             }
 
             val displayName = buildString {
@@ -506,7 +489,7 @@ class Arabp : MainAPI() {
         }
     }
 
-    private fun modernTorrentRowToSearchResult(row: Element, fallbackTvType: TvType = TvType.Anime): SearchResponse? {
+    private fun modernTorrentRowToSearchResult(row: Element): SearchResponse? {
         return try {
             val nameLink = row.selectFirst("a[name=t_url], a[href*=torrent-details]") ?: return null
             val name = cleanTitleText(nameLink.text())
@@ -520,7 +503,7 @@ class Arabp : MainAPI() {
             val isExternal = isExternalTorrent(row)
             val tvType = when {
                 name.contains("فيلم", ignoreCase = true) || name.contains("Movie", ignoreCase = true) -> TvType.AnimeMovie
-                else -> fallbackTvType
+                else -> TvType.Anime
             }
 
             val displayName = buildString {
@@ -958,7 +941,6 @@ class Arabp : MainAPI() {
         val pageTvType = if (detailUrl.contains("movies-listing")) TvType.Movie
             else if (detailUrl.contains("tv-listing")) TvType.TvSeries
             else if (detailUrl.contains("anime-listing")) TvType.Anime
-            else if (detailUrl.contains("category=19")) TvType.TvSeries
             else tvTypeFromTitle(title)
 
         if (isExternal && magnetUrl.startsWith("magnet:")) {
