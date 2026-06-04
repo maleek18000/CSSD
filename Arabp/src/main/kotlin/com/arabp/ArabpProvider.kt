@@ -214,6 +214,11 @@ class Arabp : MainAPI() {
         }
     }
 
+    /** Strip the #doc marker from a detail URL before making HTTP requests */
+    private fun cleanDetailUrl(url: String): String {
+        return url.removeSuffix("#doc")
+    }
+
     // ==================== AUTH-AWARE DOCUMENT FETCHING ====================
 
     private fun fetchDocWithAuth(url: String): Document? {
@@ -952,16 +957,18 @@ class Arabp : MainAPI() {
         var title = "Torrent #$torrentId"
         var posterUrl = ""
 
+        val cleanedDetailUrl = cleanDetailUrl(detailUrl)
+
         try {
-            if (ensureLogin() && detailUrl.isNotBlank()) {
+            if (ensureLogin() && cleanedDetailUrl.isNotBlank()) {
                 val request = Request.Builder()
-                    .url(toAbsoluteUrl(detailUrl))
+                    .url(toAbsoluteUrl(cleanedDetailUrl))
                     .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
                     .build()
 
                 authClient.newCall(request).execute().use { response ->
                     val body = response.body?.string() ?: ""
-                    val detailDoc = Jsoup.parse(body, toAbsoluteUrl(detailUrl))
+                    val detailDoc = Jsoup.parse(body, toAbsoluteUrl(cleanedDetailUrl))
                     title = detailDoc.selectFirst("td#Title h1")?.text()?.trim() ?: title
                     posterUrl = detailDoc.selectFirst("img.listing_poster")?.attr("src") ?: ""
                 }
@@ -989,7 +996,7 @@ class Arabp : MainAPI() {
             if (!isExternal && ensureLogin()) {
                 var resolvedUrl = toAbsoluteUrl(downloadUrl)
                 if (resolvedUrl.isBlank() || !resolvedUrl.contains("&f=")) {
-                    val detailPageUrl = toAbsoluteUrl(detailUrl)
+                    val detailPageUrl = toAbsoluteUrl(cleanedDetailUrl)
                     val detailRequest = Request.Builder()
                         .url(detailPageUrl)
                         .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
@@ -1010,7 +1017,7 @@ class Arabp : MainAPI() {
                     // Handle daily limit: thank uploader and retry once
                     if (dlResult is TorrentDownloadResult.DailyLimitExceeded) {
                         Log.w(TAG, "loadFromTorrentData: Daily limit hit for #$torrentId, thanking and retrying...")
-                        thankUploader(torrentId, detailUrl)
+                        thankUploader(torrentId, cleanedDetailUrl)
                         dlResult = downloadTorrentFile(resolvedUrl)
                     }
 
@@ -1032,7 +1039,7 @@ class Arabp : MainAPI() {
 
         // Fallback: parse file list from details page when .torrent download failed
         val fallbackFileNames = if (folderResult == null && !isExternal) {
-            parseFileListFromDetailPage(detailUrl)
+            parseFileListFromDetailPage(cleanedDetailUrl)
         } else null
 
         if (folderResult != null) {
@@ -1240,6 +1247,9 @@ class Arabp : MainAPI() {
         val isExternal = parts.getOrNull(5) == "1"
         val fileIndex = dataParts.getOrNull(6)?.toIntOrNull()
 
+        // Strip #doc marker from detailUrl before any HTTP requests
+        val cleanedDetailUrl = cleanDetailUrl(detailUrl)
+
         Log.d(TAG, "loadLinks: id=$torrentId, free=$isFree, external=$isExternal, fileIndex=$fileIndex")
 
         return try {
@@ -1268,7 +1278,7 @@ class Arabp : MainAPI() {
             }
 
             if (!isFree) {
-                val thankDetailUrl = if (detailUrl.isNotBlank()) detailUrl
+                val thankDetailUrl = if (cleanedDetailUrl.isNotBlank()) cleanedDetailUrl
                     else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
                 val thanked = thankUploader(torrentId, thankDetailUrl)
                 Log.d(TAG, "loadLinks: thank uploader result = $thanked for torrent $torrentId")
@@ -1287,7 +1297,7 @@ class Arabp : MainAPI() {
             var resolvedDownloadUrl = downloadUrl
 
             if (resolvedDownloadUrl.isBlank() || !resolvedDownloadUrl.contains("&f=")) {
-                val detailPageUrl = if (detailUrl.isNotBlank()) detailUrl
+                val detailPageUrl = if (cleanedDetailUrl.isNotBlank()) cleanedDetailUrl
                     else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
 
                 try {
