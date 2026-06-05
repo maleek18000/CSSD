@@ -21,8 +21,6 @@ import java.net.Socket
 import java.net.URI
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
-import kotlinx.coroutines.delay
-import kotlin.random.Random
 
 class Arabp : MainAPI() {
     override var mainUrl = "https://www.arabp2p.net"
@@ -41,38 +39,6 @@ class Arabp : MainAPI() {
         // Base32 alphabet for magnet info hash encoding
         private const val BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
         private const val MAX_TORRENT_CACHE = 10
-
-        // Rate limiting: minimum ms between requests to avoid IP bans
-        private const val MIN_REQUEST_INTERVAL_MS = 2000L
-        private const val MAX_JITTER_MS = 1500L
-    }
-
-    // ==================== RATE LIMITER ====================
-
-    private val rateLimitLock = Any()
-    @Volatile
-    private var lastRequestTime: Long = 0
-
-    /**
-     * Enforce a minimum delay between HTTP requests to arabp2p.net.
-     * Private trackers ban IPs that make too many requests too fast.
-     * Adds random jitter so the request pattern doesn't look robotic.
-     */
-    private suspend fun rateLimit() {
-        val waitMs: Long
-        synchronized(rateLimitLock) {
-            val now = System.currentTimeMillis()
-            val elapsed = now - lastRequestTime
-            val jitter = Random.nextLong(0, MAX_JITTER_MS)
-            val needed = MIN_REQUEST_INTERVAL_MS + jitter
-            waitMs = if (elapsed < needed) needed - elapsed else 0L
-            // Reserve the slot IMMEDIATELY so concurrent coroutines see the updated timestamp
-            lastRequestTime = now + waitMs
-        }
-        if (waitMs > 0) {
-            Log.d(TAG, "rateLimit: waiting ${waitMs}ms")
-            delay(waitMs)
-        }
     }
 
     // LRU cache for downloaded .torrent bytes (key = torrent ID, thread-safe)
@@ -108,16 +74,7 @@ class Arabp : MainAPI() {
     }
 
     private val authClient: OkHttpClient by lazy {
-        // CRITICAL: Limit to 1 concurrent request per host to avoid IP bans.
-        // CloudStream calls getMainPage for all 11 categories at once —
-        // without this, OkHttp fires up to 5 simultaneous requests to arabp2p.net,
-        // which triggers their anti-bot protection.
-        val dispatcher = okhttp3.Dispatcher().apply {
-            maxRequests = 2
-            maxRequestsPerHost = 1
-        }
         OkHttpClient.Builder()
-            .dispatcher(dispatcher)
             .cookieJar(object : okhttp3.CookieJar {
                 override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) {
                     for (cookie in cookies) {
@@ -255,12 +212,11 @@ class Arabp : MainAPI() {
 
     // ==================== AUTH-AWARE DOCUMENT FETCHING ====================
 
-    private suspend fun fetchDocWithAuth(url: String): Document? {
+    private fun fetchDocWithAuth(url: String): Document? {
         if (!ensureLogin()) {
             Log.e(TAG, "fetchDocWithAuth: login failed, cannot fetch $url")
             return null
         }
-        rateLimit()
         return try {
             val request = Request.Builder()
                 .url(url)
@@ -306,18 +262,11 @@ class Arabp : MainAPI() {
 
     // ==================== HOME PAGE ====================
 
+    // Only 2 categories on the home page to minimize requests and avoid IP blocking.
+    // Other content is accessible through search.
     override val mainPage = mainPageOf(
         "$mainUrl/index.php?page=anime-listing" to "قائمة الانمي",
-        "$mainUrl/index.php?page=tv-listing" to "مسلسلات عربية",
-        "$mainUrl/index.php?page=movies-listing" to "أفلام عربية",
-        "$mainUrl/index.php?page=torrents&category=19" to "وثائقيات",
-        "$mainUrl/index.php?page=torrents&category=88" to "أفلام مدبلجة للعربية",
-        "$mainUrl/index.php?page=torrents&category=90" to "برامج و مسابقات",
-        "$mainUrl/index.php?page=torrents&category=93" to "وثائقيات مترجمة",
-        "$mainUrl/index.php?page=torrents&active=0&category=113" to "مسلسلات لاتينية",
-        "$mainUrl/index.php?page=torrents&active=0&category=57" to "مسلسلات آسيوية",
-        "$mainUrl/index.php?page=torrents&active=0&category=71" to "مسلسلات مدبلجة للعربية",
-        "$mainUrl/index.php?page=torrents&active=0&category=115" to "مسلسلات تركية"
+        "$mainUrl/index.php?page=tv-listing" to "مسلسلات عربية"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
@@ -663,8 +612,7 @@ class Arabp : MainAPI() {
      * (e.g., daily download limit exceeded).
      * Returns a list of video file names found in the details page table.
      */
-    private suspend fun parseFileListFromDetailPage(detailUrl: String): List<String>? {
-        rateLimit()
+    private fun parseFileListFromDetailPage(detailUrl: String): List<String>? {
         return try {
             val request = Request.Builder()
                 .url(toAbsoluteUrl(detailUrl))
@@ -843,161 +791,19 @@ class Arabp : MainAPI() {
                 TorrentRowInfo(epName, displayName, torrentId, detailHref, downloadHref, magnetHref, isFree, isExternal, baseData)
             }
 
-            ensureLogin()
-
-            data class SplitResult(
-                val info: TorrentRowInfo,
-                val folders: List<TorrentFolder>?,
-                val fallbackFileNames: List<String>? = null  // From details page when .torrent download fails
-            )
-
-            // Process torrents SEQUENTIALLY with rate limiting to avoid IP bans.
-            // Parallel downloads trigger arabp2p's anti-bot protection.
-            val splitResults = if (torrentInfos.isNotEmpty()) {
-                val results = mutableListOf<SplitResult>()
-                for (info in torrentInfos) {
-                    var folders: List<TorrentFolder>? = null
-                    var fallbackFileNames: List<String>? = null
-                    try {
-                        if (!info.isExternal && info.downloadHref.isNotBlank()) {
-                            var resolvedUrl = toAbsoluteUrl(info.downloadHref)
-                            if (!resolvedUrl.contains("&f=")) {
-                                rateLimit()
-                                val detailPageUrl = toAbsoluteUrl(info.detailHref)
-                                val detailRequest = Request.Builder()
-                                    .url(detailPageUrl)
-                                    .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
-                                    .build()
-                                authClient.newCall(detailRequest).execute().use { resp ->
-                                    val body = resp.body?.string() ?: ""
-                                    val detailDoc = Jsoup.parse(body, detailPageUrl)
-                                    val dlLink = detailDoc.selectFirst("a[href*=download.php]")
-                                        ?: detailDoc.selectFirst("td#Title h1 a[href*=download.php]")
-                                    if (dlLink != null) {
-                                        resolvedUrl = toAbsoluteUrl(dlLink.attr("href"))
-                                    }
-                                }
-                            }
-                            if (resolvedUrl.contains("&f=")) {
-                                var dlResult = downloadTorrentFile(resolvedUrl)
-
-                                // Handle daily limit: thank uploader and retry once
-                                if (dlResult is TorrentDownloadResult.DailyLimitExceeded) {
-                                    Log.w(TAG, "Daily limit hit for #${info.torrentId}, thanking and retrying...")
-                                    thankUploader(info.torrentId, info.detailHref)
-                                    dlResult = downloadTorrentFile(resolvedUrl)
-                                }
-
-                                if (dlResult is TorrentDownloadResult.Success) {
-                                    cacheTorrent(info.torrentId, dlResult.bytes)
-                                    val parsedFolders = parseTorrentFolders(dlResult.bytes)
-                                    val totalVideos = parsedFolders.sumOf { it.videoFiles.size }
-                                    Log.d(TAG, "Torrent #${info.torrentId} has ${totalVideos} video files in ${parsedFolders.size} folders")
-                                    if (totalVideos > 1) folders = parsedFolders
-                                } else {
-                                    // .torrent download failed — try parsing file list from details page
-                                    Log.w(TAG, "Torrent #${info.torrentId} download failed, trying details page fallback...")
-                                    fallbackFileNames = parseFileListFromDetailPage(info.detailHref)
-                                }
-                            }
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Torrent split failed for #${info.torrentId}: ${e.message}")
-                        // Try details page fallback
-                        try {
-                            fallbackFileNames = parseFileListFromDetailPage(info.detailHref)
-                        } catch (_: Exception) {}
-                    }
-                    results.add(SplitResult(info, folders, fallbackFileNames))
-                }
-                results
-            } else {
-                emptyList()
-            }
-
+            // Lazy loading: do NOT download .torrent files here.
+            // Each torrent row becomes one episode. The .torrent is only downloaded
+            // in loadLinks() when the user actually clicks play.
+            // This avoids making dozens of rapid requests that trigger IP bans.
             val episodes = mutableListOf<Episode>()
-            val seasonNamesList = mutableListOf<SeasonData>()
-            var seasonNum = 1
 
-            for (result in splitResults) {
-                val info = result.info
-
-                if (result.folders != null) {
-                    val folders = result.folders
-                    // Only treat folders as separate seasons if there are 2+ named folders
-                    val hasMultipleFolders = folders.size > 1
-
-                    if (hasMultipleFolders) {
-                        // Each folder becomes its own season (each folder is a different show)
-                        for (folder in folders) {
-                            val seasonDisplayName = if (folder.folderName.isNotEmpty())
-                                folder.folderName else info.epName
-                            seasonNamesList.add(SeasonData(season = seasonNum, name = seasonDisplayName))
-
-                            // Build a global file index map so loadLinks can find the right file
-                            // We need the flat index across all video files for this torrent
-                            val globalOffset = folders.takeWhile { it != folder }
-                                .sumOf { it.videoFiles.size }
-
-                            for ((localIdx, filePath) in folder.videoFiles.withIndex()) {
-                                val fileName = filePath.substringAfterLast("/")
-                                val epNameFromFile = fileName.substringBeforeLast(".")
-                                    .replace(".", " ").replace("_", " ").trim()
-                                val globalIdx = globalOffset + localIdx
-                                val epData = "${info.baseData}|${globalIdx}"
-                                episodes.add(newEpisode(epData, fix = false, initializer = {
-                                    name = epNameFromFile
-                                    season = seasonNum
-                                    episode = localIdx + 1
-                                    this.posterUrl = absPosterUrl
-                                }))
-                            }
-                            seasonNum++
-                        }
-                    } else {
-                        // Single folder with videos (or all in root) — treat as one season
-                        seasonNamesList.add(SeasonData(season = seasonNum, name = info.epName))
-                        val allFiles = folders.flatMap { it.videoFiles }
-                        for ((idx, filePath) in allFiles.withIndex()) {
-                            val fileName = filePath.substringAfterLast("/")
-                            val epNameFromFile = fileName.substringBeforeLast(".")
-                                .replace(".", " ").replace("_", " ").trim()
-                            val epData = "${info.baseData}|${idx}"
-                            episodes.add(newEpisode(epData, fix = false, initializer = {
-                                name = epNameFromFile
-                                season = seasonNum
-                                episode = idx + 1
-                                this.posterUrl = absPosterUrl
-                            }))
-                        }
-                        seasonNum++
-                    }
-                } else if (result.fallbackFileNames != null && result.fallbackFileNames.size > 1) {
-                    // .torrent download failed but we got file names from details page
-                    val fileNames = result.fallbackFileNames
-                    seasonNamesList.add(SeasonData(season = seasonNum, name = info.epName))
-                    for ((idx, fileName) in fileNames.withIndex()) {
-                        val epNameFromFile = fileName.substringBeforeLast(".")
-                            .replace(".", " ").replace("_", " ").trim()
-                        val epData = "${info.baseData}|${idx}"
-                        episodes.add(newEpisode(epData, fix = false, initializer = {
-                            name = epNameFromFile
-                            season = seasonNum
-                            episode = idx + 1
-                            this.posterUrl = absPosterUrl
-                        }))
-                    }
-                    seasonNum++
-                } else {
-                    seasonNamesList.add(SeasonData(season = seasonNum, name = info.epName))
-                    episodes.add(newEpisode(info.baseData, fix = false, initializer = {
-                        name = info.displayName
-                        season = seasonNum
-                        episode = 1
-                        this.posterUrl = absPosterUrl
-                    }))
-                    seasonNum++
-                }
+            for ((idx, info) in torrentInfos.withIndex()) {
+                episodes.add(newEpisode(info.baseData, fix = false, initializer = {
+                    name = info.displayName
+                    season = 1
+                    episode = idx + 1
+                    this.posterUrl = absPosterUrl
+                }))
             }
 
             val pageTvType = tvTypeFromPage(fullUrl)
@@ -1007,11 +813,17 @@ class Arabp : MainAPI() {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
                 }
+            } else if (torrentInfos.size == 1 && pageTvType == TvType.Movie) {
+                // Single torrent on a movie page → treat as a movie
+                newMovieLoadResponse(title, fullUrl, TvType.Movie, torrentInfos[0].baseData) {
+                    this.posterUrl = absPosterUrl
+                    this.posterHeaders = imageHeaders
+                }
             } else {
                 newTvSeriesLoadResponse(title, fullUrl, pageTvType.toSeriesType(), episodes) {
                     this.posterUrl = absPosterUrl
                     this.posterHeaders = imageHeaders
-                    this.seasonNames = seasonNamesList
+                    this.seasonNames = listOf(SeasonData(season = 1, name = title))
                 }
             }
         } catch (e: Exception) {
@@ -1067,138 +879,20 @@ class Arabp : MainAPI() {
             }
         }
 
-        val folderResult = try {
-            if (!isExternal && ensureLogin()) {
-                var resolvedUrl = toAbsoluteUrl(downloadUrl)
-                if (resolvedUrl.isBlank() || !resolvedUrl.contains("&f=")) {
-                    val detailPageUrl = toAbsoluteUrl(detailUrl)
-                    val detailRequest = Request.Builder()
-                        .url(detailPageUrl)
-                        .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
-                        .build()
-                    authClient.newCall(detailRequest).execute().use { resp ->
-                        val body = resp.body?.string() ?: ""
-                        val detailDoc = Jsoup.parse(body, detailPageUrl)
-                        val dlLink = detailDoc.selectFirst("a[href*=download.php]")
-                            ?: detailDoc.selectFirst("td#Title h1 a[href*=download.php]")
-                        if (dlLink != null) {
-                            resolvedUrl = toAbsoluteUrl(dlLink.attr("href"))
-                        }
-                    }
-                }
-                if (resolvedUrl.contains("&f=")) {
-                    var dlResult = downloadTorrentFile(resolvedUrl)
-
-                    // Handle daily limit: thank uploader and retry once
-                    if (dlResult is TorrentDownloadResult.DailyLimitExceeded) {
-                        Log.w(TAG, "loadFromTorrentData: Daily limit hit for #$torrentId, thanking and retrying...")
-                        thankUploader(torrentId, detailUrl)
-                        dlResult = downloadTorrentFile(resolvedUrl)
-                    }
-
-                    if (dlResult is TorrentDownloadResult.Success) {
-                        cacheTorrent(torrentId, dlResult.bytes)
-                        val folders = parseTorrentFolders(dlResult.bytes)
-                        val totalVideos = folders.sumOf { it.videoFiles.size }
-                        Log.d(TAG, "loadFromTorrentData: Torrent #$torrentId has ${totalVideos} video files in ${folders.size} folders")
-                        if (totalVideos >= 1) {
-                            Pair(folders, parts.joinToString("|"))
-                        } else null
-                    } else null
-                } else null
-            } else null
-        } catch (e: Exception) {
-            Log.w(TAG, "loadFromTorrentData split failed: ${e.message}")
-            null
-        }
-
-        // Fallback: parse file list from details page when .torrent download failed
-        val fallbackFileNames = if (folderResult == null && !isExternal) {
-            parseFileListFromDetailPage(detailUrl)
-        } else null
-
-        if (folderResult != null) {
-            val (folders, baseData) = folderResult
-            val episodes = mutableListOf<Episode>()
-            val seasonNamesList = mutableListOf<SeasonData>()
-            val hasMultipleFolders = folders.size > 1
-
-            var seasonNum = 1
-            if (hasMultipleFolders) {
-                // Each folder becomes its own season
-                for (folder in folders) {
-                    val seasonDisplayName = if (folder.folderName.isNotEmpty())
-                        folder.folderName else title
-                    seasonNamesList.add(SeasonData(season = seasonNum, name = seasonDisplayName))
-                    val globalOffset = folders.takeWhile { it != folder }
-                        .sumOf { it.videoFiles.size }
-                    for ((localIdx, filePath) in folder.videoFiles.withIndex()) {
-                        val fileName = filePath.substringAfterLast("/")
-                        val epNameFromFile = fileName.substringBeforeLast(".")
-                            .replace(".", " ").replace("_", " ").trim()
-                        val globalIdx = globalOffset + localIdx
-                        val epData = "$baseData|${globalIdx}"
-                        episodes.add(newEpisode(epData, fix = false, initializer = {
-                            name = epNameFromFile
-                            season = seasonNum
-                            episode = localIdx + 1
-                            this.posterUrl = absPosterUrl
-                        }))
-                    }
-                    seasonNum++
-                }
-            } else {
-                // Single folder or all files in root — one season
-                seasonNamesList.add(SeasonData(season = 1, name = title))
-                val allFiles = folders.flatMap { it.videoFiles }
-                for ((idx, filePath) in allFiles.withIndex()) {
-                    val fileName = filePath.substringAfterLast("/")
-                    val epNameFromFile = fileName.substringBeforeLast(".")
-                        .replace(".", " ").replace("_", " ").trim()
-                    val epData = "$baseData|${idx}"
-                    episodes.add(newEpisode(epData, fix = false, initializer = {
-                        name = epNameFromFile
-                        season = 1
-                        episode = idx + 1
-                        this.posterUrl = absPosterUrl
-                    }))
-                }
-            }
-
-            return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), episodes) {
-                this.posterUrl = absPosterUrl
-                this.posterHeaders = imageHeaders
-                this.seasonNames = seasonNamesList
-            }
-        }
-
-        // Fallback: use file names from details page when .torrent download failed
-        if (fallbackFileNames != null && fallbackFileNames.size > 1) {
-            val baseData = parts.joinToString("|")
-            val episodes = mutableListOf<Episode>()
-            for ((idx, fileName) in fallbackFileNames.withIndex()) {
-                val epNameFromFile = fileName.substringBeforeLast(".")
-                    .replace(".", " ").replace("_", " ").trim()
-                val epData = "$baseData|${idx}"
-                episodes.add(newEpisode(epData, fix = false, initializer = {
-                    name = epNameFromFile
-                    season = 1
-                    episode = idx + 1
-                    this.posterUrl = absPosterUrl
-                }))
-            }
-            return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), episodes) {
-                this.posterUrl = absPosterUrl
-                this.posterHeaders = imageHeaders
-                this.seasonNames = listOf(SeasonData(season = 1, name = title))
-            }
-        }
-
-        // Single episode fallback — use baseData with file index 0 for consistency
+        // Lazy loading: do NOT download .torrent here.
+        // The .torrent is downloaded in loadLinks() when the user clicks play.
+        // Just return a single episode with the torrent metadata.
         val baseData = parts.joinToString("|")
-        val epData = "$baseData|0"
+
+        if (pageTvType == TvType.Movie || pageTvType == TvType.AnimeMovie) {
+            return newMovieLoadResponse(title, data, pageTvType.toMovieType(), baseData) {
+                this.posterUrl = absPosterUrl
+                this.posterHeaders = imageHeaders
+            }
+        }
+
         return newTvSeriesLoadResponse(title, data, pageTvType.toSeriesType(), listOf(
-            newEpisode(epData, fix = false, initializer = {
+            newEpisode(baseData, fix = false, initializer = {
                 name = title
                 season = 1
                 episode = 1
@@ -1216,9 +910,8 @@ class Arabp : MainAPI() {
     /**
      * Handle URLs from torrent category pages (documentaries, etc.) that use
      * a real torrent-detail URL with an arabp_data query parameter containing
-     * encoded torrent metadata. This follows the same pattern as the anime
-     * listing pages: fetch detail page, find download link, download .torrent,
-     * parse it, and create episodes.
+     * encoded torrent metadata.
+     * Lazy loading: does NOT download .torrent files here — that happens in loadLinks().
      */
     private suspend fun loadFromTorrentDetailUrl(url: String): LoadResponse? {
         // Extract the actual detail page URL (strip the arabp_data parameter)
@@ -1252,7 +945,6 @@ class Arabp : MainAPI() {
         // Fetch the detail page for title and poster
         try {
             if (ensureLogin() && detailUrl.isNotBlank()) {
-                rateLimit()
                 val request = Request.Builder()
                     .url(toAbsoluteUrl(detailUrl))
                     .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
@@ -1275,146 +967,23 @@ class Arabp : MainAPI() {
 
         // Handle external torrents with magnet links
         if (isExternal && magnetUrl.startsWith("magnet:")) {
-            val epData = "$baseData|0"
-            return newMovieLoadResponse(title, url, pageTvType.toMovieType(), epData) {
+            return newMovieLoadResponse(title, url, pageTvType.toMovieType(), baseData) {
                 this.posterUrl = absPosterUrl
                 this.posterHeaders = imageHeaders
             }
         }
 
-        // Download and parse the .torrent file — same logic as anime listing pages
-        val folderResult = try {
-            if (!isExternal && ensureLogin()) {
-                var resolvedUrl = toAbsoluteUrl(downloadUrl)
-
-                // If we don't have a valid download URL with &f=, try to find one from the detail page
-                if (resolvedUrl.isBlank() || !resolvedUrl.contains("&f=")) {
-                    rateLimit()
-                    val detailPageUrl = toAbsoluteUrl(detailUrl)
-                    val detailRequest = Request.Builder()
-                        .url(detailPageUrl)
-                        .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
-                        .build()
-                    authClient.newCall(detailRequest).execute().use { resp ->
-                        val body = resp.body?.string() ?: ""
-                        val detailDoc = Jsoup.parse(body, detailPageUrl)
-                        val dlLink = detailDoc.selectFirst("a[href*=download.php]")
-                            ?: detailDoc.selectFirst("td#Title h1 a[href*=download.php]")
-                        if (dlLink != null) {
-                            resolvedUrl = toAbsoluteUrl(dlLink.attr("href"))
-                        }
-                    }
-                }
-
-                if (resolvedUrl.contains("&f=")) {
-                    var dlResult = downloadTorrentFile(resolvedUrl)
-
-                    // Handle daily limit: thank uploader and retry once
-                    if (dlResult is TorrentDownloadResult.DailyLimitExceeded) {
-                        Log.w(TAG, "loadFromTorrentDetailUrl: Daily limit hit for #$torrentId, thanking and retrying...")
-                        thankUploader(torrentId, detailUrl)
-                        dlResult = downloadTorrentFile(resolvedUrl)
-                    }
-
-                    if (dlResult is TorrentDownloadResult.Success) {
-                        cacheTorrent(torrentId, dlResult.bytes)
-                        val folders = parseTorrentFolders(dlResult.bytes)
-                        val totalVideos = folders.sumOf { it.videoFiles.size }
-                        Log.d(TAG, "loadFromTorrentDetailUrl: Torrent #$torrentId has ${totalVideos} video files in ${folders.size} folders")
-                        if (totalVideos >= 1) {
-                            Pair(folders, baseData)
-                        } else null
-                    } else null
-                } else null
-            } else null
-        } catch (e: Exception) {
-            Log.w(TAG, "loadFromTorrentDetailUrl download failed: ${e.message}")
-            null
-        }
-
-        // Fallback: parse file list from details page when .torrent download failed
-        val fallbackFileNames = if (folderResult == null && !isExternal) {
-            parseFileListFromDetailPage(detailUrl)
-        } else null
-
-        if (folderResult != null) {
-            val (folders, baseDataStr) = folderResult
-            val episodes = mutableListOf<Episode>()
-            val seasonNamesList = mutableListOf<SeasonData>()
-            val hasMultipleFolders = folders.size > 1
-
-            var seasonNum = 1
-            if (hasMultipleFolders) {
-                for (folder in folders) {
-                    val seasonDisplayName = if (folder.folderName.isNotEmpty())
-                        folder.folderName else title
-                    seasonNamesList.add(SeasonData(season = seasonNum, name = seasonDisplayName))
-                    val globalOffset = folders.takeWhile { it != folder }
-                        .sumOf { it.videoFiles.size }
-                    for ((localIdx, filePath) in folder.videoFiles.withIndex()) {
-                        val fileName = filePath.substringAfterLast("/")
-                        val epNameFromFile = fileName.substringBeforeLast(".")
-                            .replace(".", " ").replace("_", " ").trim()
-                        val globalIdx = globalOffset + localIdx
-                        val epData = "$baseDataStr|${globalIdx}"
-                        episodes.add(newEpisode(epData, fix = false, initializer = {
-                            name = epNameFromFile
-                            season = seasonNum
-                            episode = localIdx + 1
-                            this.posterUrl = absPosterUrl
-                        }))
-                    }
-                    seasonNum++
-                }
-            } else {
-                seasonNamesList.add(SeasonData(season = 1, name = title))
-                val allFiles = folders.flatMap { it.videoFiles }
-                for ((idx, filePath) in allFiles.withIndex()) {
-                    val fileName = filePath.substringAfterLast("/")
-                    val epNameFromFile = fileName.substringBeforeLast(".")
-                        .replace(".", " ").replace("_", " ").trim()
-                    val epData = "$baseDataStr|${idx}"
-                    episodes.add(newEpisode(epData, fix = false, initializer = {
-                        name = epNameFromFile
-                        season = 1
-                        episode = idx + 1
-                        this.posterUrl = absPosterUrl
-                    }))
-                }
-            }
-
-            return newTvSeriesLoadResponse(title, url, pageTvType.toSeriesType(), episodes) {
+        // Lazy loading: do NOT download .torrent here.
+        // The .torrent is downloaded in loadLinks() when the user clicks play.
+        if (pageTvType == TvType.Movie || pageTvType == TvType.AnimeMovie) {
+            return newMovieLoadResponse(title, url, pageTvType.toMovieType(), baseData) {
                 this.posterUrl = absPosterUrl
                 this.posterHeaders = imageHeaders
-                this.seasonNames = seasonNamesList
             }
         }
 
-        // Fallback: use file names from details page
-        if (fallbackFileNames != null && fallbackFileNames.size > 1) {
-            val episodes = mutableListOf<Episode>()
-            for ((idx, fileName) in fallbackFileNames.withIndex()) {
-                val epNameFromFile = fileName.substringBeforeLast(".")
-                    .replace(".", " ").replace("_", " ").trim()
-                val epData = "$baseData|${idx}"
-                episodes.add(newEpisode(epData, fix = false, initializer = {
-                    name = epNameFromFile
-                    season = 1
-                    episode = idx + 1
-                    this.posterUrl = absPosterUrl
-                }))
-            }
-            return newTvSeriesLoadResponse(title, url, pageTvType.toSeriesType(), episodes) {
-                this.posterUrl = absPosterUrl
-                this.posterHeaders = imageHeaders
-                this.seasonNames = listOf(SeasonData(season = 1, name = title))
-            }
-        }
-
-        // Single episode fallback
-        val epData = "$baseData|0"
         return newTvSeriesLoadResponse(title, url, pageTvType.toSeriesType(), listOf(
-            newEpisode(epData, fix = false, initializer = {
+            newEpisode(baseData, fix = false, initializer = {
                 name = title
                 season = 1
                 episode = 1
@@ -1592,7 +1161,6 @@ class Arabp : MainAPI() {
                     else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
 
                 try {
-                    rateLimit()
                     val request = Request.Builder()
                         .url(toAbsoluteUrl(detailPageUrl))
                         .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
@@ -1718,9 +1286,9 @@ class Arabp : MainAPI() {
 
     // ==================== THANK UPLOADER ====================
 
-    private suspend fun thankUploader(torrentId: String, detailUrl: String): Boolean {
+    private fun thankUploader(torrentId: String, detailUrl: String): Boolean {
         if (!ensureLogin()) return false
-        rateLimit()
+
         return try {
             val thankFormBody = FormBody.Builder()
                 .add("tid", torrentId)
@@ -1757,8 +1325,7 @@ class Arabp : MainAPI() {
         data class Error(val message: String) : TorrentDownloadResult()
     }
 
-    private suspend fun downloadTorrentFile(url: String): TorrentDownloadResult {
-        rateLimit()
+    private fun downloadTorrentFile(url: String): TorrentDownloadResult {
         return try {
             val request = Request.Builder()
                 .url(toAbsoluteUrl(url))
@@ -1949,10 +1516,9 @@ class Arabp : MainAPI() {
 
     // ==================== PASSKEY FETCH FROM WEBSITE ====================
 
-    private suspend fun fetchPasskeyFromWebsite(): String? {
+    private fun fetchPasskeyFromWebsite(): String? {
         if (cachedPasskey != null) return cachedPasskey
         if (!ensureLogin()) return null
-        rateLimit()
 
         return try {
             val profileRequest = Request.Builder()
