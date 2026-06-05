@@ -43,7 +43,27 @@ class Arabp : MainAPI() {
         // Base32 alphabet for magnet info hash encoding
         private const val BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
         private const val MAX_TORRENT_CACHE = 10
+
+        // Rate limiting: minimum milliseconds between consecutive HTTP requests
+        // to avoid IP blocking from arabp2p.net anti-scraping protection.
+        private const val MIN_REQUEST_INTERVAL_MS = 800L
+
+        // Rotating User-Agent pool to reduce bot fingerprint detection
+        private val USER_AGENTS = listOf(
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 12; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 11; M2101K6G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 14; SM-A546B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+        )
     }
+
+    // Rate-limiting state: tracks last request timestamp for throttling
+    @Volatile
+    private var lastRequestTimeMs: Long = 0
+
+    private fun randomUserAgent(): String =
+        USER_AGENTS[kotlin.random.Random.nextInt(USER_AGENTS.size)]
 
     // LRU cache for downloaded .torrent bytes (key = torrent ID, thread-safe)
     private val torrentCacheLock = Any()
@@ -67,7 +87,7 @@ class Arabp : MainAPI() {
 
     // Images require Referer header to avoid 403
     private val imageHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "User-Agent" to USER_AGENTS[0],
         "Referer" to "$mainUrl/"
     )
 
@@ -79,6 +99,20 @@ class Arabp : MainAPI() {
 
     private val authClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
+            // Rate-limiting interceptor: enforces minimum delay between requests
+            // to avoid triggering anti-scraping IP blocks on arabp2p.net
+            .addInterceptor { chain ->
+                val now = System.currentTimeMillis()
+                val elapsed = now - lastRequestTimeMs
+                if (elapsed < MIN_REQUEST_INTERVAL_MS) {
+                    val delay = MIN_REQUEST_INTERVAL_MS - elapsed +
+                        kotlin.random.Random.nextLong(0, 400) // 0-400ms jitter
+                    Log.d(TAG, "Rate limit: sleeping ${delay}ms between requests")
+                    try { Thread.sleep(delay) } catch (_: InterruptedException) {}
+                }
+                lastRequestTimeMs = System.currentTimeMillis()
+                chain.proceed(chain.request())
+            }
             .cookieJar(object : okhttp3.CookieJar {
                 override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) {
                     for (cookie in cookies) {
@@ -123,7 +157,7 @@ class Arabp : MainAPI() {
 
     private fun getAuthHeaders(referer: String? = null): Map<String, String> {
         val headers = mutableMapOf(
-            "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+            "User-Agent" to randomUserAgent()
         )
         val cookies = getSessionCookies()
         if (cookies.isNotBlank()) {
@@ -162,7 +196,7 @@ class Arabp : MainAPI() {
         return try {
             val initRequest = Request.Builder()
                 .url("$mainUrl/index.php?page=login")
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+                .header("User-Agent", randomUserAgent())
                 .build()
             authClient.newCall(initRequest).execute().use { response ->
                 Log.d(TAG, "Init login page: ${response.code}")
@@ -176,7 +210,7 @@ class Arabp : MainAPI() {
             val loginRequest = Request.Builder()
                 .url("$mainUrl/index.php?page=login&returnto=index.php")
                 .post(formBody)
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+                .header("User-Agent", randomUserAgent())
                 .header("Referer", "$mainUrl/index.php?page=login")
                 .build()
 
