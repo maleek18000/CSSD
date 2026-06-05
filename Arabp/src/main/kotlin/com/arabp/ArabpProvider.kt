@@ -43,8 +43,8 @@ class Arabp : MainAPI() {
         private const val MAX_TORRENT_CACHE = 10
 
         // Rate limiting: minimum ms between requests to avoid IP bans
-        private const val MIN_REQUEST_INTERVAL_MS = 1200L
-        private const val MAX_JITTER_MS = 800L
+        private const val MIN_REQUEST_INTERVAL_MS = 2000L
+        private const val MAX_JITTER_MS = 1500L
     }
 
     // ==================== RATE LIMITER ====================
@@ -59,19 +59,19 @@ class Arabp : MainAPI() {
      * Adds random jitter so the request pattern doesn't look robotic.
      */
     private suspend fun rateLimit() {
-        val now = System.currentTimeMillis()
-        val waitMs = synchronized(rateLimitLock) {
+        val waitMs: Long
+        synchronized(rateLimitLock) {
+            val now = System.currentTimeMillis()
             val elapsed = now - lastRequestTime
             val jitter = Random.nextLong(0, MAX_JITTER_MS)
             val needed = MIN_REQUEST_INTERVAL_MS + jitter
-            if (elapsed < needed) needed - elapsed else 0L
+            waitMs = if (elapsed < needed) needed - elapsed else 0L
+            // Reserve the slot IMMEDIATELY so concurrent coroutines see the updated timestamp
+            lastRequestTime = now + waitMs
         }
         if (waitMs > 0) {
             Log.d(TAG, "rateLimit: waiting ${waitMs}ms")
             delay(waitMs)
-        }
-        synchronized(rateLimitLock) {
-            lastRequestTime = System.currentTimeMillis()
         }
     }
 
@@ -108,7 +108,16 @@ class Arabp : MainAPI() {
     }
 
     private val authClient: OkHttpClient by lazy {
+        // CRITICAL: Limit to 1 concurrent request per host to avoid IP bans.
+        // CloudStream calls getMainPage for all 11 categories at once —
+        // without this, OkHttp fires up to 5 simultaneous requests to arabp2p.net,
+        // which triggers their anti-bot protection.
+        val dispatcher = okhttp3.Dispatcher().apply {
+            maxRequests = 2
+            maxRequestsPerHost = 1
+        }
         OkHttpClient.Builder()
+            .dispatcher(dispatcher)
             .cookieJar(object : okhttp3.CookieJar {
                 override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) {
                     for (cookie in cookies) {
