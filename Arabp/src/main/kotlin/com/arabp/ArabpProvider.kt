@@ -22,6 +22,7 @@ import java.net.URI
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.Semaphore
 
@@ -188,6 +189,68 @@ class Arabp : MainAPI() {
             .build()
     }
 
+    // Separate client for HOME PAGE BROWSING only.
+    // Uses a MUCH lighter rate limiter (300ms vs 1500ms) and NO Semaphore,
+    // allowing concurrent category fetches so 11 carousels load fast.
+    // Shares the same cookieManager for auth, but has shorter timeouts
+    // so a slow/failing category page doesn't hold up the entire home page.
+    // Anti-blocking for torrent downloads still goes through authClient.
+    private val browseClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                // Light rate limiter for browse requests: 300ms minimum + 0-300ms jitter.
+                // Fast enough for home page (11 categories in ~5s), gentle enough
+                // to not trigger IP blocking (browsers routinely make 6+ concurrent requests).
+                while (true) {
+                    val now = System.currentTimeMillis()
+                    val last = lastRequestTimeMs.get()
+                    val elapsed = now - last
+                    if (elapsed < 300L) {
+                        val delay = 300L - elapsed +
+                            kotlin.random.Random.nextLong(0, 300)
+                        try { Thread.sleep(delay) } catch (_: InterruptedException) {}
+                    }
+                    val newNow = System.currentTimeMillis()
+                    if (lastRequestTimeMs.compareAndSet(last, newNow)) break
+                }
+                chain.proceed(chain.request())
+            }
+            .cookieJar(object : okhttp3.CookieJar {
+                override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) {
+                    for (cookie in cookies) {
+                        val uri = URI(url.toString())
+                        val httpCookie = HttpCookie(cookie.name, cookie.value)
+                        httpCookie.domain = cookie.domain
+                        httpCookie.path = cookie.path ?: "/"
+                        httpCookie.secure = cookie.secure
+                        if (cookie.expiresAt != Long.MAX_VALUE) {
+                            httpCookie.maxAge = (cookie.expiresAt - System.currentTimeMillis()) / 1000
+                        }
+                        cookieManager.cookieStore.add(uri, httpCookie)
+                    }
+                }
+
+                override fun loadForRequest(url: okhttp3.HttpUrl): List<okhttp3.Cookie> {
+                    val uri = URI(url.toString())
+                    return cookieManager.cookieStore.get(uri).map { hc ->
+                        val builder = okhttp3.Cookie.Builder()
+                            .name(hc.name)
+                            .value(hc.value)
+                            .domain(hc.domain ?: url.host)
+                            .path(hc.path ?: "/")
+                        if (hc.secure) builder.secure()
+                        if (hc.isHttpOnly) builder.httpOnly()
+                        builder.build()
+                    }
+                }
+            })
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .build()
+    }
+
     private fun getSessionCookies(): String {
         val uri = URI(mainUrl)
         return cookieManager.cookieStore.get(uri)
@@ -340,6 +403,51 @@ class Arabp : MainAPI() {
         return fetchDocWithAuth(url)
     }
 
+    /**
+     * Fast document fetch for HOME PAGE BROWSING only.
+     * Uses browseClient (light rate limiter, no Semaphore, shorter timeouts)
+     * so that 11 category pages can load concurrently without hitting the
+     * 120s CloudStream timeout.
+     * Still calls ensureLogin() via authClient to get auth cookies, then
+     * uses browseClient for the actual page fetch.
+     */
+    private fun fetchDocForBrowse(url: String): Document? {
+        if (!ensureLogin()) {
+            Log.e(TAG, "fetchDocForBrowse: login failed, cannot fetch $url")
+            return null
+        }
+        return try {
+            val request = Request.Builder()
+                .url(url)
+                .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
+                .build()
+            browseClient.newCall(request).execute().use { response ->
+                val body = response.body?.string() ?: return null
+                val doc = Jsoup.parse(body, url)
+                // Same session-expired check as fetchDocWithAuth
+                val hasListingContent = doc.select("div.listing_div1, table.lista2t, div.listing_div_id, table#listing_table, div.file-header").isNotEmpty()
+                if (!hasListingContent && body.contains("name=\"uid\"")) {
+                    Log.w(TAG, "fetchDocForBrowse: got login page for $url — session may have expired, retrying login")
+                    isLoggedIn = false
+                    if (ensureLogin()) {
+                        val retryRequest = Request.Builder()
+                            .url(url)
+                            .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
+                            .build()
+                        browseClient.newCall(retryRequest).execute().use { retryResponse ->
+                            val retryBody = retryResponse.body?.string() ?: return null
+                            return Jsoup.parse(retryBody, url)
+                        }
+                    }
+                }
+                doc
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchDocForBrowse error for $url: ${e.message}")
+            null
+        }
+    }
+
     // ==================== HOME PAGE ====================
 
     override val mainPage = mainPageOf(
@@ -362,9 +470,17 @@ class Arabp : MainAPI() {
         // (poster images etc.) which triggers IP blocking.
         val url = "${request.data}&pages=$page"
         Log.d(TAG, "getMainPage: fetching $url for '${request.name}' (page=$page)")
-        val doc = fetchDoc(url)
+
+        // Use fetchDocForBrowse (browseClient) instead of fetchDoc (authClient).
+        // browseClient has a lighter rate limiter (300ms vs 1500ms) and no Semaphore,
+        // so 11 categories can load concurrently without hitting 120s timeout.
+        // Also wrap in withTimeoutOrNull(20s) as safety net — if one category page
+        // is slow/failing, return empty instead of blocking the entire home page.
+        val doc = withTimeoutOrNull(20_000L) {
+            fetchDocForBrowse(url)
+        }
         if (doc == null) {
-            Log.e(TAG, "getMainPage: fetchDoc returned null for $url")
+            Log.w(TAG, "getMainPage: fetchDocForBrowse timed out or failed for $url")
             return newHomePageResponse(mutableListOf())
         }
         val homeSets = mutableListOf<HomePageList>()
