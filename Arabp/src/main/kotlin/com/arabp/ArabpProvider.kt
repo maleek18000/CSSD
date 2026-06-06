@@ -596,41 +596,45 @@ class Arabp : MainAPI() {
                 if (!response.isSuccessful) return null
                 val body = response.body?.string() ?: return null
                 val doc = Jsoup.parse(body, detailUrl)
-
-                // The details page has a table with file names and sizes
-                // Look for tables that contain video file entries
-                val videoFiles = mutableListOf<String>()
-                for (table in doc.select("table")) {
-                    val rows = table.select("tr")
-                    if (rows.size < 2) continue
-
-                    // Check if this table looks like a file list (has cells with .mkv/.mp4 etc.)
-                    val candidates = mutableListOf<String>()
-                    for (row in rows) {
-                        val cells = row.select("td")
-                        if (cells.isNotEmpty()) {
-                            val name = cells[0].text().trim()
-                            if (name.isNotEmpty() && isVideoFile(name)) {
-                                candidates.add(name)
-                            }
-                        }
-                    }
-                    if (candidates.size > videoFiles.size) {
-                        videoFiles.clear()
-                        videoFiles.addAll(candidates)
-                    }
-                }
-
-                if (videoFiles.isNotEmpty()) {
-                    Log.d(TAG, "parseFileListFromDetailPage: found ${videoFiles.size} video files from $detailUrl")
-                    videoFiles
-                } else {
-                    Log.w(TAG, "parseFileListFromDetailPage: no video files found on $detailUrl")
-                    null
-                }
+                extractVideoFileNamesFromDoc(doc)
             }
         } catch (e: Exception) {
             Log.w(TAG, "parseFileListFromDetailPage error for $detailUrl: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Extract video file names from an already-parsed detail page Document.
+     * This avoids re-fetching the page when we already have the parsed HTML.
+     */
+    private fun extractVideoFileNamesFromDoc(doc: Document): List<String>? {
+        val videoFiles = mutableListOf<String>()
+        for (table in doc.select("table")) {
+            val rows = table.select("tr")
+            if (rows.size < 2) continue
+
+            val candidates = mutableListOf<String>()
+            for (row in rows) {
+                val cells = row.select("td")
+                if (cells.isNotEmpty()) {
+                    val name = cells[0].text().trim()
+                    if (name.isNotEmpty() && isVideoFile(name)) {
+                        candidates.add(name)
+                    }
+                }
+            }
+            if (candidates.size > videoFiles.size) {
+                videoFiles.clear()
+                videoFiles.addAll(candidates)
+            }
+        }
+
+        return if (videoFiles.isNotEmpty()) {
+            Log.d(TAG, "extractVideoFileNamesFromDoc: found ${videoFiles.size} video files")
+            videoFiles
+        } else {
+            Log.w(TAG, "extractVideoFileNamesFromDoc: no video files found")
             null
         }
     }
