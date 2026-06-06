@@ -21,10 +21,9 @@ import java.net.Socket
 import java.net.URI
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.Dispatchers
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.Semaphore
 
 class Arabp : MainAPI() {
     override var mainUrl = "https://www.arabp2p.net"
@@ -46,21 +45,37 @@ class Arabp : MainAPI() {
 
         // Rate limiting: minimum milliseconds between consecutive HTTP requests
         // to avoid IP blocking from arabp2p.net anti-scraping protection.
-        private const val MIN_REQUEST_INTERVAL_MS = 800L
+        // Increased from 800ms to 1500ms with 0-1500ms jitter for human-like pacing.
+        private const val MIN_REQUEST_INTERVAL_MS = 1500L
 
-        // Rotating User-Agent pool to reduce bot fingerprint detection
+        // Maximum concurrent HTTP requests allowed at any time.
+        // Prevents parallel async() from overwhelming the server.
+        private const val MAX_CONCURRENT_REQUESTS = 1
+
+        // Rotating User-Agent pool to reduce bot fingerprint detection.
+        // Expanded to 10 diverse Android Chrome UAs across different devices and versions.
         private val USER_AGENTS = listOf(
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 12; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 11; M2101K6G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
-            "Mozilla/5.0 (Linux; Android 14; SM-A546B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+            "Mozilla/5.0 (Linux; Android 14; SM-A546B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 13; SM-A145F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 11; Redmi Note 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 13; OPPO CPH2461) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
         )
     }
 
-    // Rate-limiting state: tracks last request timestamp for throttling
-    @Volatile
-    private var lastRequestTimeMs: Long = 0
+    // Thread-safe rate-limiting state: uses AtomicLong for correct multi-thread behavior.
+    // The previous @Volatile Long was NOT thread-safe — parallel async() coroutines could
+    // read the same timestamp, all sleep the same amount, then all fire at once.
+    private val lastRequestTimeMs = AtomicLong(0)
+
+    // Semaphore to enforce MAX_CONCURRENT_REQUESTS. Prevents parallel async() in load()
+    // from firing many HTTP requests simultaneously.
+    private val requestSemaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
 
     private fun randomUserAgent(): String =
         USER_AGENTS[kotlin.random.Random.nextInt(USER_AGENTS.size)]
@@ -85,6 +100,19 @@ class Arabp : MainAPI() {
     @Volatile
     private var cachedPasskey: String? = null
 
+    // Cache of resolved download URLs (torrentId -> URL with &f=).
+    // Avoids re-fetching detail pages in loadLinks() that were already fetched in load().
+    private val resolvedUrlCacheLock = Any()
+    private val resolvedUrlCache = HashMap<String, String>()
+
+    private fun getCachedResolvedUrl(torrentId: String): String? = synchronized(resolvedUrlCacheLock) {
+        resolvedUrlCache[torrentId]
+    }
+
+    private fun cacheResolvedUrl(torrentId: String, url: String) = synchronized(resolvedUrlCacheLock) {
+        resolvedUrlCache[torrentId] = url
+    }
+
     // Images require Referer header to avoid 403
     private val imageHeaders = mapOf(
         "User-Agent" to USER_AGENTS[0],
@@ -99,19 +127,30 @@ class Arabp : MainAPI() {
 
     private val authClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            // Rate-limiting interceptor: enforces minimum delay between requests
-            // to avoid triggering anti-scraping IP blocks on arabp2p.net
+            // Thread-safe rate-limiting interceptor: enforces minimum delay between
+            // requests using AtomicLong compareAndSet to prevent race conditions.
+            // Also acquires a semaphore to limit concurrent in-flight requests.
             .addInterceptor { chain ->
-                val now = System.currentTimeMillis()
-                val elapsed = now - lastRequestTimeMs
-                if (elapsed < MIN_REQUEST_INTERVAL_MS) {
-                    val delay = MIN_REQUEST_INTERVAL_MS - elapsed +
-                        kotlin.random.Random.nextLong(0, 400) // 0-400ms jitter
-                    Log.d(TAG, "Rate limit: sleeping ${delay}ms between requests")
-                    try { Thread.sleep(delay) } catch (_: InterruptedException) {}
+                requestSemaphore.acquire()
+                try {
+                    while (true) {
+                        val now = System.currentTimeMillis()
+                        val last = lastRequestTimeMs.get()
+                        val elapsed = now - last
+                        if (elapsed < MIN_REQUEST_INTERVAL_MS) {
+                            val delay = MIN_REQUEST_INTERVAL_MS - elapsed +
+                                kotlin.random.Random.nextLong(0, 1500) // 0-1500ms jitter for human-like pacing
+                            Log.d(TAG, "Rate limit: sleeping ${delay}ms between requests")
+                            try { Thread.sleep(delay) } catch (_: InterruptedException) {}
+                        }
+                        val newNow = System.currentTimeMillis()
+                        // Atomically update only if no other thread updated it since we read it
+                        if (lastRequestTimeMs.compareAndSet(last, newNow)) break
+                    }
+                    chain.proceed(chain.request())
+                } finally {
+                    requestSemaphore.release()
                 }
-                lastRequestTimeMs = System.currentTimeMillis()
-                chain.proceed(chain.request())
             }
             .cookieJar(object : okhttp3.CookieJar {
                 override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) {
@@ -157,7 +196,10 @@ class Arabp : MainAPI() {
 
     private fun getAuthHeaders(referer: String? = null): Map<String, String> {
         val headers = mutableMapOf(
-            "User-Agent" to randomUserAgent()
+            "User-Agent" to randomUserAgent(),
+            // Accept-Language header with Arabic makes requests look more like a real browser
+            "Accept-Language" to "ar,en-US;q=0.9,en;q=0.8",
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
         )
         val cookies = getSessionCookies()
         if (cookies.isNotBlank()) {
@@ -585,9 +627,10 @@ class Arabp : MainAPI() {
      * This is used as a fallback when the .torrent file can't be downloaded
      * (e.g., daily download limit exceeded).
      * Returns a list of video file names found in the details page table.
+     * Also accepts an already-fetched Document to avoid redundant HTTP requests.
      */
-    private fun parseFileListFromDetailPage(detailUrl: String): List<String>? {
-        return try {
+    private fun parseFileListFromDetailPage(detailUrl: String, existingDoc: Document? = null): List<String>? {
+        val doc = existingDoc ?: try {
             val request = Request.Builder()
                 .url(toAbsoluteUrl(detailUrl))
                 .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
@@ -595,13 +638,13 @@ class Arabp : MainAPI() {
             authClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) return null
                 val body = response.body?.string() ?: return null
-                val doc = Jsoup.parse(body, detailUrl)
-                extractVideoFileNamesFromDoc(doc)
+                Jsoup.parse(body, detailUrl)
             }
         } catch (e: Exception) {
             Log.w(TAG, "parseFileListFromDetailPage error for $detailUrl: ${e.message}")
-            null
+            return null
         }
+        return extractVideoFileNamesFromDoc(doc)
     }
 
     /**
@@ -773,68 +816,79 @@ class Arabp : MainAPI() {
                 val fallbackFileNames: List<String>? = null  // From details page when .torrent download fails
             )
 
+            // Process torrents SEQUENTIALLY instead of in parallel.
+            // Previously used async(Dispatchers.IO) for all torrents at once, which caused
+            // dozens of simultaneous HTTP requests that triggered IP blocking.
+            // Sequential processing ensures the rate limiter actually controls pacing.
             val splitResults = if (torrentInfos.isNotEmpty()) {
                 try {
-                    coroutineScope {
-                        torrentInfos.map { info ->
-                            async(Dispatchers.IO) {
-                                var folders: List<TorrentFolder>? = null
-                                var fallbackFileNames: List<String>? = null
-                                try {
-                                    if (!info.isExternal && info.downloadHref.isNotBlank()) {
-                                        var resolvedUrl = toAbsoluteUrl(info.downloadHref)
-                                        if (!resolvedUrl.contains("&f=")) {
-                                            val detailPageUrl = toAbsoluteUrl(info.detailHref)
-                                            val detailRequest = Request.Builder()
-                                                .url(detailPageUrl)
-                                                .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
-                                                .build()
-                                            authClient.newCall(detailRequest).execute().use { resp ->
-                                                val body = resp.body?.string() ?: ""
-                                                val detailDoc = Jsoup.parse(body, detailPageUrl)
-                                                val dlLink = detailDoc.selectFirst("a[href*=download.php]")
-                                                    ?: detailDoc.selectFirst("td#Title h1 a[href*=download.php]")
-                                                if (dlLink != null) {
-                                                    resolvedUrl = toAbsoluteUrl(dlLink.attr("href"))
-                                                }
-                                            }
-                                        }
-                                        if (resolvedUrl.contains("&f=")) {
-                                            var dlResult = downloadTorrentFile(resolvedUrl)
-
-                                            // Handle daily limit: thank uploader and retry once
-                                            if (dlResult is TorrentDownloadResult.DailyLimitExceeded) {
-                                                Log.w(TAG, "Daily limit hit for #${info.torrentId}, thanking and retrying...")
-                                                thankUploader(info.torrentId, info.detailHref)
-                                                dlResult = downloadTorrentFile(resolvedUrl)
-                                            }
-
-                                            if (dlResult is TorrentDownloadResult.Success) {
-                                                cacheTorrent(info.torrentId, dlResult.bytes)
-                                                val parsedFolders = parseTorrentFolders(dlResult.bytes)
-                                                val totalVideos = parsedFolders.sumOf { it.videoFiles.size }
-                                                Log.d(TAG, "Torrent #${info.torrentId} has ${totalVideos} video files in ${parsedFolders.size} folders")
-                                                if (totalVideos > 1) folders = parsedFolders
-                                            } else {
-                                                // .torrent download failed — try parsing file list from details page
-                                                Log.w(TAG, "Torrent #${info.torrentId} download failed, trying details page fallback...")
-                                                fallbackFileNames = parseFileListFromDetailPage(info.detailHref)
-                                            }
+                    torrentInfos.map { info ->
+                        var folders: List<TorrentFolder>? = null
+                        var fallbackFileNames: List<String>? = null
+                        var detailDocCache: Document? = null
+                        try {
+                            if (!info.isExternal && info.downloadHref.isNotBlank()) {
+                                // Check if we already resolved this download URL
+                                var resolvedUrl = getCachedResolvedUrl(info.torrentId)
+                                    ?: toAbsoluteUrl(info.downloadHref)
+                                if (!resolvedUrl.contains("&f=")) {
+                                    val detailPageUrl = toAbsoluteUrl(info.detailHref)
+                                    val detailRequest = Request.Builder()
+                                        .url(detailPageUrl)
+                                        .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
+                                        .build()
+                                    authClient.newCall(detailRequest).execute().use { resp ->
+                                        val body = resp.body?.string() ?: ""
+                                        detailDocCache = Jsoup.parse(body, detailPageUrl)
+                                        val dlLink = detailDocCache!!.selectFirst("a[href*=download.php]")
+                                            ?: detailDocCache!!.selectFirst("td#Title h1 a[href*=download.php]")
+                                        if (dlLink != null) {
+                                            resolvedUrl = toAbsoluteUrl(dlLink.attr("href"))
                                         }
                                     }
-                                } catch (e: Exception) {
-                                    Log.w(TAG, "Torrent split failed for #${info.torrentId}: ${e.message}")
-                                    // Try details page fallback
-                                    try {
-                                        fallbackFileNames = parseFileListFromDetailPage(info.detailHref)
-                                    } catch (_: Exception) {}
                                 }
-                                SplitResult(info, folders, fallbackFileNames)
+                                // Cache the resolved URL so loadLinks() doesn't need to re-fetch
+                                if (resolvedUrl.contains("&f=")) {
+                                    cacheResolvedUrl(info.torrentId, resolvedUrl)
+                                }
+                                if (resolvedUrl.contains("&f=")) {
+                                    var dlResult = downloadTorrentFile(resolvedUrl)
+
+                                    // Handle daily limit: thank uploader and retry once
+                                    if (dlResult is TorrentDownloadResult.DailyLimitExceeded) {
+                                        Log.w(TAG, "Daily limit hit for #${info.torrentId}, thanking and retrying...")
+                                        thankUploader(info.torrentId, info.detailHref)
+                                        dlResult = downloadTorrentFile(resolvedUrl)
+                                    }
+
+                                    if (dlResult is TorrentDownloadResult.Success) {
+                                        cacheTorrent(info.torrentId, dlResult.bytes)
+                                        val parsedFolders = parseTorrentFolders(dlResult.bytes)
+                                        val totalVideos = parsedFolders.sumOf { it.videoFiles.size }
+                                        Log.d(TAG, "Torrent #${info.torrentId} has ${totalVideos} video files in ${parsedFolders.size} folders")
+                                        if (totalVideos > 1) folders = parsedFolders
+                                    } else {
+                                        // .torrent download failed — reuse cached detail doc to avoid extra request
+                                        Log.w(TAG, "Torrent #${info.torrentId} download failed, trying details page fallback...")
+                                        fallbackFileNames = if (detailDocCache != null)
+                                            extractVideoFileNamesFromDoc(detailDocCache!!)
+                                        else parseFileListFromDetailPage(info.detailHref)
+                                    }
+                                }
                             }
-                        }.awaitAll()
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Torrent split failed for #${info.torrentId}: ${e.message}")
+                            // Try details page fallback — reuse cached doc if available
+                            try {
+                                fallbackFileNames = if (detailDocCache != null)
+                                    extractVideoFileNamesFromDoc(detailDocCache!!)
+                                else parseFileListFromDetailPage(info.detailHref)
+                            } catch (_: Exception) {}
+                        }
+                        SplitResult(info, folders, fallbackFileNames)
                     }
                 } catch (e: Exception) {
-                    Log.w(TAG, "Parallel download failed, using fallback: ${e.message}")
+                    Log.w(TAG, "Sequential download failed, using fallback: ${e.message}")
                     torrentInfos.map { SplitResult(it, null) }
                 }
             } else {
@@ -960,6 +1014,7 @@ class Arabp : MainAPI() {
 
         var title = "Torrent #$torrentId"
         var posterUrl = ""
+        var detailDocCache: Document? = null
 
         try {
             if (ensureLogin() && detailUrl.isNotBlank()) {
@@ -970,9 +1025,9 @@ class Arabp : MainAPI() {
 
                 authClient.newCall(request).execute().use { response ->
                     val body = response.body?.string() ?: ""
-                    val detailDoc = Jsoup.parse(body, toAbsoluteUrl(detailUrl))
-                    title = detailDoc.selectFirst("td#Title h1")?.text()?.trim() ?: title
-                    posterUrl = detailDoc.selectFirst("img.listing_poster")?.attr("src") ?: ""
+                    detailDocCache = Jsoup.parse(body, toAbsoluteUrl(detailUrl))
+                    title = detailDocCache!!.selectFirst("td#Title h1")?.text()?.trim() ?: title
+                    posterUrl = detailDocCache!!.selectFirst("img.listing_poster")?.attr("src") ?: ""
                 }
             }
         } catch (e: Exception) {
@@ -995,22 +1050,37 @@ class Arabp : MainAPI() {
 
         val folderResult = try {
             if (!isExternal && ensureLogin()) {
-                var resolvedUrl = toAbsoluteUrl(downloadUrl)
+                // Check resolved URL cache first to avoid re-fetching detail page
+                var resolvedUrl = getCachedResolvedUrl(torrentId)
+                    ?: toAbsoluteUrl(downloadUrl)
                 if (resolvedUrl.isBlank() || !resolvedUrl.contains("&f=")) {
-                    val detailPageUrl = toAbsoluteUrl(detailUrl)
-                    val detailRequest = Request.Builder()
-                        .url(detailPageUrl)
-                        .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
-                        .build()
-                    authClient.newCall(detailRequest).execute().use { resp ->
-                        val body = resp.body?.string() ?: ""
-                        val detailDoc = Jsoup.parse(body, detailPageUrl)
-                        val dlLink = detailDoc.selectFirst("a[href*=download.php]")
-                            ?: detailDoc.selectFirst("td#Title h1 a[href*=download.php]")
+                    // Reuse cached detail doc if we already fetched it above
+                    if (detailDocCache != null) {
+                        val dlLink = detailDocCache!!.selectFirst("a[href*=download.php]")
+                            ?: detailDocCache!!.selectFirst("td#Title h1 a[href*=download.php]")
                         if (dlLink != null) {
                             resolvedUrl = toAbsoluteUrl(dlLink.attr("href"))
                         }
+                    } else {
+                        val detailPageUrl = toAbsoluteUrl(detailUrl)
+                        val detailRequest = Request.Builder()
+                            .url(detailPageUrl)
+                            .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
+                            .build()
+                        authClient.newCall(detailRequest).execute().use { resp ->
+                            val body = resp.body?.string() ?: ""
+                            detailDocCache = Jsoup.parse(body, detailPageUrl)
+                            val dlLink = detailDocCache!!.selectFirst("a[href*=download.php]")
+                                ?: detailDocCache!!.selectFirst("td#Title h1 a[href*=download.php]")
+                            if (dlLink != null) {
+                                resolvedUrl = toAbsoluteUrl(dlLink.attr("href"))
+                            }
+                        }
                     }
+                }
+                // Cache the resolved download URL for loadLinks()
+                if (resolvedUrl.contains("&f=")) {
+                    cacheResolvedUrl(torrentId, resolvedUrl)
                 }
                 if (resolvedUrl.contains("&f=")) {
                     var dlResult = downloadTorrentFile(resolvedUrl)
@@ -1038,9 +1108,10 @@ class Arabp : MainAPI() {
             null
         }
 
-        // Fallback: parse file list from details page when .torrent download failed
+        // Fallback: reuse cached detail doc to avoid extra HTTP request
         val fallbackFileNames = if (folderResult == null && !isExternal) {
-            parseFileListFromDetailPage(detailUrl)
+            if (detailDocCache != null) extractVideoFileNamesFromDoc(detailDocCache!!)
+            else parseFileListFromDetailPage(detailUrl)
         } else null
 
         if (folderResult != null) {
@@ -1292,7 +1363,8 @@ class Arabp : MainAPI() {
                 return foundLink
             }
 
-            var resolvedDownloadUrl = downloadUrl
+            // Check resolved URL cache first to avoid re-fetching detail page
+            var resolvedDownloadUrl = getCachedResolvedUrl(torrentId) ?: downloadUrl
 
             if (resolvedDownloadUrl.isBlank() || !resolvedDownloadUrl.contains("&f=")) {
                 val detailPageUrl = if (detailUrl.isNotBlank()) detailUrl
@@ -1312,6 +1384,8 @@ class Arabp : MainAPI() {
                             ?: detailDoc.selectFirst("td#Title h1 a[href*=download.php]")
                         if (dlLink != null) {
                             resolvedDownloadUrl = toAbsoluteUrl(dlLink.attr("href"))
+                            // Cache the resolved URL for future calls
+                            cacheResolvedUrl(torrentId, resolvedDownloadUrl)
                         }
 
                         val magnetEl = detailDoc.selectFirst("a[href^=magnet:]")
