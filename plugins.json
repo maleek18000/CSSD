@@ -839,6 +839,30 @@
   "description": "Arabic dubbed anime from arab-torrents.com. Supports TorrServe for direct streaming or magnet link playback.",
   "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/Arabmagnet.cs3",
   "name": "ArabMagnet"
-}
+  },
+  {
+    "iconUrl": "https://www.anime-day.com/favicon.ico",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/maleek18000/CSSD",
+    "fileSize": 35000,
+    "status": 1,
+    "language": "ar",
+    "authors": [
+      "maleek18000"
+    ],
+    "tvTypes": [
+      "Anime",
+      "AnimeMovie",
+      "Cartoon",
+      "TvSeries",
+      "Movie"
+    ],
+    "version": 1,
+    "internalName": "AnimeDay",
+    "description": "Anime Day - أنمي وأفلام من سيرفرات متعددة (SR, SA, JO, BO)",
+    "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/AnimeDay.cs3",
+    "name": "Anime Day"
+  }
 ]
+
 
