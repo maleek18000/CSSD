@@ -195,7 +195,7 @@ class AnimeDayProvider : MainAPI() {
         // BO Server config (MovieWitcher)
         const val BO_ALGOLIA_APP_ID = "V67NZNF3RR"
         const val BO_ALGOLIA_API_KEY = "2a0e44dbb2b46865f88fd584d154d0bd"
-        const val BO_ALGOLIA_URL = "https://V67NZNF3RR.algolia.net"
+        const val BO_ALGOLIA_URL = "https://V67NZNF3RR-1.algolianet.com"
         const val BO_FIRESTORE_URL = "https://firestore.googleapis.com/v1/projects/moviewitcher-133f3/databases/(default)/documents"
 
         // Custom URL schemes for routing between methods
@@ -223,12 +223,17 @@ class AnimeDayProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = request.data
-        val items = when {
-            url.startsWith(SR_BASE) -> getSRMainPage(url, page)
-            url.startsWith(SA_BASE) -> getSAMainPage(url, page)
-            url.startsWith(JO_ALGOLIA_URL) -> getJOMainPage(url, page)
-            url.startsWith(BO_ALGOLIA_URL) -> getBOMainPage(url, page)
-            else -> emptyList()
+        val items = try {
+            when {
+                url.startsWith(SR_BASE) -> getSRMainPage(url, page)
+                url.startsWith(SA_BASE) -> getSAMainPage(url, page)
+                url.startsWith(JO_ALGOLIA_URL) -> getJOMainPage(url, page)
+                url.startsWith(BO_ALGOLIA_URL) -> getBOMainPage(url, page)
+                else -> emptyList()
+            }
+        } catch (e: Exception) {
+            // Don't let one server failure crash the entire home page
+            emptyList()
         }
         return newHomePageResponse(request.name, items, hasNext = items.size >= 21)
     }
