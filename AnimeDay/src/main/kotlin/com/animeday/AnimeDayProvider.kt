@@ -39,6 +39,7 @@ data class SRCatalogItem(
 data class SRWPMedia(
     val id: Int? = null,
     val title: SRWPTitle? = null,
+    @JsonProperty("repeatable_fields")
     val `repeatable-fields`: List<SRRepeatableField>? = null,
     val ids: String? = null,
     val link: String? = null,
@@ -47,7 +48,12 @@ data class SRWPMedia(
     @JsonProperty("imdbRating") val imdbRating: String? = null,
     @JsonProperty("original_name") val originalName: String? = null,
     @JsonProperty("number_of_episodes") val numberOfEpisodes: String? = null,
-    val content: SRWPContent? = null
+    val content: SRWPContent? = null,
+    // Episode-specific fields from WP REST API
+    val episodio: String? = null,
+    val temporada: String? = null,
+    val serie: String? = null,
+    @JsonProperty("episode_name") val episodeName: String? = null
 ) {
     fun getRepeatableFields(): List<SRRepeatableField> {
         return `repeatable-fields` ?: emptyList()
@@ -469,12 +475,22 @@ class AnimeDayProvider : MainAPI() {
             field.url?.let { Triple(field.name ?: "SR", field.select ?: "mp4", it) }
         }
 
-        // Pass all video data as JSON in the data field
-        val dataJson = videoData.map { (server, type, vidUrl) ->
-            """{"server":"$server","type":"$type","url":"${vidUrl.replace("\"", "\\\"")}"}"""
-        }.joinToString(",", "[", "]")
+        if (videoData.isNotEmpty()) {
+            // Pass all video data as JSON in the data field
+            val dataJson = videoData.map { (server, type, vidUrl) ->
+                """{"server":"$server","type":"$type","url":"${vidUrl.replace("\"", "\\\"")}"}"""
+            }.joinToString(",", "[", "]")
 
-        return newMovieLoadResponse(title, url, TvType.AnimeMovie, dataJson) {
+            return newMovieLoadResponse(title, url, TvType.AnimeMovie, dataJson) {
+                this.posterUrl = poster
+                this.backgroundPosterUrl = bg
+                this.plot = plot
+                this.score = Score.from10(rating)
+            }
+        }
+
+        // Fallback: pass movie ID for dooplayer extraction in loadLinks
+        return newMovieLoadResponse(title, url, TvType.AnimeMovie, "sr_movie:$idPage") {
             this.posterUrl = poster
             this.backgroundPosterUrl = bg
             this.plot = plot
@@ -532,31 +548,52 @@ class AnimeDayProvider : MainAPI() {
             } catch (_: Exception) {}
         }
 
-        // Strategy 2: Fallback - search WP API by anime name
+        // Strategy 2: Fallback - search WP API by anime name (try both English and Arabic)
         if (episodes.isEmpty()) {
-            val searchName = originalName ?: title.substringBefore("–").substringBefore("-").trim()
-            try {
-                val encodedSearch = URLEncoder.encode(searchName, "UTF-8")
-                val epRes = app.get(
-                    "$SR_WP_BASE/wp-json/wp/v2/episodes?search=$encodedSearch&per_page=100&orderby=date&order=asc",
-                    headers = mapOf("Authorization" to SR_AUTH)
-                )
-                val epList = tryParseJson<List<SRWPMedia>>(epRes.text) ?: emptyList()
-                for (ep in epList) {
-                    val epTitle = ep.title?.rendered ?: continue
-                    val epId = ep.id ?: continue
-                    val match = Regex("(\\d+)×(\\d+)").find(epTitle)
-                    if (match != null) {
-                        val seasonNum = match.groupValues[1].toIntOrNull() ?: 1
-                        val epNum = match.groupValues[2].toIntOrNull() ?: continue
-                        episodes.add(newEpisode("sr_ep:$epId") {
-                            this.name = epTitle.replace(Regex("<[^>]+>"), "").trim()
-                            this.season = seasonNum
-                            this.episode = epNum
-                        })
+            val searchNames = mutableListOf<String>()
+            originalName?.let { searchNames.add(it) }
+            val arabicName = title.substringBefore("–").substringBefore("-").trim()
+            if (arabicName != originalName) searchNames.add(arabicName)
+
+            for (searchName in searchNames) {
+                try {
+                    val encodedSearch = URLEncoder.encode(searchName, "UTF-8")
+                    val epRes = app.get(
+                        "$SR_WP_BASE/wp-json/wp/v2/episodes?search=$encodedSearch&per_page=100&orderby=date&order=asc",
+                        headers = mapOf("Authorization" to SR_AUTH)
+                    )
+                    val epList = tryParseJson<List<SRWPMedia>>(epRes.text) ?: emptyList()
+                    for (ep in epList) {
+                        val epId = ep.id ?: continue
+
+                        // Use temporada/episodio fields if available (more reliable)
+                        val seasonNum = ep.temporada?.toIntOrNull()
+                        val epNum = ep.episodio?.toIntOrNull()
+
+                        if (seasonNum != null && epNum != null) {
+                            episodes.add(newEpisode("sr_ep:$epId") {
+                                this.name = ep.episodeName ?: ep.title?.rendered?.replace(Regex("<[^>]+>"), "")?.trim() ?: "حلقة $epNum"
+                                this.season = seasonNum
+                                this.episode = epNum
+                            })
+                        } else {
+                            // Fallback to regex parsing from title
+                            val epTitle = ep.title?.rendered ?: continue
+                            val match = Regex("(\\d+)×(\\d+)").find(epTitle)
+                            if (match != null) {
+                                val s = match.groupValues[1].toIntOrNull() ?: 1
+                                val e = match.groupValues[2].toIntOrNull() ?: continue
+                                episodes.add(newEpisode("sr_ep:$epId") {
+                                    this.name = ep.episodeName ?: epTitle.replace(Regex("<[^>]+>"), "").trim()
+                                    this.season = s
+                                    this.episode = e
+                                })
+                            }
+                        }
                     }
-                }
-            } catch (_: Exception) {}
+                    if (episodes.isNotEmpty()) break
+                } catch (_: Exception) {}
+            }
         }
 
         return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes.sortedBy { (it.season ?: 1) * 1000 + (it.episode ?: 0) }) {
@@ -717,6 +754,7 @@ class AnimeDayProvider : MainAPI() {
     ): Boolean {
         return when {
             data.startsWith("[") -> loadLinksFromJson(data, callback, subtitleCallback)
+            data.startsWith("sr_movie:") -> loadSRMovieLinks(data.removePrefix("sr_movie:"), callback, subtitleCallback)
             data.startsWith("sr_ep:") -> loadSRLinks(data.removePrefix("sr_ep:"), callback, subtitleCallback)
             data.startsWith("sr_slug:") -> loadSRSlugLinks(data.removePrefix("sr_slug:"), callback, subtitleCallback)
             data.startsWith("jo_ep:") -> loadJOLinks(data.removePrefix("jo_ep:"), callback, subtitleCallback)
@@ -788,6 +826,74 @@ class AnimeDayProvider : MainAPI() {
                 } catch (_: Exception) { false }
             }
         }
+    }
+
+    // ============================================================
+    // SR Server: loadLinks for movies via dooplayer (fallback)
+    // ============================================================
+    private suspend fun loadSRMovieLinks(
+        movieId: String,
+        callback: (ExtractorLink) -> Unit,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ): Boolean {
+        // Try WP API first (repeatable_fields contains direct video URLs)
+        val res = app.get("$SR_WP_BASE/wp-json/wp/v2/movies/$movieId",
+            headers = mapOf("Authorization" to SR_AUTH)
+        ).parsedSafe<SRWPMedia>()
+
+        val fields = res?.getRepeatableFields()
+        if (!fields.isNullOrEmpty()) {
+            var found = false
+            for (field in fields) {
+                val vidUrl = field.url ?: continue
+                val serverName = field.name ?: "SR"
+                val type = field.select ?: "mp4"
+                found = extractVideoLink(vidUrl, serverName, type, callback, subtitleCallback) || found
+            }
+            if (found) return true
+        }
+
+        // Fallback: try dooplayer API with multiple server numbers
+        for (nume in 1..5) {
+            try {
+                val dooRes = app.post(
+                    "$SR_WP_BASE/wp-admin/admin-ajax.php",
+                    headers = mapOf(
+                        "Authorization" to SR_AUTH,
+                        "Content-Type" to "application/x-www-form-urlencoded"
+                    ),
+                    data = mapOf(
+                        "action" to "doo_player_ajax",
+                        "post" to movieId,
+                        "nume" to nume.toString(),
+                        "type" to "movie"
+                    )
+                ).text
+
+                val dooData = tryParseJson<Map<String, Any?>>(dooRes)
+                val embedUrl = dooData?.get("embed_url") as? String ?: continue
+                if (embedUrl.isBlank()) continue
+                val dooType = dooData?.get("type") as? String ?: ""
+
+                // Decode base64 URL
+                val decoded = try {
+                    String(Base64.decode(embedUrl, Base64.DEFAULT), Charsets.UTF_8)
+                } catch (_: Exception) {
+                    embedUrl
+                }
+
+                // Extract the source URL from the decoded string
+                // Format: ?source=ENCODED_URL&id=ID&type=TYPE
+                val sourceUrl = Regex("""source=([^&]+)""").find(decoded)?.groupValues?.get(1)
+                    ?.let { URLDecoder.decode(URLDecoder.decode(it, "UTF-8"), "UTF-8") }
+
+                if (sourceUrl != null) {
+                    val result = extractVideoLink(sourceUrl, "SR Srv$nume", dooType, callback, subtitleCallback)
+                    if (result) return true
+                }
+            } catch (_: Exception) { continue }
+        }
+        return false
     }
 
     // ============================================================
