@@ -217,14 +217,14 @@ class AnimeDayProvider : MainAPI() {
     }
 
     // ============================================================
-    // Main Page
+    // Main Page - Use simple identifiers to avoid URL encoding issues
     // ============================================================
     override val mainPage = mainPageOf(
         "$SR_BASE/app/stardima.php?&translate_type=sub" to "SR: أفلام مترجمة",
         "$SR_BASE/app/stardima.php?&translate_type=dub" to "SR: مسلسلات مدبلجة",
-        "$SA_BASE/anime/public/animes/get-published-animes?json={\"_offset\":0,\"_limit\":21,\"order_by\":\"latest_first\",\"list_type\":\"filter\",\"anime_name\":\"\",\"just_info\":\"Yes\",\"anime_status\":\"Finished Airing\",\"anime_type\":\"TV\"}" to "SA: مسلسلات أنمي",
-        "$SA_BASE/anime/public/animes/get-published-animes?json={\"_offset\":0,\"_limit\":21,\"order_by\":\"latest_first\",\"list_type\":\"filter\",\"anime_name\":\"\",\"just_info\":\"Yes\",\"anime_status\":\"Finished Airing\",\"anime_type\":\"Movie\"}" to "SA: أفلام أنمي",
-        "$JO_ALGOLIA_URL/1/indexes/recent/query" to "JO: أحدث الأنمي",
+        "sa_tv" to "SA: مسلسلات أنمي",
+        "sa_movie" to "SA: أفلام أنمي",
+        "jo_recent" to "JO: أحدث الأنمي",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -232,9 +232,9 @@ class AnimeDayProvider : MainAPI() {
         val items = try {
             when {
                 url.startsWith(SR_BASE) -> getSRMainPage(url, page)
-                url.startsWith(SA_BASE) -> getSAMainPage(url, page)
-                url.startsWith(JO_ALGOLIA_URL) -> getJOMainPage(url, page)
-                url.startsWith(BO_ALGOLIA_URL) -> getBOMainPage(url, page)
+                url == "sa_tv" -> getSAMainPage("TV", page)
+                url == "sa_movie" -> getSAMainPage("Movie", page)
+                url == "jo_recent" -> getJOMainPage(page)
                 else -> emptyList()
             }
         } catch (e: Exception) {
@@ -359,16 +359,10 @@ class AnimeDayProvider : MainAPI() {
     // ============================================================
     // SA Server: Main Page
     // ============================================================
-    private suspend fun getSAMainPage(url: String, page: Int): List<SearchResponse> {
+    private suspend fun getSAMainPage(animeType: String, page: Int): List<SearchResponse> {
         val offset = (page - 1) * 21
-        // Modify the JSON to change offset
-        val jsonBase = url.substringAfter("json=")
-        val jsonDecoded = URLDecoder.decode(jsonBase, "UTF-8")
-        val updatedJson = jsonDecoded.replace(
-            """"_offset":0""",
-            """"_offset":$offset"""
-        )
-        val fullUrl = url.substringBefore("json=") + "json=" + URLEncoder.encode(updatedJson, "UTF-8")
+        val saJson = """{"_offset":$offset,"_limit":21,"order_by":"latest_first","list_type":"filter","anime_name":"","just_info":"Yes","anime_status":"Finished Airing","anime_type":"$animeType"}"""
+        val fullUrl = "$SA_BASE/anime/public/animes/get-published-animes?json=${URLEncoder.encode(saJson, "UTF-8")}"
 
         val res = app.get(fullUrl, headers = mapOf(
             "Client-Id" to SA_CLIENT_ID,
@@ -392,8 +386,8 @@ class AnimeDayProvider : MainAPI() {
     // ============================================================
     // JO Server: Main Page
     // ============================================================
-    private suspend fun getJOMainPage(url: String, page: Int): List<SearchResponse> {
-        val res = app.post(url, headers = mapOf(
+    private suspend fun getJOMainPage(page: Int): List<SearchResponse> {
+        val res = app.post("$JO_ALGOLIA_URL/1/indexes/recent/query", headers = mapOf(
             "X-Algolia-Application-Id" to JO_ALGOLIA_APP_ID,
             "X-Algolia-API-Key" to JO_ALGOLIA_API_KEY,
             "Content-Type" to "application/json"
@@ -548,12 +542,30 @@ class AnimeDayProvider : MainAPI() {
             } catch (_: Exception) {}
         }
 
-        // Strategy 2: Fallback - search WP API by anime name (try both English and Arabic)
+        // Strategy 2: Fallback - search WP API by anime name
+        // Try multiple search variants because WP search doesn't always match
         if (episodes.isEmpty()) {
             val searchNames = mutableListOf<String>()
-            originalName?.let { searchNames.add(it) }
+
+            // Add English name (strip common articles: The, A, An)
+            originalName?.let { engName ->
+                searchNames.add(engName)
+                val stripped = engName.replace(Regex("^(The|A|An)\\s+", RegexOption.IGNORE_CASE), "").trim()
+                if (stripped != engName && stripped.length > 2) {
+                    searchNames.add(stripped)
+                }
+            }
+
+            // Add Arabic name variants (without "كرتون" or "مسلسل" prefix)
             val arabicName = title.substringBefore("–").substringBefore("-").trim()
-            if (arabicName != originalName) searchNames.add(arabicName)
+            if (arabicName != originalName) {
+                searchNames.add(arabicName)
+                val arabicStripped = arabicName
+                    .replace(Regex("^(كرتون|مسلسل|فيلم)\\s+"), "").trim()
+                if (arabicStripped != arabicName && arabicStripped.length > 2) {
+                    searchNames.add(arabicStripped)
+                }
+            }
 
             for (searchName in searchNames) {
                 try {
