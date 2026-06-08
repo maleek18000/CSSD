@@ -195,11 +195,12 @@ class AnimeDayProvider : MainAPI() {
         // BO Server config (MovieWitcher)
         const val BO_ALGOLIA_APP_ID = "V67NZNF3RR"
         const val BO_ALGOLIA_API_KEY = "2a0e44dbb2b46865f88fd584d154d0bd"
-        const val BO_ALGOLIA_URL = "https://V67NZNF3RR-1.algolianet.com"
+        const val BO_ALGOLIA_URL = "https://V67NZNF3RR-dsn.algolia.net"
         const val BO_FIRESTORE_URL = "https://firestore.googleapis.com/v1/projects/moviewitcher-133f3/databases/(default)/documents"
 
         // Custom URL schemes for routing between methods
-        const val SCHEME = "animeday://"
+        // Must use https:// so CloudStream doesn't prepend mainUrl
+        const val SCHEME = "https://animeday.app/"
         const val SR_MOVIE = "sr/movie/"
         const val SR_SERIES = "sr/series/"
         const val SR_EPISODE = "sr/episode/"
@@ -218,7 +219,6 @@ class AnimeDayProvider : MainAPI() {
         "$SA_BASE/anime/public/animes/get-published-animes?json={\"_offset\":0,\"_limit\":21,\"order_by\":\"latest_first\",\"list_type\":\"filter\",\"anime_name\":\"\",\"just_info\":\"Yes\",\"anime_status\":\"Finished Airing\",\"anime_type\":\"TV\"}" to "SA: مسلسلات أنمي",
         "$SA_BASE/anime/public/animes/get-published-animes?json={\"_offset\":0,\"_limit\":21,\"order_by\":\"latest_first\",\"list_type\":\"filter\",\"anime_name\":\"\",\"just_info\":\"Yes\",\"anime_status\":\"Finished Airing\",\"anime_type\":\"Movie\"}" to "SA: أفلام أنمي",
         "$JO_ALGOLIA_URL/1/indexes/recent/query" to "JO: أحدث الأنمي",
-        "$BO_ALGOLIA_URL/1/indexes/recent_movie_witcher/query" to "BO: أحدث الأفلام",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -436,12 +436,16 @@ class AnimeDayProvider : MainAPI() {
     // Load (Detail Page)
     // ============================================================
     override suspend fun load(url: String): LoadResponse? {
+        // Strip mainUrl prefix if CloudStream prepended it (e.g. https://anime-day.com/https://animeday.app/...)
+        val cleanUrl = url.removePrefix(mainUrl).removePrefix("/")
+        val fullUrl = if (cleanUrl.startsWith("https://")) cleanUrl else url
+
         return when {
-            url.startsWith(SCHEME + SR_MOVIE) -> loadSRMovie(url.removePrefix(SCHEME + SR_MOVIE), url)
-            url.startsWith(SCHEME + SR_SERIES) -> loadSRSeries(url.removePrefix(SCHEME + SR_SERIES), url)
-            url.startsWith(SCHEME + SA_ANIME) -> loadSAAnime(url.removePrefix(SCHEME + SA_ANIME), url)
-            url.startsWith(SCHEME + JO_ANIME) -> loadJOAnime(url.removePrefix(SCHEME + JO_ANIME), url)
-            url.startsWith(SCHEME + BO_MOVIE) -> loadBOMovie(url.removePrefix(SCHEME + BO_MOVIE), url)
+            fullUrl.startsWith(SCHEME + SR_MOVIE) -> loadSRMovie(fullUrl.removePrefix(SCHEME + SR_MOVIE), fullUrl)
+            fullUrl.startsWith(SCHEME + SR_SERIES) -> loadSRSeries(fullUrl.removePrefix(SCHEME + SR_SERIES), fullUrl)
+            fullUrl.startsWith(SCHEME + SA_ANIME) -> loadSAAnime(fullUrl.removePrefix(SCHEME + SA_ANIME), fullUrl)
+            fullUrl.startsWith(SCHEME + JO_ANIME) -> loadJOAnime(fullUrl.removePrefix(SCHEME + JO_ANIME), fullUrl)
+            fullUrl.startsWith(SCHEME + BO_MOVIE) -> loadBOMovie(fullUrl.removePrefix(SCHEME + BO_MOVIE), fullUrl)
             else -> null
         }
     }
