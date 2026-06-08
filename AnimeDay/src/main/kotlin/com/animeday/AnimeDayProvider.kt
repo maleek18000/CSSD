@@ -40,7 +40,7 @@ data class SRWPMedia(
     val id: Int? = null,
     val title: SRWPTitle? = null,
     @JsonProperty("repeatable_fields")
-    val `repeatable-fields`: List<SRRepeatableField>? = null,
+    val repeatableFields: List<SRRepeatableField>? = null,
     val ids: String? = null,
     val link: String? = null,
     @JsonProperty("dt_poster") val dtPoster: String? = null,
@@ -54,11 +54,7 @@ data class SRWPMedia(
     val temporada: String? = null,
     val serie: String? = null,
     @JsonProperty("episode_name") val episodeName: String? = null
-) {
-    fun getRepeatableFields(): List<SRRepeatableField> {
-        return `repeatable-fields` ?: emptyList()
-    }
-}
+)
 
 data class SRWPTitle(val rendered: String? = null)
 data class SRWPContent(val rendered: String? = null)
@@ -160,6 +156,7 @@ data class FirestoreValue(
     val stringValue: String? = null,
     val integerValue: String? = null,
     val booleanValue: Boolean? = null,
+    val doubleValue: Double? = null,
     val mapValue: FirestoreMapValue? = null,
     val arrayValue: FirestoreArrayValue? = null
 )
@@ -180,7 +177,6 @@ class AnimeDayProvider : MainAPI() {
         TvType.Anime, TvType.AnimeMovie, TvType.Cartoon, TvType.TvSeries, TvType.Movie
     )
 
-    // SR Server config
     companion object {
         const val SR_BASE = "https://anime-day.com"
         const val SR_WP_BASE = "https://ap45.wiib.top"
@@ -201,23 +197,20 @@ class AnimeDayProvider : MainAPI() {
         // BO Server config (MovieWitcher)
         const val BO_ALGOLIA_APP_ID = "V67NZNF3RR"
         const val BO_ALGOLIA_API_KEY = "2a0e44dbb2b46865f88fd584d154d0bd"
-        const val BO_ALGOLIA_URL = "https://V67NZNF3RR-dsn.algolia.net"
+        const val BO_ALGOLIA_URL = "https://V67NZNF3RR-1.algolianet.com"
         const val BO_FIRESTORE_URL = "https://firestore.googleapis.com/v1/projects/moviewitcher-133f3/databases/(default)/documents"
 
         // Custom URL schemes for routing between methods
-        // Must use https:// so CloudStream doesn't prepend mainUrl
         const val SCHEME = "https://animeday.app/"
         const val SR_MOVIE = "sr/movie/"
         const val SR_SERIES = "sr/series/"
-        const val SR_EPISODE = "sr/episode/"
         const val SA_ANIME = "sa/anime/"
-        const val SA_EPISODE = "sa/episode/"
         const val JO_ANIME = "jo/anime/"
         const val BO_MOVIE = "bo/movie/"
     }
 
     // ============================================================
-    // Main Page - Use simple identifiers to avoid URL encoding issues
+    // Main Page
     // ============================================================
     override val mainPage = mainPageOf(
         "$SR_BASE/app/stardima.php?&translate_type=sub" to "SR: أفلام مترجمة",
@@ -225,6 +218,7 @@ class AnimeDayProvider : MainAPI() {
         "sa_tv" to "SA: مسلسلات أنمي",
         "sa_movie" to "SA: أفلام أنمي",
         "jo_recent" to "JO: أحدث الأنمي",
+        "bo_recent" to "BO: أحدث الأفلام",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -235,17 +229,17 @@ class AnimeDayProvider : MainAPI() {
                 url == "sa_tv" -> getSAMainPage("TV", page)
                 url == "sa_movie" -> getSAMainPage("Movie", page)
                 url == "jo_recent" -> getJOMainPage(page)
+                url == "bo_recent" -> getBOMainPage(page)
                 else -> emptyList()
             }
         } catch (e: Exception) {
-            // Don't let one server failure crash the entire home page
             emptyList()
         }
         return newHomePageResponse(request.name, items, hasNext = items.size >= 21)
     }
 
     // ============================================================
-    // SR Server: Main Page & Search
+    // SR Server: Main Page
     // ============================================================
     private suspend fun getSRMainPage(url: String, page: Int): List<SearchResponse> {
         val pageUrl = if (page > 1) "$url&page=$page" else url
@@ -259,17 +253,16 @@ class AnimeDayProvider : MainAPI() {
             }
             val link = SCHEME + (if (isMovie) SR_MOVIE else SR_SERIES) + idPage
             if (isMovie) {
-                newMovieSearchResponse(name, link) {
-                    this.posterUrl = poster
-                }
+                newMovieSearchResponse(name, link) { this.posterUrl = poster }
             } else {
-                newTvSeriesSearchResponse(name, link) {
-                    this.posterUrl = poster
-                }
+                newTvSeriesSearchResponse(name, link) { this.posterUrl = poster }
             }
         } ?: emptyList()
     }
 
+    // ============================================================
+    // Search
+    // ============================================================
     override suspend fun search(query: String): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
 
@@ -329,19 +322,18 @@ class AnimeDayProvider : MainAPI() {
                 "$JO_ALGOLIA_URL/1/indexes/series/query",
                 headers = mapOf(
                     "X-Algolia-Application-Id" to JO_ALGOLIA_APP_ID,
-                    "X-Algolia-API-Key" to JO_ALGOLIA_API_KEY,
-                    "Content-Type" to "application/json"
+                    "X-Algolia-API-Key" to JO_ALGOLIA_API_KEY
                 ),
-                data = mapOf(
+                json = mapOf(
                     "query" to query,
-                    "hitsPerPage" to "20"
+                    "hitsPerPage" to 20
                 )
             ).parsedSafe<AlgoliaResponse>()
             joRes?.hits?.forEach { hit ->
                 val name = hit.name ?: return@forEach
                 val objectId = hit.objectID ?: return@forEach
                 val poster = hit.posterUri ?: hit.poster
-                val link = SCHEME + JO_ANIME + objectId
+                val link = SCHEME + JO_ANIME + URLEncoder.encode(objectId, "UTF-8")
                 val isMovie = hit.type == "فيلم"
                 results.add(
                     if (isMovie) {
@@ -361,82 +353,174 @@ class AnimeDayProvider : MainAPI() {
     // ============================================================
     private suspend fun getSAMainPage(animeType: String, page: Int): List<SearchResponse> {
         val offset = (page - 1) * 21
-        val saJson = """{"_offset":$offset,"_limit":21,"order_by":"latest_first","list_type":"filter","anime_name":"","just_info":"Yes","anime_status":"Finished Airing","anime_type":"$animeType"}"""
+        val saJson = """{"_offset":$offset,"_limit":21,"order_by":"latest_first","list_type":"filter","anime_name":"","just_info":"Yes","anime_type":"$animeType"}"""
         val fullUrl = "$SA_BASE/anime/public/animes/get-published-animes?json=${URLEncoder.encode(saJson, "UTF-8")}"
 
-        val res = app.get(fullUrl, headers = mapOf(
+        val responseText = app.get(fullUrl, headers = mapOf(
             "Client-Id" to SA_CLIENT_ID,
             "Client-Secret" to SA_CLIENT_SECRET
-        )).parsedSafe<SACatalogResponse>() ?: return emptyList()
+        )).text
 
-        return res.response?.data?.mapNotNull { item ->
-            val name = item.animeName ?: return@mapNotNull null
-            val animeId = item.animeId ?: return@mapNotNull null
-            val poster = item.coverImageUrl
-            val link = SCHEME + SA_ANIME + animeId
-            val isMovie = item.animeType == "Movie"
-            if (isMovie) {
-                newMovieSearchResponse(name, link) { this.posterUrl = poster }
-            } else {
-                newTvSeriesSearchResponse(name, link) { this.posterUrl = poster }
+        // Try parsedSafe first, then manual parsing as fallback
+        val res = tryParseJson<SACatalogResponse>(responseText)
+        val items = res?.response?.data
+
+        if (!items.isNullOrEmpty()) {
+            return items.mapNotNull { item ->
+                val name = item.animeName ?: return@mapNotNull null
+                val animeId = item.animeId ?: return@mapNotNull null
+                val poster = item.coverImageUrl
+                val link = SCHEME + SA_ANIME + animeId
+                val isMovie = item.animeType == "Movie"
+                if (isMovie) {
+                    newMovieSearchResponse(name, link) { this.posterUrl = poster }
+                } else {
+                    newTvSeriesSearchResponse(name, link) { this.posterUrl = poster }
+                }
             }
-        } ?: emptyList()
+        }
+
+        // Fallback: parse JSON manually
+        return parseSACatalogManual(responseText)
+    }
+
+    private fun parseSACatalogManual(jsonText: String): List<SearchResponse> {
+        val items = mutableListOf<SearchResponse>()
+        try {
+            val root = tryParseJson<Map<String, Any?>>(jsonText) ?: return items
+            val response = root["response"] as? Map<String, Any?> ?: return items
+            val data = response["data"] as? List<Map<String, Any?>> ?: return items
+            for (item in data) {
+                val name = item["anime_name"] as? String ?: continue
+                val animeId = item["anime_id"]?.toString() ?: continue
+                val poster = item["anime_cover_image_url"] as? String
+                val animeType = item["anime_type"] as? String ?: "TV"
+                val link = SCHEME + SA_ANIME + animeId
+                val isMovie = animeType == "Movie"
+                items.add(
+                    if (isMovie) {
+                        newMovieSearchResponse(name, link) { this.posterUrl = poster }
+                    } else {
+                        newTvSeriesSearchResponse(name, link) { this.posterUrl = poster }
+                    }
+                )
+            }
+        } catch (_: Exception) {}
+        return items
     }
 
     // ============================================================
     // JO Server: Main Page
     // ============================================================
     private suspend fun getJOMainPage(page: Int): List<SearchResponse> {
-        val res = app.post("$JO_ALGOLIA_URL/1/indexes/recent/query", headers = mapOf(
+        val responseText = app.post("$JO_ALGOLIA_URL/1/indexes/recent/query", headers = mapOf(
             "X-Algolia-Application-Id" to JO_ALGOLIA_APP_ID,
-            "X-Algolia-API-Key" to JO_ALGOLIA_API_KEY,
-            "Content-Type" to "application/json"
-        ), data = mapOf(
-            "params" to "hitsPerPage=21&page=${page - 1}",
+            "X-Algolia-API-Key" to JO_ALGOLIA_API_KEY
+        ), json = mapOf(
+            "hitsPerPage" to 21,
+            "page" to (page - 1),
             "query" to ""
-        )).parsedSafe<AlgoliaResponse>() ?: return emptyList()
+        )).text
 
-        return res.hits?.mapNotNull { hit ->
-            val name = hit.name ?: return@mapNotNull null
-            val objectId = hit.objectID ?: return@mapNotNull null
-            val poster = hit.posterUri ?: hit.poster
-            val link = SCHEME + JO_ANIME + objectId
-            val isMovie = hit.type == "فيلم"
-            if (isMovie) {
-                newMovieSearchResponse(name, link) { this.posterUrl = poster }
-            } else {
-                newTvSeriesSearchResponse(name, link) { this.posterUrl = poster }
+        // Try parsedSafe first, then manual parsing as fallback
+        val res = tryParseJson<AlgoliaResponse>(responseText)
+        if (!res?.hits.isNullOrEmpty()) {
+            return res!!.hits!!.mapNotNull { hit ->
+                val name = hit.name ?: return@mapNotNull null
+                val objectId = hit.objectID ?: return@mapNotNull null
+                val poster = hit.posterUri ?: hit.poster
+                val link = SCHEME + JO_ANIME + URLEncoder.encode(objectId, "UTF-8")
+                val isMovie = hit.type == "فيلم"
+                if (isMovie) {
+                    newMovieSearchResponse(name, link) { this.posterUrl = poster }
+                } else {
+                    newTvSeriesSearchResponse(name, link) { this.posterUrl = poster }
+                }
             }
-        } ?: emptyList()
+        }
+
+        // Fallback: parse JSON manually
+        return parseJOAlgoliaManual(responseText)
+    }
+
+    private fun parseJOAlgoliaManual(jsonText: String): List<SearchResponse> {
+        val items = mutableListOf<SearchResponse>()
+        try {
+            val root = tryParseJson<Map<String, Any?>>(jsonText) ?: return items
+            val hits = root["hits"] as? List<Map<String, Any?>> ?: return items
+            for (hit in hits) {
+                val name = hit["name"] as? String ?: continue
+                val objectId = hit["objectID"] as? String ?: continue
+                val posterUri = hit["poster_uri"] as? String
+                val poster = hit["poster"] as? String
+                val type = hit["type"] as? String ?: "مسلسل"
+                val link = SCHEME + JO_ANIME + URLEncoder.encode(objectId, "UTF-8")
+                val isMovie = type == "فيلم"
+                items.add(
+                    if (isMovie) {
+                        newMovieSearchResponse(name, link) { this.posterUrl = posterUri ?: poster }
+                    } else {
+                        newTvSeriesSearchResponse(name, link) { this.posterUrl = posterUri ?: poster }
+                    }
+                )
+            }
+        } catch (_: Exception) {}
+        return items
     }
 
     // ============================================================
     // BO Server: Main Page
     // ============================================================
-    private suspend fun getBOMainPage(url: String, page: Int): List<SearchResponse> {
-        val res = app.post(url, headers = mapOf(
+    private suspend fun getBOMainPage(page: Int): List<SearchResponse> {
+        val responseText = app.post("$BO_ALGOLIA_URL/1/indexes/Movies/query", headers = mapOf(
             "X-Algolia-Application-Id" to BO_ALGOLIA_APP_ID,
-            "X-Algolia-API-Key" to BO_ALGOLIA_API_KEY,
-            "Content-Type" to "application/json"
-        ), data = mapOf(
-            "params" to "hitsPerPage=21&page=${page - 1}",
+            "X-Algolia-API-Key" to BO_ALGOLIA_API_KEY
+        ), json = mapOf(
+            "hitsPerPage" to 21,
+            "page" to (page - 1),
             "query" to ""
-        )).parsedSafe<AlgoliaResponse>() ?: return emptyList()
+        )).text
 
-        return res.hits?.mapNotNull { hit ->
-            val name = hit.name ?: return@mapNotNull null
-            val objectId = hit.objectID ?: return@mapNotNull null
-            val poster = hit.posterUri ?: hit.poster
-            val link = SCHEME + BO_MOVIE + objectId
-            newMovieSearchResponse(name, link) { this.posterUrl = poster }
-        } ?: emptyList()
+        // Try parsedSafe first, then manual parsing as fallback
+        val res = tryParseJson<AlgoliaResponse>(responseText)
+        if (!res?.hits.isNullOrEmpty()) {
+            return res!!.hits!!.mapNotNull { hit ->
+                val name = hit.name ?: return@mapNotNull null
+                val objectId = hit.objectID ?: return@mapNotNull null
+                val poster = hit.posterUri ?: hit.poster
+                val link = SCHEME + BO_MOVIE + URLEncoder.encode(objectId, "UTF-8")
+                newMovieSearchResponse(name, link) { this.posterUrl = poster }
+            }
+        }
+
+        // Fallback: parse JSON manually
+        return parseBOAlgoliaManual(responseText)
+    }
+
+    private fun parseBOAlgoliaManual(jsonText: String): List<SearchResponse> {
+        val items = mutableListOf<SearchResponse>()
+        try {
+            val root = tryParseJson<Map<String, Any?>>(jsonText) ?: return items
+            val hits = root["hits"] as? List<Map<String, Any?>> ?: return items
+            for (hit in hits) {
+                val name = hit["name"] as? String ?: continue
+                val objectId = hit["objectID"] as? String ?: continue
+                val posterUri = hit["poster_uri"] as? String
+                val poster = hit["poster"] as? String
+                val link = SCHEME + BO_MOVIE + URLEncoder.encode(objectId, "UTF-8")
+                items.add(
+                    newMovieSearchResponse(name, link) { this.posterUrl = posterUri ?: poster }
+                )
+            }
+        } catch (_: Exception) {}
+        return items
     }
 
     // ============================================================
     // Load (Detail Page)
     // ============================================================
     override suspend fun load(url: String): LoadResponse? {
-        // Strip mainUrl prefix if CloudStream prepended it (e.g. https://anime-day.com/https://animeday.app/...)
+        // Strip mainUrl prefix if CloudStream prepended it
         val cleanUrl = url.removePrefix(mainUrl).removePrefix("/")
         val fullUrl = if (cleanUrl.startsWith("https://")) cleanUrl else url
 
@@ -444,7 +528,7 @@ class AnimeDayProvider : MainAPI() {
             fullUrl.startsWith(SCHEME + SR_MOVIE) -> loadSRMovie(fullUrl.removePrefix(SCHEME + SR_MOVIE), fullUrl)
             fullUrl.startsWith(SCHEME + SR_SERIES) -> loadSRSeries(fullUrl.removePrefix(SCHEME + SR_SERIES), fullUrl)
             fullUrl.startsWith(SCHEME + SA_ANIME) -> loadSAAnime(fullUrl.removePrefix(SCHEME + SA_ANIME), fullUrl)
-            fullUrl.startsWith(SCHEME + JO_ANIME) -> loadJOAnime(fullUrl.removePrefix(SCHEME + JO_ANIME), fullUrl)
+            fullUrl.startsWith(SCHEME + JO_ANIME) -> loadJOAnime(URLDecoder.decode(fullUrl.removePrefix(SCHEME + JO_ANIME), "UTF-8"), fullUrl)
             fullUrl.startsWith(SCHEME + BO_MOVIE) -> loadBOMovie(fullUrl.removePrefix(SCHEME + BO_MOVIE), fullUrl)
             else -> null
         }
@@ -454,10 +538,11 @@ class AnimeDayProvider : MainAPI() {
     // SR Server: Load Movie
     // ============================================================
     private suspend fun loadSRMovie(idPage: String, url: String): LoadResponse? {
-        val res = app.get("$SR_WP_BASE/wp-json/wp/v2/movies/$idPage",
+        val resText = app.get("$SR_WP_BASE/wp-json/wp/v2/movies/$idPage",
             headers = mapOf("Authorization" to SR_AUTH)
-        ).parsedSafe<SRWPMedia>() ?: return null
+        ).text
 
+        val res = tryParseJson<SRWPMedia>(resText) ?: return null
         val title = res.title?.rendered ?: return null
         val poster = res.dtPoster?.let { "${SR_IMG_BASE}$it" }
         val bg = res.dtBackdrop?.let { "${SR_IMG_BASE}$it" }
@@ -465,13 +550,27 @@ class AnimeDayProvider : MainAPI() {
         val rating = res.imdbRating?.toFloatOrNull()
 
         // Collect all video sources from repeatable fields
-        val videoData = res.getRepeatableFields().mapNotNull { field ->
+        val videoData = (res.repeatableFields ?: emptyList()).mapNotNull { field ->
             field.url?.let { Triple(field.name ?: "SR", field.select ?: "mp4", it) }
         }
 
         if (videoData.isNotEmpty()) {
-            // Pass all video data as JSON in the data field
             val dataJson = videoData.map { (server, type, vidUrl) ->
+                """{"server":"$server","type":"$type","url":"${vidUrl.replace("\"", "\\\"")}"}"""
+            }.joinToString(",", "[", "]")
+
+            return newMovieLoadResponse(title, url, TvType.AnimeMovie, dataJson) {
+                this.posterUrl = poster
+                this.backgroundPosterUrl = bg
+                this.plot = plot
+                this.score = Score.from10(rating)
+            }
+        }
+
+        // Fallback: try manual JSON parsing for repeatable_fields
+        val manualFields = extractRepeatableFieldsManual(resText)
+        if (manualFields.isNotEmpty()) {
+            val dataJson = manualFields.map { (server, type, vidUrl) ->
                 """{"server":"$server","type":"$type","url":"${vidUrl.replace("\"", "\\\"")}"}"""
             }.joinToString(",", "[", "]")
 
@@ -493,13 +592,32 @@ class AnimeDayProvider : MainAPI() {
     }
 
     // ============================================================
+    // Manual JSON parsing for repeatable_fields (fallback)
+    // ============================================================
+    private fun extractRepeatableFieldsManual(jsonText: String): List<Triple<String, String, String>> {
+        val result = mutableListOf<Triple<String, String, String>>()
+        try {
+            val root = tryParseJson<Map<String, Any?>>(jsonText) ?: return result
+            val rfRaw = root["repeatable_fields"] as? List<Map<String, Any?>> ?: return result
+            for (field in rfRaw) {
+                val name = field["name"] as? String ?: "SR"
+                val select = field["select"] as? String ?: "mp4"
+                val vidUrl = field["url"] as? String ?: continue
+                result.add(Triple(name, select, vidUrl))
+            }
+        } catch (_: Exception) {}
+        return result
+    }
+
+    // ============================================================
     // SR Server: Load Series
     // ============================================================
     private suspend fun loadSRSeries(idPage: String, url: String): LoadResponse? {
-        val res = app.get("$SR_WP_BASE/wp-json/wp/v2/tvshows/$idPage",
+        val resText = app.get("$SR_WP_BASE/wp-json/wp/v2/tvshows/$idPage",
             headers = mapOf("Authorization" to SR_AUTH)
-        ).parsedSafe<SRWPMedia>() ?: return null
+        ).text
 
+        val res = tryParseJson<SRWPMedia>(resText) ?: return null
         val title = res.title?.rendered ?: return null
         val poster = res.dtPoster?.let { "${SR_IMG_BASE}$it" }
         val bg = res.dtBackdrop?.let { "${SR_IMG_BASE}$it" }
@@ -507,10 +625,10 @@ class AnimeDayProvider : MainAPI() {
         val rating = res.imdbRating?.toFloatOrNull()
         val originalName = res.originalName
 
-        // Strategy 1: Get episodes via the series HTML page (with auth)
-        val link = res.link?.trimEnd('/') ?: ""
         val episodes = mutableListOf<Episode>()
 
+        // Strategy 1: Get episodes via the series HTML page (with auth)
+        val link = res.link?.trimEnd('/') ?: ""
         if (link.isNotEmpty()) {
             try {
                 val doc = app.get(link, headers = mapOf(
@@ -529,25 +647,26 @@ class AnimeDayProvider : MainAPI() {
                         val epLink = epAnchor?.attr("href")
                         val epTitle = epAnchor?.text()?.trim()
                         if (epLink != null) {
-                            // Get episode WP post ID from its slug via the WP API
+                            // Resolve the slug to an episode ID right now
                             val epSlug = epLink.trimEnd('/').substringAfterLast('/')
-                            episodes.add(newEpisode("sr_slug:$epSlug") {
-                                this.name = epTitle
-                                this.season = seasonNum
-                                this.episode = epNum
-                            })
+                            val epId = resolveSlugToId(epSlug)
+                            if (epId != null) {
+                                episodes.add(newEpisode("sr_ep:$epId") {
+                                    this.name = epTitle
+                                    this.season = seasonNum
+                                    this.episode = epNum
+                                })
+                            }
                         }
                     }
                 }
             } catch (_: Exception) {}
         }
 
-        // Strategy 2: Fallback - search WP API by anime name
-        // Try multiple search variants because WP search doesn't always match
+        // Strategy 2: Search WP API by anime name
         if (episodes.isEmpty()) {
             val searchNames = mutableListOf<String>()
 
-            // Add English name (strip common articles: The, A, An)
             originalName?.let { engName ->
                 searchNames.add(engName)
                 val stripped = engName.replace(Regex("^(The|A|An)\\s+", RegexOption.IGNORE_CASE), "").trim()
@@ -556,7 +675,6 @@ class AnimeDayProvider : MainAPI() {
                 }
             }
 
-            // Add Arabic name variants (without "كرتون" or "مسلسل" prefix)
             val arabicName = title.substringBefore("–").substringBefore("-").trim()
             if (arabicName != originalName) {
                 searchNames.add(arabicName)
@@ -570,15 +688,15 @@ class AnimeDayProvider : MainAPI() {
             for (searchName in searchNames) {
                 try {
                     val encodedSearch = URLEncoder.encode(searchName, "UTF-8")
-                    val epRes = app.get(
+                    val epResText = app.get(
                         "$SR_WP_BASE/wp-json/wp/v2/episodes?search=$encodedSearch&per_page=100&orderby=date&order=asc",
                         headers = mapOf("Authorization" to SR_AUTH)
-                    )
-                    val epList = tryParseJson<List<SRWPMedia>>(epRes.text) ?: emptyList()
+                    ).text
+
+                    // Try parsedSafe first
+                    val epList = tryParseJson<List<SRWPMedia>>(epResText) ?: emptyList()
                     for (ep in epList) {
                         val epId = ep.id ?: continue
-
-                        // Use temporada/episodio fields if available (more reliable)
                         val seasonNum = ep.temporada?.toIntOrNull()
                         val epNum = ep.episodio?.toIntOrNull()
 
@@ -589,7 +707,6 @@ class AnimeDayProvider : MainAPI() {
                                 this.episode = epNum
                             })
                         } else {
-                            // Fallback to regex parsing from title
                             val epTitle = ep.title?.rendered ?: continue
                             val match = Regex("(\\d+)×(\\d+)").find(epTitle)
                             if (match != null) {
@@ -603,6 +720,12 @@ class AnimeDayProvider : MainAPI() {
                             }
                         }
                     }
+
+                    // Fallback: manual parsing if parsedSafe returned empty
+                    if (episodes.isEmpty()) {
+                        parseEpisodesManual(epResText, episodes)
+                    }
+
                     if (episodes.isNotEmpty()) break
                 } catch (_: Exception) {}
             }
@@ -614,6 +737,71 @@ class AnimeDayProvider : MainAPI() {
             this.plot = plot
             this.score = Score.from10(rating)
         }
+    }
+
+    // ============================================================
+    // Resolve a WP episode slug to its post ID
+    // ============================================================
+    private suspend fun resolveSlugToId(slug: String): Int? {
+        return try {
+            // URL-decode the slug first (it may be percent-encoded from HTML)
+            val decodedSlug = URLDecoder.decode(slug, "UTF-8")
+            // Then URL-encode it for the API query parameter
+            val encodedSlug = URLEncoder.encode(decodedSlug, "UTF-8")
+            val epResText = app.get("$SR_WP_BASE/wp-json/wp/v2/episodes?slug=$encodedSlug",
+                headers = mapOf("Authorization" to SR_AUTH)
+            ).text
+
+            // Try parsedSafe first
+            val epList = tryParseJson<List<SRWPMedia>>(epResText)
+            val id = epList?.firstOrNull()?.id
+            if (id != null) return id
+
+            // Fallback: manual parsing
+            val root = tryParseJson<List<Map<String, Any?>>>(epResText)
+            (root?.firstOrNull()?.get("id") as? Number)?.toInt()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    // ============================================================
+    // Manual episode parsing fallback
+    // ============================================================
+    private fun parseEpisodesManual(jsonText: String, episodes: MutableList<Episode>) {
+        try {
+            val list = tryParseJson<List<Map<String, Any?>>>(jsonText) ?: return
+            for (ep in list) {
+                val epId = (ep["id"] as? Number)?.toInt() ?: continue
+                val titleObj = ep["title"] as? Map<String, Any?>
+                val titleRendered = titleObj?.get("rendered") as? String ?: continue
+                val temporada = ep["temporada"] as? String
+                val episodio = ep["episodio"] as? String
+                val episodeName = ep["episode_name"] as? String
+
+                val seasonNum = temporada?.toIntOrNull()
+                val epNum = episodio?.toIntOrNull()
+
+                if (seasonNum != null && epNum != null) {
+                    episodes.add(newEpisode("sr_ep:$epId") {
+                        this.name = episodeName ?: titleRendered.replace(Regex("<[^>]+>"), "").trim() ?: "حلقة $epNum"
+                        this.season = seasonNum
+                        this.episode = epNum
+                    })
+                } else {
+                    val match = Regex("(\\d+)×(\\d+)").find(titleRendered)
+                    if (match != null) {
+                        val s = match.groupValues[1].toIntOrNull() ?: 1
+                        val e = match.groupValues[2].toIntOrNull() ?: continue
+                        episodes.add(newEpisode("sr_ep:$epId") {
+                            this.name = episodeName ?: titleRendered.replace(Regex("<[^>]+>"), "").trim()
+                            this.season = s
+                            this.episode = e
+                        })
+                    }
+                }
+            }
+        } catch (_: Exception) {}
     }
 
     // ============================================================
@@ -636,7 +824,6 @@ class AnimeDayProvider : MainAPI() {
         val isMovie = res.animeType == "Movie"
 
         if (isMovie) {
-            // For movies, collect all episode URLs as video sources
             val epUrls = res.episodes?.data?.firstOrNull()?.episodeUrls ?: emptyList()
             val dataJson = epUrls.mapNotNull { eu ->
                 eu.url?.let { """{"server":"SA ${eu.serverName}","url":"${it.replace("\"","\\\"")}"}""" }
@@ -651,14 +838,12 @@ class AnimeDayProvider : MainAPI() {
             }
         }
 
-        // For series, create episodes
         val episodes = res.episodes?.data?.mapNotNull { ep ->
             val epName = ep.episodeName ?: return@mapNotNull null
             val epNum = ep.episodeNumber?.toIntOrNull() ?: return@mapNotNull null
             val urls = ep.episodeUrls ?: emptyList()
             if (urls.isEmpty()) return@mapNotNull null
 
-            // Encode episode URLs as JSON for loadLinks
             val dataJson = urls.mapNotNull { eu ->
                 eu.url?.let { """{"server":"SA ${eu.serverName}","url":"${it.replace("\"","\\\"")}"}""" }
             }.joinToString(",", "[", "]")
@@ -683,8 +868,7 @@ class AnimeDayProvider : MainAPI() {
     // JO Server: Load Anime
     // ============================================================
     private suspend fun loadJOAnime(objectId: String, url: String): LoadResponse? {
-        // Fetch anime details from Firestore
-        val docRes = app.get("$JO_FIRESTORE_URL/anime_list/$objectId").text
+        val docRes = app.get("$JO_FIRESTORE_URL/anime_list/${URLEncoder.encode(objectId, "UTF-8")}").text
         val doc = tryParseJson<FirestoreDocument>(docRes) ?: return null
         val fields = doc.fields ?: return null
 
@@ -692,13 +876,14 @@ class AnimeDayProvider : MainAPI() {
         val poster = fields["poster_uri"]?.stringValue ?: fields["poster"]?.stringValue
         val bg = fields["cover_uri"]?.stringValue
         val plot = fields["story"]?.stringValue
-        val rating = fields["average_rate"]?.stringValue?.toFloatOrNull()
+        val rating = fields["average_rate"]?.doubleValue?.toFloat()
+            ?: fields["average_rate"]?.stringValue?.toFloatOrNull()
             ?: fields["rating"]?.stringValue?.toFloatOrNull()
         val type = fields["type"]?.stringValue ?: "مسلسل"
         val isMovie = type == "فيلم"
 
         // Get episode summaries from Firestore
-        val epSummaryRes = app.get("$JO_FIRESTORE_URL/anime_list/$objectId/episodes_summery/summery").text
+        val epSummaryRes = app.get("$JO_FIRESTORE_URL/anime_list/${URLEncoder.encode(objectId, "UTF-8")}/episodes_summery/summery").text
         val epSummaryDoc = tryParseJson<FirestoreDocument>(epSummaryRes)
         val epValues = epSummaryDoc?.fields?.get("episodes")?.arrayValue?.values ?: emptyList()
 
@@ -716,8 +901,7 @@ class AnimeDayProvider : MainAPI() {
         }
 
         if (isMovie) {
-            // For movies, we might not have episodes - try to get video from first available source
-            val data = "jo_ep:$objectId:001"
+            val data = if (episodes.isNotEmpty()) "jo_ep:$objectId:${episodes.first().episode}" else "jo_ep:$objectId:001"
             return newMovieLoadResponse(title, url, TvType.AnimeMovie, data) {
                 this.posterUrl = poster
                 this.backgroundPosterUrl = bg
@@ -738,7 +922,6 @@ class AnimeDayProvider : MainAPI() {
     // BO Server: Load Movie
     // ============================================================
     private suspend fun loadBOMovie(objectId: String, url: String): LoadResponse? {
-        // Try Firestore first, fall back to Algolia
         val docRes = app.get("$BO_FIRESTORE_URL/Movies/$objectId").text
         val doc = tryParseJson<FirestoreDocument>(docRes)
 
@@ -768,7 +951,6 @@ class AnimeDayProvider : MainAPI() {
             data.startsWith("[") -> loadLinksFromJson(data, callback, subtitleCallback)
             data.startsWith("sr_movie:") -> loadSRMovieLinks(data.removePrefix("sr_movie:"), callback, subtitleCallback)
             data.startsWith("sr_ep:") -> loadSRLinks(data.removePrefix("sr_ep:"), callback, subtitleCallback)
-            data.startsWith("sr_slug:") -> loadSRSlugLinks(data.removePrefix("sr_slug:"), callback, subtitleCallback)
             data.startsWith("jo_ep:") -> loadJOLinks(data.removePrefix("jo_ep:"), callback, subtitleCallback)
             data.startsWith("bo_ep:") -> loadBOLinks(data.removePrefix("bo_ep:"), callback, subtitleCallback)
             else -> false
@@ -785,7 +967,6 @@ class AnimeDayProvider : MainAPI() {
     ): Boolean {
         val items = tryParseJson<List<Map<String, String>>>(data) ?: return false
         var found = false
-
         for (item in items) {
             val server = item["server"] ?: "Unknown"
             val type = item["type"] ?: ""
@@ -806,7 +987,7 @@ class AnimeDayProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit
     ): Boolean {
         return when {
-            vidUrl.endsWith(".mp4") || type == "mp4" -> {
+            vidUrl.endsWith(".mp4") || vidUrl.endsWith(".mkv") || type == "mp4" -> {
                 callback.invoke(
                     newExtractorLink(
                         source = "AnimeDay $serverName",
@@ -831,7 +1012,6 @@ class AnimeDayProvider : MainAPI() {
                 } catch (_: Exception) { false }
             }
             else -> {
-                // Try built-in extractor for embed URLs (filemoon, streamtape, etc.)
                 try {
                     loadExtractor(vidUrl, SR_WP_BASE, subtitleCallback, callback)
                     true
@@ -849,11 +1029,13 @@ class AnimeDayProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit
     ): Boolean {
         // Try WP API first (repeatable_fields contains direct video URLs)
-        val res = app.get("$SR_WP_BASE/wp-json/wp/v2/movies/$movieId",
+        val resText = app.get("$SR_WP_BASE/wp-json/wp/v2/movies/$movieId",
             headers = mapOf("Authorization" to SR_AUTH)
-        ).parsedSafe<SRWPMedia>()
+        ).text
 
-        val fields = res?.getRepeatableFields()
+        // Try parsedSafe
+        val res = tryParseJson<SRWPMedia>(resText)
+        val fields = res?.repeatableFields ?: emptyList()
         if (!fields.isNullOrEmpty()) {
             var found = false
             for (field in fields) {
@@ -865,64 +1047,18 @@ class AnimeDayProvider : MainAPI() {
             if (found) return true
         }
 
-        // Fallback: try dooplayer API with multiple server numbers
-        for (nume in 1..5) {
-            try {
-                val dooRes = app.post(
-                    "$SR_WP_BASE/wp-admin/admin-ajax.php",
-                    headers = mapOf(
-                        "Authorization" to SR_AUTH,
-                        "Content-Type" to "application/x-www-form-urlencoded"
-                    ),
-                    data = mapOf(
-                        "action" to "doo_player_ajax",
-                        "post" to movieId,
-                        "nume" to nume.toString(),
-                        "type" to "movie"
-                    )
-                ).text
-
-                val dooData = tryParseJson<Map<String, Any?>>(dooRes)
-                val embedUrl = dooData?.get("embed_url") as? String ?: continue
-                if (embedUrl.isBlank()) continue
-                val dooType = dooData?.get("type") as? String ?: ""
-
-                // Decode base64 URL
-                val decoded = try {
-                    String(Base64.decode(embedUrl, Base64.DEFAULT), Charsets.UTF_8)
-                } catch (_: Exception) {
-                    embedUrl
-                }
-
-                // Extract the source URL from the decoded string
-                // Format: ?source=ENCODED_URL&id=ID&type=TYPE
-                val sourceUrl = Regex("""source=([^&]+)""").find(decoded)?.groupValues?.get(1)
-                    ?.let { URLDecoder.decode(URLDecoder.decode(it, "UTF-8"), "UTF-8") }
-
-                if (sourceUrl != null) {
-                    val result = extractVideoLink(sourceUrl, "SR Srv$nume", dooType, callback, subtitleCallback)
-                    if (result) return true
-                }
-            } catch (_: Exception) { continue }
+        // Fallback: manual parsing
+        val manualFields = extractRepeatableFieldsManual(resText)
+        if (manualFields.isNotEmpty()) {
+            var found = false
+            for ((server, type, vidUrl) in manualFields) {
+                found = extractVideoLink(vidUrl, server, type, callback, subtitleCallback) || found
+            }
+            if (found) return true
         }
-        return false
-    }
 
-    // ============================================================
-    // SR Server: loadLinks for series episodes by slug
-    // ============================================================
-    private suspend fun loadSRSlugLinks(
-        slug: String,
-        callback: (ExtractorLink) -> Unit,
-        subtitleCallback: (SubtitleFile) -> Unit
-    ): Boolean {
-        // Resolve the slug to a WP post ID first
-        val epRes = app.get("$SR_WP_BASE/wp-json/wp/v2/episodes?slug=$slug",
-            headers = mapOf("Authorization" to SR_AUTH)
-        ).text
-        val epList = tryParseJson<List<SRWPMedia>>(epRes) ?: return false
-        val epId = epList.firstOrNull()?.id?.toString() ?: return false
-        return loadSRLinks(epId, callback, subtitleCallback)
+        // Fallback: try dooplayer API
+        return tryDooplayer(movieId, "movie", callback, subtitleCallback)
     }
 
     // ============================================================
@@ -933,12 +1069,14 @@ class AnimeDayProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit
     ): Boolean {
-        // Try WP API first (repeatable_fields contains direct video URLs)
-        val epRes = app.get("$SR_WP_BASE/wp-json/wp/v2/episodes/$episodeId",
+        // Try WP API first
+        val epResText = app.get("$SR_WP_BASE/wp-json/wp/v2/episodes/$episodeId",
             headers = mapOf("Authorization" to SR_AUTH)
-        ).parsedSafe<SRWPMedia>()
+        ).text
 
-        val fields = epRes?.getRepeatableFields()
+        // Try parsedSafe
+        val epRes = tryParseJson<SRWPMedia>(epResText)
+        val fields = epRes?.repeatableFields ?: emptyList()
         if (!fields.isNullOrEmpty()) {
             var found = false
             for (field in fields) {
@@ -950,7 +1088,98 @@ class AnimeDayProvider : MainAPI() {
             if (found) return true
         }
 
-        // Fallback: try dooplayer API with multiple server numbers
+        // Fallback: manual parsing of repeatable_fields
+        val manualFields = extractRepeatableFieldsManual(epResText)
+        if (manualFields.isNotEmpty()) {
+            var found = false
+            for ((server, type, vidUrl) in manualFields) {
+                found = extractVideoLink(vidUrl, server, type, callback, subtitleCallback) || found
+            }
+            if (found) return true
+        }
+
+        // Fallback: try the episode HTML page for iframe sources
+        val epLink = epRes?.link
+        if (!epLink.isNullOrBlank()) {
+            val result = trySREpisodePageLinks(epLink, callback, subtitleCallback)
+            if (result) return true
+        }
+
+        // Fallback: try dooplayer API with type=tv
+        var found = tryDooplayer(episodeId, "tv", callback, subtitleCallback)
+        if (found) return true
+
+        // Fallback: try dooplayer API with type=1 (some dooplay themes use this for episodes)
+        found = tryDooplayer(episodeId, "1", callback, subtitleCallback)
+        return found
+    }
+
+    // ============================================================
+    // SR Server: Try scraping episode HTML page for video sources
+    // ============================================================
+    private suspend fun trySREpisodePageLinks(
+        pageUrl: String,
+        callback: (ExtractorLink) -> Unit,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ): Boolean {
+        var found = false
+        try {
+            val doc = app.get(pageUrl, headers = mapOf(
+                "Authorization" to SR_AUTH,
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            )).document
+
+            // Look for iframe sources in the page (common for embed players)
+            val iframes = doc.select("iframe")
+            for (iframe in iframes) {
+                val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }
+                if (src.isBlank()) continue
+
+                val fullSrc = if (src.startsWith("//")) "https:$src" else src
+
+                try {
+                    loadExtractor(fullSrc, SR_WP_BASE, subtitleCallback, callback)
+                    found = true
+                } catch (_: Exception) {}
+
+                try {
+                    found = extractVideoLink(fullSrc, "SR Embed", "", callback, subtitleCallback) || found
+                } catch (_: Exception) {}
+            }
+
+            // Also look for video tags with direct sources
+            val videos = doc.select("video source")
+            for (video in videos) {
+                val src = video.attr("src")
+                if (src.isBlank()) continue
+                val fullSrc = if (src.startsWith("//")) "https:$src" else src
+                found = extractVideoLink(fullSrc, "SR Direct", "", callback, subtitleCallback) || found
+            }
+
+            // Look for dooplayer divs that contain post IDs and nume values
+            val dooPlayers = doc.select("div.dooplay_player_option")
+            for (player in dooPlayers) {
+                val dataPost = player.attr("data-post")
+                val dataNume = player.attr("data-nume")
+                val dataType = player.attr("data-type")
+                if (dataPost.isNotBlank()) {
+                    found = tryDooplayer(dataPost, dataType.ifBlank { "tv" }, callback, subtitleCallback) || found
+                }
+            }
+        } catch (_: Exception) {}
+        return found
+    }
+
+    // ============================================================
+    // Dooplayer fallback (shared for movies and episodes)
+    // ============================================================
+    private suspend fun tryDooplayer(
+        postId: String,
+        dooType: String,
+        callback: (ExtractorLink) -> Unit,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ): Boolean {
+        var found = false
         for (nume in 1..5) {
             try {
                 val dooRes = app.post(
@@ -961,36 +1190,62 @@ class AnimeDayProvider : MainAPI() {
                     ),
                     data = mapOf(
                         "action" to "doo_player_ajax",
-                        "post" to episodeId,
+                        "post" to postId,
                         "nume" to nume.toString(),
-                        "type" to "tv"
+                        "type" to dooType
                     )
                 ).text
 
                 val dooData = tryParseJson<Map<String, Any?>>(dooRes)
                 val embedUrl = dooData?.get("embed_url") as? String ?: continue
                 if (embedUrl.isBlank()) continue
-                val dooType = dooData?.get("type") as? String ?: ""
+                val videoType = dooData?.get("type") as? String ?: ""
 
-                // Decode base64 URL
+                // Try base64 decoding
                 val decoded = try {
                     String(Base64.decode(embedUrl, Base64.DEFAULT), Charsets.UTF_8)
                 } catch (_: Exception) {
                     embedUrl
                 }
 
-                // Extract the source URL from the decoded string
-                // Format: ?source=ENCODED_URL&id=ID&type=TYPE
-                val sourceUrl = Regex("""source=([^&]+)""").find(decoded)?.groupValues?.get(1)
-                    ?.let { URLDecoder.decode(URLDecoder.decode(it, "UTF-8"), "UTF-8" ) }
+                // Collect all candidate URLs to try
+                val candidates = mutableListOf<String>()
 
+                // Strategy 1: Extract source= from decoded string
+                val sourceUrl = Regex("""source=([^&]+)""").find(decoded)?.groupValues?.get(1)
+                    ?.let { URLDecoder.decode(URLDecoder.decode(it, "UTF-8"), "UTF-8") }
                 if (sourceUrl != null) {
-                    val result = extractVideoLink(sourceUrl, "SR Srv$nume", dooType, callback, subtitleCallback)
-                    if (result) return true
+                    candidates.add(sourceUrl.replace(" ", "%20"))
                 }
+
+                // Strategy 2: The decoded string itself might be a URL
+                if (decoded.startsWith("http")) {
+                    candidates.add(decoded)
+                }
+
+                // Strategy 3: The raw embed_url might be a direct URL
+                if (embedUrl.startsWith("http")) {
+                    candidates.add(embedUrl)
+                }
+
+                // Try each candidate URL
+                for (url in candidates) {
+                    try {
+                        found = extractVideoLink(url, "SR Srv$nume", videoType, callback, subtitleCallback) || found
+                    } catch (_: Exception) {}
+                    // Also try loadExtractor for embed URLs that extractVideoLink can't handle
+                    if (!found) {
+                        try {
+                            loadExtractor(url, SR_WP_BASE, subtitleCallback, callback)
+                            found = true
+                        } catch (_: Exception) {}
+                    }
+                }
+
+                if (found) return true
             } catch (_: Exception) { continue }
         }
-        return false
+        return found
     }
 
     // ============================================================
@@ -1007,7 +1262,7 @@ class AnimeDayProvider : MainAPI() {
         val docId = parts[1]
 
         // Get episode data from Firestore - check for bunny_video_id
-        val epRes = app.get("$JO_FIRESTORE_URL/anime_list/$animeId/episodes/$docId").text
+        val epRes = app.get("$JO_FIRESTORE_URL/anime_list/${URLEncoder.encode(animeId, "UTF-8")}/episodes/$docId").text
         val epDoc = tryParseJson<FirestoreDocument>(epRes) ?: return false
         val fields = epDoc.fields ?: return false
 
@@ -1025,17 +1280,13 @@ class AnimeDayProvider : MainAPI() {
             } catch (_: Exception) {}
         }
 
-        // Try MF server via animeify.net (if MF is true in servers)
-        // The anime doc has servers.MF = true for some anime
-        val animeDoc = app.get("$JO_FIRESTORE_URL/anime_list/$animeId").text
+        // Try MF server via animeify.net
+        val animeDoc = app.get("$JO_FIRESTORE_URL/anime_list/${URLEncoder.encode(animeId, "UTF-8")}").text
         val animeFields = tryParseJson<FirestoreDocument>(animeDoc)?.fields
         val mfEnabled = animeFields?.get("servers")?.mapValue?.fields?.get("MF")?.booleanValue == true
 
         if (mfEnabled) {
-            // MF server would use animeify.net - construct URL
-            // This requires further reverse engineering of the animeify API
-            // For now, try a common URL pattern
-            val mfUrl = "https://animeify.net/animeify/files/videos/${animeId}/${docId}.mp4"
+            val mfUrl = "https://animeify.net/animeify/files/videos/${URLEncoder.encode(animeId, "UTF-8")}/${docId}.mp4"
             try {
                 callback.invoke(
                     newExtractorLink(
@@ -1062,9 +1313,44 @@ class AnimeDayProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit
     ): Boolean {
-        // BO server video extraction needs further work
-        // The Firestore is permission-denied for episode/server data
-        // Try Algolia for any video-related data
-        return false
+        var found = false
+
+        // Try Firestore for movie data
+        try {
+            val docRes = app.get("$BO_FIRESTORE_URL/Movies/${URLEncoder.encode(objectId, "UTF-8")}").text
+            val doc = tryParseJson<FirestoreDocument>(docRes)
+            val fields = doc?.fields
+
+            // Try bunny_video_id
+            val bunnyId = fields?.get("bunny_video_id")?.stringValue
+            if (!bunnyId.isNullOrBlank()) {
+                val bunnyUrl = "https://vz-af91c956-726.b-cdn.net/$bunnyId/playlist.m3u8"
+                try {
+                    M3u8Helper.generateM3u8(
+                        source = "AnimeDay BO (Bunny)",
+                        streamUrl = bunnyUrl,
+                        referer = ""
+                    ).forEach { callback.invoke(it) }
+                    found = true
+                } catch (_: Exception) {}
+            }
+
+            // Try video_url field
+            val videoUrl = fields?.get("video_url")?.stringValue
+            if (!videoUrl.isNullOrBlank()) {
+                found = extractVideoLink(videoUrl, "BO", "", callback, subtitleCallback) || found
+            }
+
+            // Try embed_url field with loadExtractor
+            val embedUrl = fields?.get("embed_url")?.stringValue
+            if (!embedUrl.isNullOrBlank()) {
+                try {
+                    loadExtractor(embedUrl, "", subtitleCallback, callback)
+                    found = true
+                } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
+
+        return found
     }
 }
