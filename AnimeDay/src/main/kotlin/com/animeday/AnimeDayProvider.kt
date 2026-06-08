@@ -1069,13 +1069,14 @@ class AnimeDayProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit
     ): Boolean {
-        // Try WP API first
+        // Fetch episode data from WP REST API
         val epResText = app.get("$SR_WP_BASE/wp-json/wp/v2/episodes/$episodeId",
             headers = mapOf("Authorization" to SR_AUTH)
         ).text
 
-        // Try parsedSafe
         val epRes = tryParseJson<SRWPMedia>(epResText)
+
+        // Strategy 1: repeatable_fields from parsed API response
         val fields = epRes?.repeatableFields ?: emptyList()
         if (!fields.isNullOrEmpty()) {
             var found = false
@@ -1088,7 +1089,7 @@ class AnimeDayProvider : MainAPI() {
             if (found) return true
         }
 
-        // Fallback: manual parsing of repeatable_fields
+        // Strategy 2: manual parsing of repeatable_fields from raw JSON
         val manualFields = extractRepeatableFieldsManual(epResText)
         if (manualFields.isNotEmpty()) {
             var found = false
@@ -1098,20 +1099,70 @@ class AnimeDayProvider : MainAPI() {
             if (found) return true
         }
 
-        // Fallback: try the episode HTML page for iframe sources
+        // Strategy 3: extract any URLs found in the raw JSON response
+        val jsonUrls = extractUrlsFromJson(epResText)
+        if (jsonUrls.isNotEmpty()) {
+            var found = false
+            for (url in jsonUrls) {
+                try {
+                    loadExtractor(url, SR_WP_BASE, subtitleCallback, callback)
+                    found = true
+                } catch (_: Exception) {}
+                try {
+                    found = extractVideoLink(url, "SR", "", callback, subtitleCallback) || found
+                } catch (_: Exception) {}
+            }
+            if (found) return true
+        }
+
+        // Strategy 4: scrape the episode HTML page (try with and without auth)
         val epLink = epRes?.link
         if (!epLink.isNullOrBlank()) {
             val result = trySREpisodePageLinks(epLink, callback, subtitleCallback)
             if (result) return true
         }
 
-        // Fallback: try dooplayer API with type=tv
-        var found = tryDooplayer(episodeId, "tv", callback, subtitleCallback)
-        if (found) return true
+        // Strategy 5: try dooplayer with the episode post ID using multiple type values
+        // Dooplay uses different type values: "2" for TV, "tv", "1" for movie
+        for (dooType in listOf("2", "tv", "1")) {
+            val found = tryDooplayer(episodeId, dooType, callback, subtitleCallback)
+            if (found) return true
+        }
 
-        // Fallback: try dooplayer API with type=1 (some dooplay themes use this for episodes)
-        found = tryDooplayer(episodeId, "1", callback, subtitleCallback)
-        return found
+        // Strategy 6: try dooplayer with the parent series ID
+        // In Dooplay, video sources may be attached to the parent TV show, not the episode
+        val serieId = epRes?.serie
+        if (!serieId.isNullOrBlank()) {
+            for (dooType in listOf("2", "tv")) {
+                val found = tryDooplayer(serieId, dooType, callback, subtitleCallback)
+                if (found) return true
+            }
+        }
+
+        return false
+    }
+
+    // ============================================================
+    // Extract video URLs from raw JSON text (deep scan)
+    // ============================================================
+    private fun extractUrlsFromJson(jsonText: String): List<String> {
+        val urls = mutableListOf<String>()
+        // Find all URLs that look like video/embed sources
+        val urlPattern = Regex("""https?://[^\s"'<>\],}]+""")
+        urlPattern.findAll(jsonText).forEach { match ->
+            val url = match.value.trimEnd('\\')
+            // Only include URLs that look like video sources or embeds
+            if (url.contains(".mp4") || url.contains(".m3u8") || url.contains(".mkv") ||
+                url.contains("stream") || url.contains("embed") || url.contains("player") ||
+                url.contains("video") || url.contains("filemoon") || url.contains("streamtape") ||
+                url.contains("dood") || url.contains("uqload") || url.contains("mega") ||
+                url.contains("vidb") || url.contains("mixdrop") || url.contains("wolfstream") ||
+                url.contains("streamwish") || url.contains("voe") || url.contains("vidsrc")
+            ) {
+                if (!urls.contains(url)) urls.add(url)
+            }
+        }
+        return urls
     }
 
     // ============================================================
@@ -1123,50 +1174,94 @@ class AnimeDayProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit
     ): Boolean {
         var found = false
-        try {
-            val doc = app.get(pageUrl, headers = mapOf(
-                "Authorization" to SR_AUTH,
-                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-            )).document
 
-            // Look for iframe sources in the page (common for embed players)
-            val iframes = doc.select("iframe")
-            for (iframe in iframes) {
-                val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }
-                if (src.isBlank()) continue
+        // Try fetching the page with and without auth
+        val authHeaders = mapOf(
+            "Authorization" to SR_AUTH,
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        )
+        val noAuthHeaders = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        )
 
-                val fullSrc = if (src.startsWith("//")) "https:$src" else src
+        for (headers in listOf(authHeaders, noAuthHeaders)) {
+            try {
+                val doc = app.get(pageUrl, headers = headers).document
 
-                try {
-                    loadExtractor(fullSrc, SR_WP_BASE, subtitleCallback, callback)
-                    found = true
-                } catch (_: Exception) {}
+                // Look for iframe sources in the page (common for embed players)
+                val iframes = doc.select("iframe")
+                for (iframe in iframes) {
+                    val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }
+                    if (src.isBlank()) continue
 
-                try {
-                    found = extractVideoLink(fullSrc, "SR Embed", "", callback, subtitleCallback) || found
-                } catch (_: Exception) {}
-            }
+                    var fullSrc = if (src.startsWith("//")) "https:$src" else src
 
-            // Also look for video tags with direct sources
-            val videos = doc.select("video source")
-            for (video in videos) {
-                val src = video.attr("src")
-                if (src.isBlank()) continue
-                val fullSrc = if (src.startsWith("//")) "https:$src" else src
-                found = extractVideoLink(fullSrc, "SR Direct", "", callback, subtitleCallback) || found
-            }
+                    // Handle relative URLs
+                    if (fullSrc.startsWith("/") && !fullSrc.startsWith("//")) {
+                        fullSrc = SR_WP_BASE + fullSrc
+                    }
 
-            // Look for dooplayer divs that contain post IDs and nume values
-            val dooPlayers = doc.select("div.dooplay_player_option")
-            for (player in dooPlayers) {
-                val dataPost = player.attr("data-post")
-                val dataNume = player.attr("data-nume")
-                val dataType = player.attr("data-type")
-                if (dataPost.isNotBlank()) {
-                    found = tryDooplayer(dataPost, dataType.ifBlank { "tv" }, callback, subtitleCallback) || found
+                    try {
+                        loadExtractor(fullSrc, SR_WP_BASE, subtitleCallback, callback)
+                        found = true
+                    } catch (_: Exception) {}
+
+                    try {
+                        found = extractVideoLink(fullSrc, "SR Embed", "", callback, subtitleCallback) || found
+                    } catch (_: Exception) {}
                 }
-            }
-        } catch (_: Exception) {}
+
+                // Look for dooplayer divs that contain post IDs and nume values
+                val dooPlayers = doc.select("div.dooplay_player_option")
+                for (player in dooPlayers) {
+                    val dataPost = player.attr("data-post")
+                    val dataType = player.attr("data-type")
+                    if (dataPost.isNotBlank()) {
+                        found = tryDooplayer(dataPost, dataType.ifBlank { "2" }, callback, subtitleCallback) || found
+                    }
+                }
+
+                // Also look for #player-container or .player divs
+                val playerDivs = doc.select("#player-container iframe, .player iframe, .video-player iframe")
+                for (player in playerDivs) {
+                    val src = player.attr("src").ifBlank { player.attr("data-src") }
+                    if (src.isBlank()) continue
+                    var fullSrc = if (src.startsWith("//")) "https:$src" else src
+                    if (fullSrc.startsWith("/")) fullSrc = SR_WP_BASE + fullSrc
+
+                    try {
+                        loadExtractor(fullSrc, SR_WP_BASE, subtitleCallback, callback)
+                        found = true
+                    } catch (_: Exception) {}
+                }
+
+                // Look for video tags with direct sources
+                val videos = doc.select("video source")
+                for (video in videos) {
+                    val src = video.attr("src")
+                    if (src.isBlank()) continue
+                    val fullSrc = if (src.startsWith("//")) "https:$src" else src
+                    found = extractVideoLink(fullSrc, "SR Direct", "", callback, subtitleCallback) || found
+                }
+
+                // Also scan the raw HTML for any iframe/embed URLs
+                val htmlText = doc.html()
+                val iframePattern = Regex("""(?:src|data-src)\s*=\s*["']([^"']+)["']""")
+                iframePattern.findAll(htmlText).forEach { match ->
+                    val src = match.groupValues[1]
+                    if (src.startsWith("http") || src.startsWith("//")) {
+                        var fullSrc = if (src.startsWith("//")) "https:$src" else src
+                        try {
+                            loadExtractor(fullSrc, SR_WP_BASE, subtitleCallback, callback)
+                            found = true
+                        } catch (_: Exception) {}
+                    }
+                }
+
+                if (found) return true
+            } catch (_: Exception) {}
+        }
+
         return found
     }
 
@@ -1180,70 +1275,103 @@ class AnimeDayProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit
     ): Boolean {
         var found = false
-        for (nume in 1..5) {
-            try {
-                val dooRes = app.post(
-                    "$SR_WP_BASE/wp-admin/admin-ajax.php",
-                    headers = mapOf(
-                        "Authorization" to SR_AUTH,
-                        "Content-Type" to "application/x-www-form-urlencoded"
-                    ),
-                    data = mapOf(
-                        "action" to "doo_player_ajax",
-                        "post" to postId,
-                        "nume" to nume.toString(),
-                        "type" to dooType
-                    )
-                ).text
 
-                val dooData = tryParseJson<Map<String, Any?>>(dooRes)
-                val embedUrl = dooData?.get("embed_url") as? String ?: continue
-                if (embedUrl.isBlank()) continue
-                val videoType = dooData?.get("type") as? String ?: ""
+        // Try dooplayer both with and without auth
+        val headerSets = listOf(
+            mapOf(
+                "Authorization" to SR_AUTH,
+                "Content-Type" to "application/x-www-form-urlencoded"
+            ),
+            mapOf(
+                "Content-Type" to "application/x-www-form-urlencoded"
+            )
+        )
 
-                // Try base64 decoding
-                val decoded = try {
-                    String(Base64.decode(embedUrl, Base64.DEFAULT), Charsets.UTF_8)
-                } catch (_: Exception) {
-                    embedUrl
-                }
+        for (headers in headerSets) {
+            for (nume in 1..5) {
+                try {
+                    val dooRes = app.post(
+                        "$SR_WP_BASE/wp-admin/admin-ajax.php",
+                        headers = headers,
+                        data = mapOf(
+                            "action" to "doo_player_ajax",
+                            "post" to postId,
+                            "nume" to nume.toString(),
+                            "type" to dooType
+                        )
+                    ).text
 
-                // Collect all candidate URLs to try
-                val candidates = mutableListOf<String>()
+                    val dooData = tryParseJson<Map<String, Any?>>(dooRes)
+                    val embedUrl = dooData?.get("embed_url") as? String ?: continue
+                    if (embedUrl.isBlank()) continue
+                    val videoType = dooData?.get("type") as? String ?: ""
 
-                // Strategy 1: Extract source= from decoded string
-                val sourceUrl = Regex("""source=([^&]+)""").find(decoded)?.groupValues?.get(1)
-                    ?.let { URLDecoder.decode(URLDecoder.decode(it, "UTF-8"), "UTF-8") }
-                if (sourceUrl != null) {
-                    candidates.add(sourceUrl.replace(" ", "%20"))
-                }
+                    // Collect all candidate URLs from the dooplayer response
+                    val candidates = mutableListOf<String>()
 
-                // Strategy 2: The decoded string itself might be a URL
-                if (decoded.startsWith("http")) {
-                    candidates.add(decoded)
-                }
+                    // Strategy 1: Try base64 decoding first
+                    val decoded = try {
+                        String(Base64.decode(embedUrl, Base64.DEFAULT), Charsets.UTF_8)
+                    } catch (_: Exception) {
+                        null
+                    }
 
-                // Strategy 3: The raw embed_url might be a direct URL
-                if (embedUrl.startsWith("http")) {
-                    candidates.add(embedUrl)
-                }
+                    if (decoded != null && decoded != embedUrl) {
+                        // Strategy 1a: Extract source= from decoded string
+                        val sourceUrl = Regex("""source=([^&"']+)""").find(decoded)?.groupValues?.get(1)
+                            ?.let { URLDecoder.decode(URLDecoder.decode(it, "UTF-8"), "UTF-8") }
+                        if (sourceUrl != null) {
+                            candidates.add(sourceUrl.replace(" ", "%20"))
+                        }
 
-                // Try each candidate URL
-                for (url in candidates) {
-                    try {
-                        found = extractVideoLink(url, "SR Srv$nume", videoType, callback, subtitleCallback) || found
-                    } catch (_: Exception) {}
-                    // Also try loadExtractor for embed URLs that extractVideoLink can't handle
-                    if (!found) {
+                        // Strategy 1b: Extract any URL from decoded string
+                        val urlMatch = Regex("""(https?://[^\s"'<>&]+)""").find(decoded)
+                        if (urlMatch != null) {
+                            val url = urlMatch.groupValues[1].replace(" ", "%20")
+                            if (!candidates.contains(url)) candidates.add(url)
+                        }
+
+                        // Strategy 1c: The entire decoded string might be an iframe URL
+                        if (decoded.startsWith("http")) {
+                            if (!candidates.contains(decoded)) candidates.add(decoded)
+                        }
+                    }
+
+                    // Strategy 2: The raw embed_url might be a direct URL
+                    if (embedUrl.startsWith("http")) {
+                        if (!candidates.contains(embedUrl)) candidates.add(embedUrl)
+                    }
+
+                    // Strategy 3: Try extracting URLs from the raw dooRes text
+                    val rawUrlMatch = Regex("""(https?://[^\s"'<>\],}]+)""").find(dooRes)
+                    if (rawUrlMatch != null) {
+                        val url = rawUrlMatch.groupValues[1].trimEnd('\\')
+                        if (!candidates.contains(url)) candidates.add(url)
+                    }
+
+                    // Try each candidate URL with both extractVideoLink and loadExtractor
+                    for (url in candidates) {
+                        // Skip obviously non-video URLs
+                        if (url.contains("google-analytics") || url.contains("facebook.com") ||
+                            url.contains("doubleclick.net") || url.endsWith(".js") ||
+                            url.endsWith(".css") || url.endsWith(".png") || url.endsWith(".jpg")) {
+                            continue
+                        }
+
+                        try {
+                            found = extractVideoLink(url, "SR Srv$nume", videoType, callback, subtitleCallback) || found
+                        } catch (_: Exception) {}
+
+                        // Always try loadExtractor for embed URLs (filemoon, streamtape, etc.)
                         try {
                             loadExtractor(url, SR_WP_BASE, subtitleCallback, callback)
                             found = true
                         } catch (_: Exception) {}
                     }
-                }
 
-                if (found) return true
-            } catch (_: Exception) { continue }
+                    if (found) return true
+                } catch (_: Exception) { continue }
+            }
         }
         return found
     }
