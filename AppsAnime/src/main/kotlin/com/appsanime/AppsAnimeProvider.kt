@@ -1,6 +1,8 @@
 package com.appsanime
 
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.core.type.TypeReference
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.Score
 import com.lagradost.cloudstream3.utils.*
@@ -110,6 +112,8 @@ class AppsAnimeProvider : MainAPI() {
     private val authUser = "rabee3yamen"
     private val authPass = "d^AFi%Mu9Th5Wc7uLwh1nEMG8fp2*CW@"
 
+    private val mapper = jacksonObjectMapper()
+
     private val headers = mapOf(
         "User-Agent" to "okhttp/4.9.3",
         "Accept" to "application/json"
@@ -123,6 +127,23 @@ class AppsAnimeProvider : MainAPI() {
     private val authHeaders get() = headers + mapOf(
         "Authorization" to getAuthHeader()
     )
+
+    // Safe parsing with TypeReference to avoid LinkedHashMap cast errors
+    private inline fun <reified T> parseList(text: String): List<T> {
+        return try {
+            mapper.readValue(text, object : TypeReference<List<T>>() {})
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    private inline fun <reified T> parseObject(text: String): T? {
+        return try {
+            mapper.readValue(text, object : TypeReference<T>() {})
+        } catch (e: Exception) {
+            null
+        }
+    }
 
     // ==================== Home Page ====================
 
@@ -145,7 +166,8 @@ class AppsAnimeProvider : MainAPI() {
         val isLatest = request.data.contains("latest")
 
         if (isLatest) {
-            val res = app.get(url, headers = authHeaders).parsedSafe<List<EpisodeWithInfoLatest>>() ?: emptyList()
+            val responseText = app.get(url, headers = authHeaders).text
+            val res = parseList<EpisodeWithInfoLatest>(responseText)
             val items = res.mapNotNull { ep ->
                 val cartoon = ep.cartoon ?: return@mapNotNull null
                 cartoon.id?.let { id ->
@@ -155,7 +177,8 @@ class AppsAnimeProvider : MainAPI() {
             return newHomePageResponse(request.name, items, false)
         }
 
-        val res = app.get(url, headers = authHeaders).parsedSafe<List<CartoonWithInfo>>() ?: emptyList()
+        val responseText = app.get(url, headers = authHeaders).text
+        val res = parseList<CartoonWithInfo>(responseText)
         val items = res.mapNotNull { toSearchResult(it) }
         val hasNext = res.size >= 20
 
@@ -192,32 +215,36 @@ class AppsAnimeProvider : MainAPI() {
         val results = mutableListOf<SearchResponse>()
 
         // Search subbed series
-        val subbedSeries = app.get(
+        val subbedSeriesText = app.get(
             "$apiUrl/cartoon_with_info/searchCartoon.php",
             params = mapOf("search" to query, "type" to "1", "classification" to "2"),
             headers = authHeaders
-        ).parsedSafe<List<CartoonWithInfo>>() ?: emptyList()
+        ).text
+        val subbedSeries = parseList<CartoonWithInfo>(subbedSeriesText)
 
         // Search dubbed series
-        val dubbedSeries = app.get(
+        val dubbedSeriesText = app.get(
             "$apiUrl/cartoon_with_info/searchCartoon.php",
             params = mapOf("search" to query, "type" to "1", "classification" to "1"),
             headers = authHeaders
-        ).parsedSafe<List<CartoonWithInfo>>() ?: emptyList()
+        ).text
+        val dubbedSeries = parseList<CartoonWithInfo>(dubbedSeriesText)
 
         // Search subbed films
-        val subbedFilms = app.get(
+        val subbedFilmsText = app.get(
             "$apiUrl/cartoon_with_info/searchCartoon.php",
             params = mapOf("search" to query, "type" to "2", "classification" to "2"),
             headers = authHeaders
-        ).parsedSafe<List<CartoonWithInfo>>() ?: emptyList()
+        ).text
+        val subbedFilms = parseList<CartoonWithInfo>(subbedFilmsText)
 
         // Search dubbed films
-        val dubbedFilms = app.get(
+        val dubbedFilmsText = app.get(
             "$apiUrl/cartoon_with_info/searchCartoon.php",
             params = mapOf("search" to query, "type" to "2", "classification" to "1"),
             headers = authHeaders
-        ).parsedSafe<List<CartoonWithInfo>>() ?: emptyList()
+        ).text
+        val dubbedFilms = parseList<CartoonWithInfo>(dubbedFilmsText)
 
         (subbedSeries + dubbedSeries + subbedFilms + dubbedFilms).forEach {
             toSearchResult(it)?.let { r -> results.add(r) }
@@ -232,7 +259,6 @@ class AppsAnimeProvider : MainAPI() {
         val cartoonId = url.substringAfterLast("/")
 
         // Get cartoon info from most viewed or search (since readOne.php is 404)
-        // We fetch a quick search or use the most viewed list
         val cartoonInfo = fetchCartoonInfo(cartoonId) ?: return null
 
         val title = cartoonInfo.title ?: return null
@@ -241,16 +267,16 @@ class AppsAnimeProvider : MainAPI() {
         val categories = cartoonInfo.category?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
 
         // Get playlists (seasons)
-        val playlists = app.post(
+        val playlistsText = app.post(
             "$apiUrl/playlist/read.php",
             headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
             data = mapOf("cartoon_id" to cartoonId)
-        ).parsedSafe<List<Playlist>>() ?: emptyList()
+        ).text
+        val playlists = parseList<Playlist>(playlistsText)
 
         if (cartoonInfo.type == "2" || playlists.isEmpty()) {
             // It's a movie or single-list show
             if (playlists.isEmpty()) {
-                // No playlists at all - create a dummy one
                 val videoData = EpisodeVideoData(
                     videos = emptyMap(),
                     episodeTitle = title
@@ -305,13 +331,11 @@ class AppsAnimeProvider : MainAPI() {
             )
             newEpisode(videoData.toJson()) {
                 this.name = ep.title ?: "الحلقة ${idx + 1}"
-                // Try to extract season and episode number from title
                 val seasonPlaylist = playlists.find { it.id == ep.playlistId?.toString() }
                 val seasonIndex = playlists.indexOf(seasonPlaylist)
                 if (seasonIndex >= 0) {
                     this.season = seasonIndex + 1
                 }
-                // Extract episode number from Arabic title like "الحلقة 1"
                 val epNum = ep.title?.let { extractEpisodeNumber(it) }
                 if (epNum != null) {
                     this.episode = epNum
@@ -351,15 +375,12 @@ class AppsAnimeProvider : MainAPI() {
     }
 
     private fun extractEpisodeNumber(title: String): Int? {
-        // Arabic pattern: "الحلقة 1" or "الحلقة 15"
         val arabicPattern = Regex("الحلقة\\s*(\\d+)")
         arabicPattern.find(title)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
 
-        // English pattern: "Episode 1" or "E15"
         val engPattern = Regex("(?:Episode|Ep\\.?)\\s*(\\d+)", RegexOption.IGNORE_CASE)
         engPattern.find(title)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
 
-        // Just a number
         val numPattern = Regex("^(\\d+)$")
         numPattern.find(title.trim())?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
 
@@ -368,10 +389,11 @@ class AppsAnimeProvider : MainAPI() {
 
     private suspend fun fetchCartoonInfo(cartoonId: String): CartoonWithInfo? {
         // Try most viewed list first
-        val mostViewed = app.get(
+        val mostViewedText = app.get(
             "$apiUrl/cartoon_with_info/getMostViewedCartoons.php",
             headers = authHeaders
-        ).parsedSafe<List<CartoonWithInfo>>() ?: emptyList()
+        ).text
+        val mostViewed = parseList<CartoonWithInfo>(mostViewedText)
 
         mostViewed.find { it.id == cartoonId }?.let { return it }
 
@@ -384,12 +406,12 @@ class AppsAnimeProvider : MainAPI() {
         )
 
         for (listingUrl in listings) {
-            val items = app.get(listingUrl, headers = authHeaders).parsedSafe<List<CartoonWithInfo>>() ?: emptyList()
+            val text = app.get(listingUrl, headers = authHeaders).text
+            val items = parseList<CartoonWithInfo>(text)
             items.find { it.id == cartoonId }?.let { return it }
         }
 
         // If still not found, create a minimal info from the cartoon ID
-        // We'll still try to load playlists
         return CartoonWithInfo(id = cartoonId, title = "Anime #$cartoonId", type = "1")
     }
 
@@ -398,16 +420,16 @@ class AppsAnimeProvider : MainAPI() {
         var page = 1
 
         while (true) {
-            val eps = app.post(
+            val text = app.post(
                 "$apiUrl/episode/readPaging.php?page=$page",
                 headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
                 data = mapOf("playlist_id" to playlistId)
-            ).parsedSafe<List<Episode>>() ?: emptyList()
+            ).text
+            val eps = parseList<Episode>(text)
 
             if (eps.isEmpty()) break
             allEpisodes.addAll(eps)
 
-            // If we got less than 50, there are no more pages
             if (eps.size < 50) break
             page++
         }
@@ -544,8 +566,9 @@ class AppsAnimeProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ) {
         try {
-            val res = app.get(url, headers = authHeaders).parsedSafe<StreamResponse>()
-            val qualities = res?.availableQualities ?: return
+            val responseText = app.get(url, headers = authHeaders).text
+            val res = parseObject<StreamResponse>(responseText) ?: return
+            val qualities = res.availableQualities ?: return
 
             qualities.forEach { q ->
                 val qualityStr = q.quality ?: return@forEach
@@ -577,7 +600,7 @@ class AppsAnimeProvider : MainAPI() {
             val response = app.get(url, headers = authHeaders)
 
             // Try parsing as JSON with availableQualities
-            val streamRes = response.parsedSafe<StreamResponse>()
+            val streamRes = parseObject<StreamResponse>(response.text)
             if (streamRes?.availableQualities?.isNotEmpty() == true) {
                 streamRes.availableQualities.forEach { q ->
                     val qualityStr = q.quality ?: return@forEach
@@ -620,8 +643,6 @@ class AppsAnimeProvider : MainAPI() {
         try {
             val doc = app.get(url, headers = headers).document
 
-            // Extract video URLs from Google Photos page
-            // Pattern: https://...googleusercontent.com/...(mp4|m3u8)
             val videoRegex = Regex("https?://[^\"'\\s]+?googleusercontent\\.com/[^\"'\\s]+?(?:mp4|m3u8)[^\"'\\s]*")
             val videoUrls = videoRegex.findAll(doc.toString()).map { it.value }.distinct().toList()
 
@@ -639,7 +660,6 @@ class AppsAnimeProvider : MainAPI() {
                 )
             }
 
-            // Also try extracting from script tags with video data
             if (videoUrls.isEmpty()) {
                 val scripts = doc.select("script")
                 for (script in scripts) {
@@ -676,7 +696,6 @@ class AppsAnimeProvider : MainAPI() {
             val response = app.get(url, headers = authHeaders, allowRedirects = true)
             val finalUrl = response.url
 
-            // Check if it's a direct video URL
             if (finalUrl.contains(".mp4") || finalUrl.contains(".m3u8")) {
                 val quality = getQualityFromUrl(finalUrl)
                 callback(
