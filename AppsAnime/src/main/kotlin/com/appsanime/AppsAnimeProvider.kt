@@ -17,12 +17,12 @@ data class CartoonWithInfo(
     @JsonProperty("id") val id: String? = null,
     @JsonProperty("title") val title: String? = null,
     @JsonProperty("thumb") val thumb: String? = null,
-    @JsonProperty("type") val type: String? = null,           // 1=series, 2=film
+    @JsonProperty("type") val type: String? = null,
     @JsonProperty("world_rate") val worldRate: String? = null,
     @JsonProperty("view_date") val viewDate: String? = null,
-    @JsonProperty("status") val status: String? = null,       // 1=completed, 2=ongoing
+    @JsonProperty("status") val status: String? = null,
     @JsonProperty("Watched_users") val watchedUsers: String? = null,
-    @JsonProperty("classification") val classification: String? = null, // 1=dubbed, 2=subbed
+    @JsonProperty("classification") val classification: String? = null,
     @JsonProperty("category") val category: String? = null,
     @JsonProperty("age_rate") val ageRate: String? = null
 )
@@ -44,12 +44,12 @@ data class Episode(
     @JsonProperty("video3") val video3: String? = null,
     @JsonProperty("video4") val video4: String? = null,
     @JsonProperty("video5") val video5: String? = null,
-    @JsonProperty("jResolver") val jResolver: String? = null,
-    @JsonProperty("jResolver1") val jResolver1: String? = null,
-    @JsonProperty("jResolver2") val jResolver2: String? = null,
-    @JsonProperty("jResolver3") val jResolver3: String? = null,
-    @JsonProperty("jResolver4") val jResolver4: String? = null,
-    @JsonProperty("jResolver5") val jResolver5: String? = null,
+    @JsonProperty("jResolver") val jResolver: Any? = null,
+    @JsonProperty("jResolver1") val jResolver1: Any? = null,
+    @JsonProperty("jResolver2") val jResolver2: Any? = null,
+    @JsonProperty("jResolver3") val jResolver3: Any? = null,
+    @JsonProperty("jResolver4") val jResolver4: Any? = null,
+    @JsonProperty("jResolver5") val jResolver5: Any? = null,
     @JsonProperty("playlist_id") val playlistId: Any? = null
 )
 
@@ -60,9 +60,6 @@ data class EpisodeWithInfoLatest(
     @JsonProperty("video") val video: String? = null,
     @JsonProperty("video1") val video1: String? = null,
     @JsonProperty("video2") val video2: String? = null,
-    @JsonProperty("video3") val video3: String? = null,
-    @JsonProperty("video4") val video4: String? = null,
-    @JsonProperty("video5") val video5: String? = null,
     @JsonProperty("playlist") val playlist: PlaylistInfo? = null,
     @JsonProperty("cartoon") val cartoon: CartoonWithInfo? = null,
     @JsonProperty("world_rate") val worldRate: String? = null,
@@ -86,10 +83,18 @@ data class StreamResponse(
     @JsonProperty("availableQualities") val availableQualities: List<VideoQuality>? = null
 )
 
-// Data class to pass video URLs to loadLinks
-data class EpisodeVideoData(
-    val videos: Map<String, String>,  // serverName -> url
+// Episode data stored in newEpisode() - fetched fresh in loadLinks
+data class EpisodeLinkData(
+    val playlistId: String,
+    val episodeId: String,
     val episodeTitle: String = ""
+)
+
+// Movie data stored in newMovieLoadResponse()
+data class MovieLinkData(
+    val cartoonId: String,
+    val playlistId: String? = null,
+    val episodeId: String? = null
 )
 
 // ==================== Provider ====================
@@ -128,7 +133,6 @@ class AppsAnimeProvider : MainAPI() {
         "Authorization" to getAuthHeader()
     )
 
-    // Safe parsing with TypeReference to avoid LinkedHashMap cast errors
     private inline fun <reified T> parseList(text: String): List<T> {
         return try {
             mapper.readValue(text, object : TypeReference<List<T>>() {})
@@ -170,9 +174,7 @@ class AppsAnimeProvider : MainAPI() {
             val res = parseList<EpisodeWithInfoLatest>(responseText)
             val items = res.mapNotNull { ep ->
                 val cartoon = ep.cartoon ?: return@mapNotNull null
-                cartoon.id?.let { id ->
-                    toSearchResult(cartoon)
-                }
+                cartoon.id?.let { toSearchResult(cartoon) }
             }.distinctBy { it.url }
             return newHomePageResponse(request.name, items, false)
         }
@@ -214,40 +216,23 @@ class AppsAnimeProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
 
-        // Search subbed series
-        val subbedSeriesText = app.get(
-            "$apiUrl/cartoon_with_info/searchCartoon.php",
-            params = mapOf("search" to query, "type" to "1", "classification" to "2"),
-            headers = authHeaders
-        ).text
-        val subbedSeries = parseList<CartoonWithInfo>(subbedSeriesText)
+        val searchConfigs = listOf(
+            "1" to "2", // series subbed
+            "1" to "1", // series dubbed
+            "2" to "2", // film subbed
+            "2" to "1"  // film dubbed
+        )
 
-        // Search dubbed series
-        val dubbedSeriesText = app.get(
-            "$apiUrl/cartoon_with_info/searchCartoon.php",
-            params = mapOf("search" to query, "type" to "1", "classification" to "1"),
-            headers = authHeaders
-        ).text
-        val dubbedSeries = parseList<CartoonWithInfo>(dubbedSeriesText)
-
-        // Search subbed films
-        val subbedFilmsText = app.get(
-            "$apiUrl/cartoon_with_info/searchCartoon.php",
-            params = mapOf("search" to query, "type" to "2", "classification" to "2"),
-            headers = authHeaders
-        ).text
-        val subbedFilms = parseList<CartoonWithInfo>(subbedFilmsText)
-
-        // Search dubbed films
-        val dubbedFilmsText = app.get(
-            "$apiUrl/cartoon_with_info/searchCartoon.php",
-            params = mapOf("search" to query, "type" to "2", "classification" to "1"),
-            headers = authHeaders
-        ).text
-        val dubbedFilms = parseList<CartoonWithInfo>(dubbedFilmsText)
-
-        (subbedSeries + dubbedSeries + subbedFilms + dubbedFilms).forEach {
-            toSearchResult(it)?.let { r -> results.add(r) }
+        for ((type, classification) in searchConfigs) {
+            try {
+                val text = app.get(
+                    "$apiUrl/cartoon_with_info/searchCartoon.php",
+                    params = mapOf("search" to query, "type" to type, "classification" to classification),
+                    headers = authHeaders
+                ).text
+                val items = parseList<CartoonWithInfo>(text)
+                items.forEach { toSearchResult(it)?.let { r -> results.add(r) } }
+            } catch (_: Exception) {}
         }
 
         return results.distinctBy { it.url }
@@ -258,15 +243,7 @@ class AppsAnimeProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse? {
         val cartoonId = url.substringAfterLast("/")
 
-        // Get cartoon info from most viewed or search (since readOne.php is 404)
-        val cartoonInfo = fetchCartoonInfo(cartoonId) ?: return null
-
-        val title = cartoonInfo.title ?: return null
-        val poster = cartoonInfo.thumb
-        val scoreValue = Score.from10(cartoonInfo.worldRate)
-        val categories = cartoonInfo.category?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
-
-        // Get playlists (seasons)
+        // Fetch playlists first - this gives us the cartoon structure
         val playlistsText = app.post(
             "$apiUrl/playlist/read.php",
             headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
@@ -274,39 +251,22 @@ class AppsAnimeProvider : MainAPI() {
         ).text
         val playlists = parseList<Playlist>(playlistsText)
 
-        if (cartoonInfo.type == "2" || playlists.isEmpty()) {
-            // It's a movie or single-list show
-            if (playlists.isEmpty()) {
-                val videoData = EpisodeVideoData(
-                    videos = emptyMap(),
-                    episodeTitle = title
-                )
-                return newMovieLoadResponse(title, url, TvType.Movie, videoData.toJson()) {
-                    this.posterUrl = poster
-                    this.score = scoreValue
-                    this.tags = categories
-                    plot = buildPlot(cartoonInfo)
-                }
-            }
+        // Get cartoon info from the first playlist's episodes or search
+        val cartoonInfo = fetchCartoonInfo(cartoonId, playlists)
+        val title = cartoonInfo.title ?: return null
+        val poster = cartoonInfo.thumb
+        val scoreValue = Score.from10(cartoonInfo.worldRate)
+        val categories = cartoonInfo.category?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
+        val isMovie = cartoonInfo.type == "2" || (playlists.size == 1 && playlists.first().title?.contains("فيلم") == true)
 
-            // Movie with playlists - use first playlist
-            val episodes = fetchEpisodes(playlists.first().id ?: return null)
-            if (episodes.isEmpty()) {
-                val videoData = EpisodeVideoData(videos = emptyMap(), episodeTitle = title)
-                return newMovieLoadResponse(title, url, TvType.Movie, videoData.toJson()) {
-                    this.posterUrl = poster
-                    this.score = scoreValue
-                    this.tags = categories
-                    plot = buildPlot(cartoonInfo)
-                }
-            }
-
-            val ep = episodes.first()
-            val videoData = EpisodeVideoData(
-                videos = collectVideoUrls(ep),
-                episodeTitle = ep.title ?: title
+        if (isMovie || playlists.isEmpty()) {
+            // Movie - store cartoonId and playlistId for fresh fetch in loadLinks
+            val playlistId = playlists.firstOrNull()?.id
+            val linkData = MovieLinkData(
+                cartoonId = cartoonId,
+                playlistId = playlistId
             )
-            return newMovieLoadResponse(title, url, TvType.Movie, videoData.toJson()) {
+            return newMovieLoadResponse(title, url, TvType.Movie, linkData.toJson()) {
                 this.posterUrl = poster
                 this.score = scoreValue
                 this.tags = categories
@@ -314,24 +274,33 @@ class AppsAnimeProvider : MainAPI() {
             }
         }
 
-        // TV Series with seasons
-        val allEpisodes = mutableListOf<Episode>()
-        playlists.forEachIndexed { index, playlist ->
-            val playlistId = playlist.id ?: return@forEachIndexed
-            val eps = fetchEpisodes(playlistId)
-            eps.forEach { ep ->
-                allEpisodes.add(ep)
-            }
+        // TV Series - fetch episodes for each playlist using episodeWithInfo (no pagination)
+        val tvEpisodes = mutableListOf<Episode>()
+
+        for ((seasonIndex, playlist) in playlists.withIndex()) {
+            val playlistId = playlist.id ?: continue
+            try {
+                val epsText = app.post(
+                    "$apiUrl/episodeWithInfo/readPaging.php",
+                    headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
+                    data = mapOf("playlist_id" to playlistId)
+                ).text
+                val eps = parseList<Episode>(epsText)
+                tvEpisodes.addAll(eps)
+            } catch (_: Exception) {}
         }
 
-        val tvEpisodes = allEpisodes.mapIndexed { idx, ep ->
-            val videoData = EpisodeVideoData(
-                videos = collectVideoUrls(ep),
+        val episodes = tvEpisodes.mapIndexed { idx, ep ->
+            val epId = ep.id ?: idx.toString()
+            val pId = ep.playlistId?.toString() ?: playlists.firstOrNull()?.id ?: ""
+            val linkData = EpisodeLinkData(
+                playlistId = pId,
+                episodeId = epId,
                 episodeTitle = ep.title ?: "الحلقة ${idx + 1}"
             )
-            newEpisode(videoData.toJson()) {
+            newEpisode(linkData.toJson()) {
                 this.name = ep.title ?: "الحلقة ${idx + 1}"
-                val seasonPlaylist = playlists.find { it.id == ep.playlistId?.toString() }
+                val seasonPlaylist = playlists.find { it.id == pId }
                 val seasonIndex = playlists.indexOf(seasonPlaylist)
                 if (seasonIndex >= 0) {
                     this.season = seasonIndex + 1
@@ -351,7 +320,7 @@ class AppsAnimeProvider : MainAPI() {
         }
         val displayTitle = if (classificationTag.isNotEmpty()) "$title ($classificationTag)" else title
 
-        return newTvSeriesLoadResponse(displayTitle, url, TvType.TvSeries, tvEpisodes) {
+        return newTvSeriesLoadResponse(displayTitle, url, TvType.TvSeries, episodes) {
             this.posterUrl = poster
             this.score = scoreValue
             this.tags = categories
@@ -375,94 +344,36 @@ class AppsAnimeProvider : MainAPI() {
     }
 
     private fun extractEpisodeNumber(title: String): Int? {
-        val arabicPattern = Regex("الحلقة\\s*(\\d+)")
-        arabicPattern.find(title)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
-
-        val engPattern = Regex("(?:Episode|Ep\\.?)\\s*(\\d+)", RegexOption.IGNORE_CASE)
-        engPattern.find(title)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
-
-        val numPattern = Regex("^(\\d+)$")
-        numPattern.find(title.trim())?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
-
+        Regex("الحلقة\\s*(\\d+)").find(title)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        Regex("(?:Episode|Ep\\.?)\\s*(\\d+)", RegexOption.IGNORE_CASE).find(title)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        Regex("^(\\d+)$").find(title.trim())?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
         return null
     }
 
-    private suspend fun fetchCartoonInfo(cartoonId: String): CartoonWithInfo? {
-        // Try most viewed list first
-        val mostViewedText = app.get(
-            "$apiUrl/cartoon_with_info/getMostViewedCartoons.php",
-            headers = authHeaders
-        ).text
-        val mostViewed = parseList<CartoonWithInfo>(mostViewedText)
-
-        mostViewed.find { it.id == cartoonId }?.let { return it }
-
-        // Try page 1 of each listing
-        val listings = listOf(
-            "$apiUrl/cartoon_with_info/readPagingTranslatedSeriesAnime.php?page=1",
-            "$apiUrl/cartoon_with_info/readPagingDUBBEDSeriesAnime.php?page=1",
-            "$apiUrl/cartoon_with_info/readPagingTranslatedFilms.php?page=1",
-            "$apiUrl/cartoon_with_info/readPagingDUBBEDFilms.php?page=1"
-        )
-
-        for (listingUrl in listings) {
-            val text = app.get(listingUrl, headers = authHeaders).text
+    private suspend fun fetchCartoonInfo(cartoonId: String, playlists: List<Playlist>): CartoonWithInfo {
+        // Try to get info from most viewed list
+        try {
+            val text = app.get(
+                "$apiUrl/cartoon_with_info/getMostViewedCartoons.php",
+                headers = authHeaders
+            ).text
             val items = parseList<CartoonWithInfo>(text)
             items.find { it.id == cartoonId }?.let { return it }
-        }
+        } catch (_: Exception) {}
 
-        // If still not found, create a minimal info from the cartoon ID
-        return CartoonWithInfo(id = cartoonId, title = "Anime #$cartoonId", type = "1")
+        // Try search with the cartoon ID (won't work but worth trying title from playlist)
+        // Use playlist info to infer type
+        val isInferredMovie = playlists.size == 1
+
+        return CartoonWithInfo(
+            id = cartoonId,
+            title = playlists.firstOrNull()?.title?.substringBefore(" الجزء")?.substringBefore(" الموسم")?.trim() ?: "Anime #$cartoonId",
+            type = if (isInferredMovie) "2" else "1",
+            thumb = playlists.firstOrNull()?.thumb
+        )
     }
 
-    private suspend fun fetchEpisodes(playlistId: String): List<Episode> {
-        val allEpisodes = mutableListOf<Episode>()
-        var page = 1
-
-        while (true) {
-            val text = app.post(
-                "$apiUrl/episode/readPaging.php?page=$page",
-                headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
-                data = mapOf("playlist_id" to playlistId)
-            ).text
-            val eps = parseList<Episode>(text)
-
-            if (eps.isEmpty()) break
-            allEpisodes.addAll(eps)
-
-            if (eps.size < 50) break
-            page++
-        }
-
-        return allEpisodes
-    }
-
-    private fun collectVideoUrls(episode: Episode): Map<String, String> {
-        val videos = mutableMapOf<String, String>()
-
-        episode.video?.takeIf { it.isNotEmpty() }?.let {
-            videos["سيرفر 1"] = it
-        }
-        episode.video1?.takeIf { it.isNotEmpty() }?.let {
-            videos["سيرفر 2"] = it
-        }
-        episode.video2?.takeIf { it.isNotEmpty() }?.let {
-            videos["سيرفر 3"] = it
-        }
-        episode.video3?.takeIf { it.isNotEmpty() }?.let {
-            videos["سيرفر 4"] = it
-        }
-        episode.video4?.takeIf { it.isNotEmpty() }?.let {
-            videos["سيرفر 5"] = it
-        }
-        episode.video5?.takeIf { it.isNotEmpty() }?.let {
-            videos["سيرفر 6"] = it
-        }
-
-        return videos
-    }
-
-    // ==================== Video Extraction ====================
+    // ==================== Video Extraction (FRESH FETCH) ====================
 
     override suspend fun loadLinks(
         data: String,
@@ -470,23 +381,116 @@ class AppsAnimeProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val videoData = tryParseJson<EpisodeVideoData>(data) ?: return false
+        // Try parsing as episode data first
+        val epData = tryParseJson<EpisodeLinkData>(data)
+        if (epData != null) {
+            return loadEpisodeLinks(epData, subtitleCallback, callback)
+        }
 
-        if (videoData.videos.isEmpty()) return false
+        // Try parsing as movie data
+        val movieData = tryParseJson<MovieLinkData>(data)
+        if (movieData != null) {
+            return loadMovieLinks(movieData, subtitleCallback, callback)
+        }
 
+        return false
+    }
+
+    private suspend fun loadEpisodeLinks(
+        epData: EpisodeLinkData,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        // Fetch fresh episode data from the API at play time
+        val videos = fetchFreshEpisodeVideos(epData.playlistId, epData.episodeId)
+        if (videos.isEmpty()) return false
+
+        extractAllVideos(videos, subtitleCallback, callback)
+        return true
+    }
+
+    private suspend fun loadMovieLinks(
+        movieData: MovieLinkData,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val playlistId = movieData.playlistId ?: return false
+
+        // Fetch fresh episode data for the movie
+        val videos = fetchFreshEpisodeVideos(playlistId, movieData.episodeId)
+        if (videos.isEmpty()) return false
+
+        extractAllVideos(videos, subtitleCallback, callback)
+        return true
+    }
+
+    private suspend fun fetchFreshEpisodeVideos(playlistId: String, episodeId: String?): Map<String, String> {
+        val videos = mutableMapOf<String, String>()
+
+        try {
+            // Use episodeWithInfo which returns ALL episodes without pagination
+            val text = app.post(
+                "$apiUrl/episodeWithInfo/readPaging.php",
+                headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
+                data = mapOf("playlist_id" to playlistId)
+            ).text
+            val episodes = parseList<Episode>(text)
+
+            val ep = if (episodeId != null) {
+                episodes.find { it.id == episodeId }
+            } else {
+                episodes.firstOrNull()
+            } ?: return emptyMap()
+
+            collectVideoUrls(ep, videos)
+        } catch (_: Exception) {}
+
+        // If no videos from episodeWithInfo, try the paginated endpoint
+        if (videos.isEmpty()) {
+            try {
+                val text = app.post(
+                    "$apiUrl/episode/readPaging.php?page=1",
+                    headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
+                    data = mapOf("playlist_id" to playlistId)
+                ).text
+                val episodes = parseList<Episode>(text)
+
+                val ep = if (episodeId != null) {
+                    episodes.find { it.id == episodeId }
+                } else {
+                    episodes.firstOrNull()
+                } ?: return videos
+
+                collectVideoUrls(ep, videos)
+            } catch (_: Exception) {}
+        }
+
+        return videos
+    }
+
+    private fun collectVideoUrls(episode: Episode, videos: MutableMap<String, String>) {
+        episode.video?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 1"] = it }
+        episode.video1?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 2"] = it }
+        episode.video2?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 3"] = it }
+        episode.video3?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 4"] = it }
+        episode.video4?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 5"] = it }
+        episode.video5?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 6"] = it }
+    }
+
+    private suspend fun extractAllVideos(
+        videos: Map<String, String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
         coroutineScope {
-            videoData.videos.entries.map { (serverName, url) ->
+            videos.entries.map { (serverName, url) ->
                 async {
                     try {
                         extractFromUrl(url, serverName, subtitleCallback, callback)
-                    } catch (e: Exception) {
-                        // Silently skip failed extractions
-                    }
+                    } catch (_: Exception) {}
                 }
             }.forEach { it.await() }
         }
-
-        return true
     }
 
     private suspend fun extractFromUrl(
@@ -497,40 +501,20 @@ class AppsAnimeProvider : MainAPI() {
     ) {
         when {
             // test-stream worker - returns JSON with availableQualities
-            url.contains("test-stream.developer-pro.workers.dev") -> {
+            url.contains("test-stream") -> {
                 extractTestStream(url, serverName, callback)
             }
-            // cdnlink worker - may return JSON with qualities or redirect
-            url.contains("cdnlink.developer-pro.workers.dev") -> {
-                extractWorkerLink(url, serverName, callback)
+            // Any developer-pro.workers.dev worker
+            url.contains("developer-pro.workers.dev") -> {
+                extractWorkerLink(url, serverName, subtitleCallback, callback)
             }
-            // link worker - may return JSON with qualities or redirect
-            url.contains("link.developer-pro.workers.dev") -> {
-                extractWorkerLink(url, serverName, callback)
-            }
-            // linkcdn worker
-            url.contains("linkcdn.developer-pro.workers.dev") -> {
-                extractWorkerLink(url, serverName, callback)
-            }
-            // multiplecdnqualities worker
-            url.contains("multiplecdnqualities.apps-anime.workers.dev") -> {
-                extractWorkerLink(url, serverName, callback)
+            // Any apps-anime.workers.dev worker
+            url.contains("apps-anime.workers.dev") -> {
+                extractWorkerLink(url, serverName, subtitleCallback, callback)
             }
             // Google Photos
             url.contains("photos.google.com") -> {
                 extractGooglePhotos(url, serverName, callback)
-            }
-            // ok.ru
-            url.contains("ok.ru") -> {
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
-            }
-            // vudeo.io / vudeo.net
-            url.contains("vudeo") -> {
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
-            }
-            // mixdrop
-            url.contains("mixdrop") -> {
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
             }
             // Direct video URLs (.mp4, .m3u8)
             url.contains(".mp4") || url.contains(".m3u8") -> {
@@ -548,14 +532,11 @@ class AppsAnimeProvider : MainAPI() {
                     }
                 )
             }
-            // Unknown - try CloudStream's built-in extractor
+            // Known video hosts - use CloudStream built-in extractors
             else -> {
                 try {
                     loadExtractor(url, mainUrl, subtitleCallback, callback)
-                } catch (e: Exception) {
-                    // Fallback: try fetching as direct stream
-                    tryDirectFetch(url, serverName, callback)
-                }
+                } catch (_: Exception) {}
             }
         }
     }
@@ -569,6 +550,8 @@ class AppsAnimeProvider : MainAPI() {
             val responseText = app.get(url, headers = authHeaders).text
             val res = parseObject<StreamResponse>(responseText) ?: return
             val qualities = res.availableQualities ?: return
+
+            if (qualities.isEmpty()) return
 
             qualities.forEach { q ->
                 val qualityStr = q.quality ?: return@forEach
@@ -586,14 +569,13 @@ class AppsAnimeProvider : MainAPI() {
                     }
                 )
             }
-        } catch (e: Exception) {
-            // Stream may be unavailable
-        }
+        } catch (_: Exception) {}
     }
 
     private suspend fun extractWorkerLink(
         url: String,
         serverName: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
         try {
@@ -621,18 +603,36 @@ class AppsAnimeProvider : MainAPI() {
                 return
             }
 
-            // Try as redirect (follow and extract from destination)
+            // Check if the response is a redirect to another URL
             val finalUrl = response.url
-            if (finalUrl != url) {
-                extractFromUrl(finalUrl, serverName, callback = callback, subtitleCallback = {})
+            if (finalUrl != url && finalUrl.isNotEmpty()) {
+                extractFromUrl(finalUrl, serverName, subtitleCallback, callback)
                 return
             }
 
-            // Try direct fetch
-            tryDirectFetch(url, serverName, callback)
-        } catch (e: Exception) {
-            // Worker link may be expired
-        }
+            // Try to find direct video URL in the response text
+            val text = response.text
+            val m3u8Regex = Regex("https?://[^\"'\\s]+\\.m3u8[^\"'\\s]*")
+            val mp4Regex = Regex("https?://[^\"'\\s]+\\.mp4[^\"'\\s]*")
+
+            m3u8Regex.find(text)?.value?.let { streamUrl ->
+                callback(
+                    newExtractorLink(source = serverName, name = "$serverName - Auto", url = streamUrl, type = INFER_TYPE) {
+                        this.referer = mainUrl
+                    }
+                )
+                return
+            }
+
+            mp4Regex.find(text)?.value?.let { streamUrl ->
+                callback(
+                    newExtractorLink(source = serverName, name = "$serverName - Auto", url = streamUrl, type = ExtractorLinkType.VIDEO) {
+                        this.referer = mainUrl
+                    }
+                )
+                return
+            }
+        } catch (_: Exception) {}
     }
 
     private suspend fun extractGooglePhotos(
@@ -642,78 +642,31 @@ class AppsAnimeProvider : MainAPI() {
     ) {
         try {
             val doc = app.get(url, headers = headers).document
+            val html = doc.toString()
 
-            val videoRegex = Regex("https?://[^\"'\\s]+?googleusercontent\\.com/[^\"'\\s]+?(?:mp4|m3u8)[^\"'\\s]*")
-            val videoUrls = videoRegex.findAll(doc.toString()).map { it.value }.distinct().toList()
+            // Multiple patterns for Google Photos video URLs
+            val patterns = listOf(
+                Regex("https?://[^\"'\\s]+?googleusercontent\\.com/[^\"'\\s]+?(?:mp4|m3u8)[^\"'\\s]*"),
+                Regex("https?://[^\"'\\s]+?googlevideo\\.com/[^\"'\\s]+?(?:mp4|m3u8)[^\"'\\s]*"),
+                Regex("\"(https://lh3\\.[^\"']+)\""),
+                Regex("\"(https://video\\.google\\.com/[^\"']+)\"")
+            )
 
-            videoUrls.forEach { videoUrl ->
-                callback(
-                    newExtractorLink(
-                        source = "$serverName (Google Photos)",
-                        name = "$serverName - Google Photos",
-                        url = videoUrl,
-                        type = INFER_TYPE
-                    ) {
-                        this.referer = "https://photos.google.com/"
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-            }
-
-            if (videoUrls.isEmpty()) {
-                val scripts = doc.select("script")
-                for (script in scripts) {
-                    val content = script.data()
-                    if (content.contains("googleusercontent") && content.contains("video")) {
-                        val urls = videoRegex.findAll(content).map { it.value }.distinct()
-                        urls.forEach { videoUrl ->
-                            callback(
-                                newExtractorLink(
-                                    source = "$serverName (Google Photos)",
-                                    name = "$serverName - Google Photos",
-                                    url = videoUrl,
-                                    type = INFER_TYPE
-                                ) {
-                                    this.referer = "https://photos.google.com/"
-                                    this.quality = Qualities.Unknown.value
-                                }
-                            )
+            for (pattern in patterns) {
+                pattern.findAll(html).map { it.groupValues.last() }.distinct().forEach { videoUrl ->
+                    callback(
+                        newExtractorLink(
+                            source = "$serverName (GP)",
+                            name = "$serverName - Google Photos",
+                            url = videoUrl,
+                            type = INFER_TYPE
+                        ) {
+                            this.referer = "https://photos.google.com/"
                         }
-                    }
+                    )
                 }
             }
-        } catch (e: Exception) {
-            // Google Photos may require auth or be unavailable
-        }
-    }
-
-    private suspend fun tryDirectFetch(
-        url: String,
-        serverName: String,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        try {
-            val response = app.get(url, headers = authHeaders, allowRedirects = true)
-            val finalUrl = response.url
-
-            if (finalUrl.contains(".mp4") || finalUrl.contains(".m3u8")) {
-                val quality = getQualityFromUrl(finalUrl)
-                callback(
-                    newExtractorLink(
-                        source = serverName,
-                        name = "$serverName - $quality",
-                        url = finalUrl,
-                        type = if (finalUrl.contains(".m3u8")) INFER_TYPE else ExtractorLinkType.VIDEO
-                    ) {
-                        this.referer = mainUrl
-                        this.headers = headers
-                        this.quality = getQualityValue(quality)
-                    }
-                )
-            }
-        } catch (e: Exception) {
-            // URL may not be a direct video
-        }
+        } catch (_: Exception) {}
     }
 
     private fun getQualityFromUrl(url: String): String {
