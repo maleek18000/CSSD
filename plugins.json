@@ -862,6 +862,29 @@
     "description": "Anime Day - أنمي وأفلام من سيرفرات متعددة (SR, SA, JO, BO)",
     "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/AnimeDay.cs3",
     "name": "Anime Day"
+  },
+  {
+    "iconUrl": "https://apps-anime.com/favicon.ico",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/maleek18000/CSSD",
+    "fileSize": 28000,
+    "status": 1,
+    "language": "ar",
+    "authors": [
+      "maleek18000"
+    ],
+    "tvTypes": [
+      "Anime",
+      "AnimeMovie",
+      "Cartoon",
+      "TvSeries",
+      "Movie"
+    ],
+    "version": 1,
+    "internalName": "AppsAnime",
+    "description": "Apps Anime - انمي وكرتون مدبلج ومترجم من تطبيق Apps Anime",
+    "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/AppsAnime.cs3",
+    "name": "AppsAnime"
   }
 ]
 
