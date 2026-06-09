@@ -100,17 +100,9 @@ data class StreamResponse(
     @JsonProperty("availableQualities") val availableQualities: List<VideoQuality>? = null
 )
 
-// Data stored in episode/movie items - fetched fresh in loadLinks
-data class EpisodeLinkData(
-    val playlistId: String,
-    val episodeId: String,
-    val episodeTitle: String = ""
-)
-
-data class MovieLinkData(
-    val cartoonId: String,
-    val playlistId: String,
-    val episodeId: String? = null
+// Link data stores raw video URLs from the episode - resolved in loadLinks()
+data class LinkData(
+    val videoUrls: Map<String, String>  // server name -> raw URL from API
 )
 
 // ==================== Provider ====================
@@ -163,6 +155,43 @@ class AppsAnimeProvider : MainAPI() {
         } catch (e: Exception) {
             null
         }
+    }
+
+    // ==================== Helpers ====================
+
+    private fun extractOkVideoId(okcdnUrl: String): String? {
+        val idParam = okcdnUrl.substringAfter("id=", "")
+            .substringBefore("&")
+            .substringBefore(" ")
+            .substringBefore("\r")
+            .substringBefore("\n")
+            .trim()
+        return idParam.takeIf { it.isNotEmpty() && it.all { c -> c.isDigit() } }
+    }
+
+    private fun collectVideoUrls(episode: Episode): Map<String, String> {
+        val videos = mutableMapOf<String, String>()
+        episode.video?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 1"] = it }
+        episode.video1?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 2"] = it }
+        episode.video2?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 3"] = it }
+        episode.video3?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 4"] = it }
+        episode.video4?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 5"] = it }
+        episode.video5?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 6"] = it }
+        return videos
+    }
+
+    private fun isPlaylistMovie(playlist: Playlist, episodeCount: Int): Boolean {
+        if (playlist.title?.contains("فيلم") == true) return true
+        if (playlist.title?.contains("الجزء") == true || playlist.title?.contains("الموسم") == true) return false
+        if (episodeCount == 1) return true
+        return false
+    }
+
+    private fun extractEpisodeNumber(title: String): Int? {
+        Regex("الحلقة\\s*(\\d+)").find(title)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        Regex("(?:Episode|Ep\\.?)\\s*(\\d+)", RegexOption.IGNORE_CASE).find(title)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        Regex("^(\\d+)$").find(title.trim())?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        return null
     }
 
     // ==================== Home Page ====================
@@ -233,10 +262,7 @@ class AppsAnimeProvider : MainAPI() {
         val results = mutableListOf<SearchResponse>()
 
         val searchConfigs = listOf(
-            "1" to "2", // series subbed
-            "1" to "1", // series dubbed
-            "2" to "2", // film subbed
-            "2" to "1"  // film dubbed
+            "1" to "2", "1" to "1", "2" to "2", "2" to "1"
         )
 
         for ((type, classification) in searchConfigs) {
@@ -256,37 +282,18 @@ class AppsAnimeProvider : MainAPI() {
 
     // ==================== Load Detail ====================
 
-    /**
-     * Determine if a playlist is a movie based on:
-     * - Playlist title contains "فيلم" (movie in Arabic)
-     * - OR it has only 1 episode AND the episode title doesn't look like a series episode
-     */
-    private fun isPlaylistMovie(playlist: Playlist, episodeCount: Int): Boolean {
-        // If playlist title contains "فيلم" (movie), it's definitely a movie
-        if (playlist.title?.contains("فيلم") == true) return true
-        // If playlist title contains "الجزء" or "الموسم" (season/part), it's a series
-        if (playlist.title?.contains("الجزء") == true || playlist.title?.contains("الموسم") == true) return false
-        // If there's only 1 episode and the title doesn't contain "الحلقة" or "Episode", likely a movie
-        if (episodeCount == 1) return true
-        // Multiple episodes = series
-        return false
-    }
-
     override suspend fun load(url: String): LoadResponse? {
         val cartoonId = url.substringAfterLast("/")
 
-        // Step 1: Fetch playlists (seasons/parts)
         val playlistsText = app.post(
             "$apiUrl/playlist/read.php",
             headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
             data = mapOf("cartoon_id" to cartoonId)
         ).text
         val playlists = parseList<Playlist>(playlistsText)
-
         if (playlists.isEmpty()) return null
 
-        // Step 2: Fetch episodes for ALL playlists at once
-        // We also extract rating/category from the first episode
+        // Fetch episodes for all playlists
         val playlistEpisodes = mutableMapOf<String, List<Episode>>()
         var firstEpisodeInfo: Episode? = null
 
@@ -306,31 +313,22 @@ class AppsAnimeProvider : MainAPI() {
             } catch (_: Exception) {}
         }
 
-        // Determine if this is a movie or series
-        // Use the first playlist to decide
         val firstPlaylist = playlists.first()
         val firstPlaylistEps = playlistEpisodes[firstPlaylist.id] ?: emptyList()
         val isMovie = isPlaylistMovie(firstPlaylist, firstPlaylistEps.size)
 
-        // Build title and poster from playlist data
-        val title = firstPlaylist.title
-            ?.trim()
-            ?: "Anime #$cartoonId"
+        val title = firstPlaylist.title?.trim() ?: "Anime #$cartoonId"
         val poster = firstPlaylist.thumb
         val scoreValue = Score.from10(firstEpisodeInfo?.worldRate)
         val categories = firstEpisodeInfo?.category?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
             ?: emptyList()
-
-        // Build plot from episode data
         val plot = buildPlotFromEpisode(firstEpisodeInfo)
 
         if (isMovie) {
-            // Movie: use first playlist, first episode
-            val playlistId = firstPlaylist.id ?: return null
-            val linkData = MovieLinkData(
-                cartoonId = cartoonId,
-                playlistId = playlistId
-            )
+            val ep = firstPlaylistEps.firstOrNull()
+            val videoUrls = if (ep != null) collectVideoUrls(ep) else emptyMap()
+            val linkData = LinkData(videoUrls)
+
             return newMovieLoadResponse(title, url, TvType.Movie, linkData.toJson()) {
                 this.posterUrl = poster
                 this.score = scoreValue
@@ -339,23 +337,18 @@ class AppsAnimeProvider : MainAPI() {
             }
         }
 
-        // TV Series: build episodes list from all playlists
+        // TV Series
         val allEpisodes = mutableListOf<Episode>()
         for (playlist in playlists) {
-            val eps = playlistEpisodes[playlist.id] ?: continue
-            allEpisodes.addAll(eps)
+            playlistEpisodes[playlist.id]?.let { allEpisodes.addAll(it) }
         }
-
         if (allEpisodes.isEmpty()) return null
 
         val episodes = allEpisodes.mapIndexed { idx, ep ->
-            val epId = ep.getIdString()
+            val videoUrls = collectVideoUrls(ep)
             val pId = ep.getPlaylistIdString().ifEmpty { playlists.firstOrNull()?.id ?: "" }
-            val linkData = EpisodeLinkData(
-                playlistId = pId,
-                episodeId = epId,
-                episodeTitle = ep.title ?: "الحلقة ${idx + 1}"
-            )
+            val linkData = LinkData(videoUrls)
+
             newEpisode(linkData.toJson()) {
                 this.name = ep.title ?: "الحلقة ${idx + 1}"
                 val seasonPlaylist = playlists.find { it.id == pId }
@@ -390,13 +383,6 @@ class AppsAnimeProvider : MainAPI() {
         return parts.joinToString(" | ")
     }
 
-    private fun extractEpisodeNumber(title: String): Int? {
-        Regex("الحلقة\\s*(\\d+)").find(title)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
-        Regex("(?:Episode|Ep\\.?)\\s*(\\d+)", RegexOption.IGNORE_CASE).find(title)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
-        Regex("^(\\d+)$").find(title.trim())?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
-        return null
-    }
-
     // ==================== Video Extraction ====================
 
     override suspend fun loadLinks(
@@ -405,449 +391,205 @@ class AppsAnimeProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Try parsing as episode data first
-        val epData = tryParseJson<EpisodeLinkData>(data)
-        if (epData != null) {
-            return loadEpisodeLinks(epData, subtitleCallback, callback)
-        }
-
-        // Try parsing as movie data
-        val movieData = tryParseJson<MovieLinkData>(data)
-        if (movieData != null) {
-            return loadMovieLinks(movieData, subtitleCallback, callback)
-        }
-
-        return false
-    }
-
-    private suspend fun loadEpisodeLinks(
-        epData: EpisodeLinkData,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val episode = fetchFreshEpisode(epData.playlistId, epData.episodeId)
-            ?: return false
-
-        val videoUrls = collectVideoUrls(episode)
+        val linkData = tryParseJson<LinkData>(data) ?: return false
+        val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        extractAllVideos(videoUrls, subtitleCallback, callback)
-        return true
-    }
+        // Try to resolve ok.ru video ID from the available URLs
+        // and use CloudStream's built-in ok.ru extractor
+        val okVideoId = resolveOkVideoIdFromUrls(videoUrls)
 
-    private suspend fun loadMovieLinks(
-        movieData: MovieLinkData,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val episode = fetchFreshEpisode(movieData.playlistId, movieData.episodeId)
-            ?: return false
+        if (okVideoId != null) {
+            val okUrl = "https://ok.ru/video/$okVideoId"
+            try {
+                loadExtractor(okUrl, mainUrl, subtitleCallback, callback)
+                return true
+            } catch (_: Exception) {}
+        }
 
-        val videoUrls = collectVideoUrls(episode)
-        if (videoUrls.isEmpty()) return false
-
-        extractAllVideos(videoUrls, subtitleCallback, callback)
-        return true
-    }
-
-    private suspend fun fetchFreshEpisode(playlistId: String, episodeId: String?): Episode? {
-        // Use episodeWithInfo which returns ALL episodes without pagination
-        try {
-            val text = app.post(
-                "$apiUrl/episodeWithInfo/readPaging.php",
-                headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
-                data = mapOf("playlist_id" to playlistId)
-            ).text
-            val episodes = parseList<Episode>(text)
-
-            if (episodeId != null) {
-                episodes.find { it.getIdString() == episodeId }?.let { return it }
-            }
-            return episodes.firstOrNull()
-        } catch (_: Exception) {}
-
-        // Fallback: try the paginated endpoint
-        try {
-            val text = app.post(
-                "$apiUrl/episode/readPaging.php?page=1",
-                headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
-                data = mapOf("playlist_id" to playlistId)
-            ).text
-            val episodes = parseList<Episode>(text)
-
-            if (episodeId != null) {
-                episodes.find { it.getIdString() == episodeId }?.let { return it }
-            }
-            return episodes.firstOrNull()
-        } catch (_: Exception) {}
-
-        return null
-    }
-
-    private fun collectVideoUrls(episode: Episode): Map<String, String> {
-        val videos = mutableMapOf<String, String>()
-        episode.video?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 1"] = it }
-        episode.video1?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 2"] = it }
-        episode.video2?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 3"] = it }
-        episode.video3?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 4"] = it }
-        episode.video4?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 5"] = it }
-        episode.video5?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 6"] = it }
-        return videos
-    }
-
-    private suspend fun extractAllVideos(
-        videos: Map<String, String>,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
+        // Fallback: try each URL individually
+        var foundAny = false
         coroutineScope {
-            videos.entries.map { (serverName, url) ->
+            videoUrls.entries.map { (serverName, url) ->
                 async {
                     try {
-                        extractFromUrl(url, serverName, subtitleCallback, callback)
+                        if (extractFromUrl(url, serverName, subtitleCallback, callback)) {
+                            foundAny = true
+                        }
                     } catch (_: Exception) {}
                 }
             }.forEach { it.await() }
         }
+
+        return foundAny
     }
 
+    /**
+     * Try to resolve the ok.ru video ID from a map of video URLs.
+     * Tries test-stream first (reliable), then cdnlink.
+     */
+    private suspend fun resolveOkVideoIdFromUrls(videoUrls: Map<String, String>): String? {
+        // Try test-stream URLs first (they return JSON reliably)
+        for ((_, url) in videoUrls) {
+            if (url.contains("test-stream")) {
+                try {
+                    val responseText = app.get(url, headers = headers).text
+                    val res = parseObject<StreamResponse>(responseText) ?: continue
+                    val firstUrl = res.availableQualities?.firstOrNull()?.url ?: continue
+                    extractOkVideoId(firstUrl)?.let { return it }
+                } catch (_: Exception) {}
+            }
+        }
+
+        // Try cdnlink URLs (they redirect to okcdn.ru)
+        for ((_, url) in videoUrls) {
+            if (url.contains("cdnlink.developer-pro.workers.dev")) {
+                try {
+                    val response = app.get(url, headers = headers)
+                    // Check final URL after redirect (even on 400, URL might be accessible)
+                    val finalUrl = response.url
+                    if (finalUrl != url && finalUrl.contains("okcdn.ru")) {
+                        extractOkVideoId(finalUrl)?.let { return it }
+                    }
+                    // Check Location header for redirect
+                    val location = response.headers?.get("location")
+                    if (!location.isNullOrBlank() && location.contains("okcdn.ru")) {
+                        extractOkVideoId(location)?.let { return it }
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * Extract video from a single URL. Returns true if links were found.
+     */
     private suspend fun extractFromUrl(
         url: String,
         serverName: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
-    ) {
+    ): Boolean {
         when {
-            // test-stream worker - returns JSON with availableQualities
+            // test-stream worker - returns JSON with qualities
             url.contains("test-stream") -> {
-                extractTestStream(url, serverName, subtitleCallback, callback)
+                try {
+                    val responseText = app.get(url, headers = headers).text
+                    val res = parseObject<StreamResponse>(responseText) ?: return false
+                    val qualities = res.availableQualities ?: return false
+                    if (qualities.isEmpty()) return false
+
+                    // Try ok.ru extractor first
+                    val firstUrl = qualities.firstOrNull()?.url ?: return false
+                    val okVideoId = extractOkVideoId(firstUrl)
+                    if (okVideoId != null) {
+                        try {
+                            loadExtractor("https://ok.ru/video/$okVideoId", mainUrl, subtitleCallback, callback)
+                            return true
+                        } catch (_: Exception) {}
+                    }
+
+                    // Fallback: direct links
+                    qualities.forEach { q ->
+                        val qualityStr = q.quality ?: return@forEach
+                        val streamUrl = q.url ?: return@forEach
+                        callback(
+                            newExtractorLink(source = serverName, name = "$serverName - $qualityStr", url = streamUrl, type = INFER_TYPE) {
+                                this.referer = ""
+                                this.quality = getQualityValue(qualityStr)
+                            }
+                        )
+                    }
+                    return true
+                } catch (_: Exception) { return false }
             }
-            // cdnlink worker - returns 302 redirect to okcdn.ru
+
+            // cdnlink worker - 302 redirect to okcdn.ru
             url.contains("cdnlink.developer-pro.workers.dev") -> {
-                extractCdnLink(url, serverName, subtitleCallback, callback)
+                try {
+                    val response = app.get(url, headers = headers)
+                    val finalUrl = response.url
+
+                    if (finalUrl != url && finalUrl.contains("okcdn.ru")) {
+                        val okVideoId = extractOkVideoId(finalUrl)
+                        if (okVideoId != null) {
+                            try {
+                                loadExtractor("https://ok.ru/video/$okVideoId", mainUrl, subtitleCallback, callback)
+                                return true
+                            } catch (_: Exception) {}
+                        }
+                        // Direct link fallback
+                        callback(
+                            newExtractorLink(source = serverName, name = "$serverName - Auto", url = finalUrl, type = INFER_TYPE) {
+                                this.referer = ""
+                            }
+                        )
+                        return true
+                    }
+
+                    // Check Location header
+                    val location = response.headers?.get("location")
+                    if (!location.isNullOrBlank() && location.contains("okcdn.ru")) {
+                        val okVideoId = extractOkVideoId(location)
+                        if (okVideoId != null) {
+                            try {
+                                loadExtractor("https://ok.ru/video/$okVideoId", mainUrl, subtitleCallback, callback)
+                                return true
+                            } catch (_: Exception) {}
+                        }
+                    }
+                } catch (_: Exception) {}
+                return false
             }
-            // Other developer-pro workers
-            url.contains("link.developer-pro.workers.dev") ||
-            url.contains("linkcdn.developer-pro.workers.dev") -> {
-                extractWorkerLink(url, serverName, subtitleCallback, callback)
-            }
-            // apps-anime workers
-            url.contains("apps-anime.workers.dev") -> {
-                extractWorkerLink(url, serverName, subtitleCallback, callback)
-            }
-            // Google Photos
+
+            // Google Photos - use CloudStream's built-in extractor
             url.contains("photos.google.com") -> {
-                extractGooglePhotos(url, serverName, callback)
+                try {
+                    loadExtractor(url, mainUrl, subtitleCallback, callback)
+                    return true
+                } catch (_: Exception) { return false }
             }
+
             // Direct video URLs
             url.contains(".mp4") || url.contains(".m3u8") -> {
                 val quality = getQualityFromUrl(url)
                 callback(
-                    newExtractorLink(
-                        source = serverName,
-                        name = "$serverName - $quality",
-                        url = url,
-                        type = if (url.contains(".m3u8")) INFER_TYPE else ExtractorLinkType.VIDEO
-                    ) {
+                    newExtractorLink(source = serverName, name = "$serverName - $quality", url = url,
+                        type = if (url.contains(".m3u8")) INFER_TYPE else ExtractorLinkType.VIDEO) {
                         this.referer = mainUrl
-                        this.headers = headers
                         this.quality = getQualityValue(quality)
                     }
                 )
+                return true
             }
-            // ok.ru page - use CloudStream built-in extractor
-            url.contains("ok.ru") -> {
-                try {
-                    loadExtractor(url, mainUrl, subtitleCallback, callback)
-                } catch (_: Exception) {}
-            }
-            // Other video hosts - use CloudStream built-in extractors
+
+            // ok.ru or other known hosts - use built-in extractor
             else -> {
                 try {
                     loadExtractor(url, mainUrl, subtitleCallback, callback)
-                } catch (_: Exception) {}
+                    return true
+                } catch (_: Exception) { return false }
             }
         }
     }
 
-    /**
-     * Extract ok.ru video ID from an okcdn.ru CDN URL.
-     * okcdn.ru URLs have an "id" parameter which is the ok.ru video ID.
-     * Example: https://vd436.okcdn.ru/?...&id=7455078484594
-     * This ID can be used with the ok.ru page URL: https://ok.ru/video/7455078484594
-     */
-    private fun extractOkVideoId(okcdnUrl: String): String? {
-        val idParam = okcdnUrl.substringAfter("id=", "")
-            .substringBefore("&")
-            .substringBefore(" ")
-            .substringBefore("\r")
-            .substringBefore("\n")
-            .trim()
-        return idParam.takeIf { it.isNotEmpty() && it.all { c -> c.isDigit() } }
+    private fun getQualityFromUrl(url: String): String = when {
+        url.contains("1080") -> "1080p"
+        url.contains("720") -> "720p"
+        url.contains("480") -> "480p"
+        url.contains("360") -> "360p"
+        url.contains("240") -> "240p"
+        else -> "Auto"
     }
 
-    /**
-     * test-stream worker returns JSON:
-     * {"availableQualities": [{"quality":"1080p","url":"https://vd436.okcdn.ru/...&id=XXXX"}, ...]}
-     *
-     * Strategy: Extract the ok.ru video ID from the first quality URL,
-     * then use CloudStream's built-in ok.ru extractor with the page URL.
-     */
-    private suspend fun extractTestStream(
-        url: String,
-        serverName: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        try {
-            val responseText = app.get(url, headers = headers).text
-            val res = parseObject<StreamResponse>(responseText) ?: return
-            val qualities = res.availableQualities ?: return
-
-            if (qualities.isEmpty()) return
-
-            // Extract ok.ru video ID from the first available URL
-            val firstUrl = qualities.firstOrNull()?.url ?: return
-            val okVideoId = extractOkVideoId(firstUrl)
-
-            if (okVideoId != null) {
-                // Use CloudStream's built-in ok.ru extractor
-                val okUrl = "https://ok.ru/video/$okVideoId"
-                try {
-                    loadExtractor(okUrl, mainUrl, subtitleCallback, callback)
-                    return
-                } catch (_: Exception) {}
-            }
-
-            // Fallback: try each quality URL as a direct link
-            qualities.forEach { q ->
-                val qualityStr = q.quality ?: return@forEach
-                val streamUrl = q.url ?: return@forEach
-
-                callback(
-                    newExtractorLink(
-                        source = serverName,
-                        name = "$serverName - $qualityStr",
-                        url = streamUrl,
-                        type = INFER_TYPE
-                    ) {
-                        this.referer = ""
-                        this.quality = getQualityValue(qualityStr)
-                    }
-                )
-            }
-        } catch (_: Exception) {}
-    }
-
-    /**
-     * cdnlink worker returns 302 redirect to okcdn.ru.
-     * Strategy: Follow the redirect, extract the ok.ru video ID from the final URL,
-     * then use CloudStream's built-in ok.ru extractor.
-     */
-    private suspend fun extractCdnLink(
-        url: String,
-        serverName: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        try {
-            // Follow the redirect - cdnlink returns 302 to okcdn.ru
-            val response = app.get(url, headers = headers)
-            val finalUrl = response.url
-
-            if (finalUrl != url && finalUrl.isNotEmpty()) {
-                // Got redirected
-                if (finalUrl.contains("okcdn.ru")) {
-                    // Extract ok.ru video ID and use the extractor
-                    val okVideoId = extractOkVideoId(finalUrl)
-                    if (okVideoId != null) {
-                        val okUrl = "https://ok.ru/video/$okVideoId"
-                        try {
-                            loadExtractor(okUrl, mainUrl, subtitleCallback, callback)
-                            return
-                        } catch (_: Exception) {}
-                    }
-                    // Fallback: pass as direct link
-                    callback(
-                        newExtractorLink(
-                            source = serverName,
-                            name = "$serverName - Auto",
-                            url = finalUrl,
-                            type = INFER_TYPE
-                        ) {
-                            this.referer = ""
-                        }
-                    )
-                    return
-                } else {
-                    // Redirected to something other than okcdn.ru
-                    extractFromUrl(finalUrl, serverName, subtitleCallback, callback)
-                    return
-                }
-            }
-
-            // No redirect detected - try parsing as JSON
-            val streamRes = parseObject<StreamResponse>(response.text)
-            if (streamRes?.availableQualities?.isNotEmpty() == true) {
-                val firstUrl = streamRes.availableQualities.firstOrNull()?.url ?: return
-                val okVideoId = extractOkVideoId(firstUrl)
-                if (okVideoId != null) {
-                    val okUrl = "https://ok.ru/video/$okVideoId"
-                    try {
-                        loadExtractor(okUrl, mainUrl, subtitleCallback, callback)
-                        return
-                    } catch (_: Exception) {}
-                }
-                // Fallback: direct links
-                streamRes.availableQualities.forEach { q ->
-                    val qualityStr = q.quality ?: return@forEach
-                    val streamUrl = q.url ?: return@forEach
-                    callback(
-                        newExtractorLink(
-                            source = serverName,
-                            name = "$serverName - $qualityStr",
-                            url = streamUrl,
-                            type = INFER_TYPE
-                        ) {
-                            this.referer = ""
-                            this.quality = getQualityValue(qualityStr)
-                        }
-                    )
-                }
-            }
-        } catch (_: Exception) {}
-    }
-
-    /**
-     * Generic worker link handler for link/linkcdn/apps-anime workers.
-     */
-    private suspend fun extractWorkerLink(
-        url: String,
-        serverName: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        try {
-            val response = app.get(url, headers = headers)
-
-            // Try parsing as JSON with availableQualities
-            val streamRes = parseObject<StreamResponse>(response.text)
-            if (streamRes?.availableQualities?.isNotEmpty() == true) {
-                val firstUrl = streamRes.availableQualities.firstOrNull()?.url ?: return
-                val okVideoId = extractOkVideoId(firstUrl)
-                if (okVideoId != null) {
-                    val okUrl = "https://ok.ru/video/$okVideoId"
-                    try {
-                        loadExtractor(okUrl, mainUrl, subtitleCallback, callback)
-                        return
-                    } catch (_: Exception) {}
-                }
-                // Fallback
-                streamRes.availableQualities.forEach { q ->
-                    val qualityStr = q.quality ?: return@forEach
-                    val streamUrl = q.url ?: return@forEach
-                    callback(
-                        newExtractorLink(
-                            source = serverName,
-                            name = "$serverName - $qualityStr",
-                            url = streamUrl,
-                            type = INFER_TYPE
-                        ) {
-                            this.referer = mainUrl
-                            this.quality = getQualityValue(qualityStr)
-                        }
-                    )
-                }
-                return
-            }
-
-            // Check if redirected
-            val finalUrl = response.url
-            if (finalUrl != url && finalUrl.isNotEmpty()) {
-                extractFromUrl(finalUrl, serverName, subtitleCallback, callback)
-                return
-            }
-
-            // Try to find direct video URL in the response text
-            val text = response.text
-            val m3u8Regex = Regex("https?://[^\"'\\s]+\\.m3u8[^\"'\\s]*")
-            val mp4Regex = Regex("https?://[^\"'\\s]+\\.mp4[^\"'\\s]*")
-
-            m3u8Regex.find(text)?.value?.let { streamUrl ->
-                callback(
-                    newExtractorLink(source = serverName, name = "$serverName - Auto", url = streamUrl, type = INFER_TYPE) {
-                        this.referer = mainUrl
-                    }
-                )
-                return
-            }
-
-            mp4Regex.find(text)?.value?.let { streamUrl ->
-                callback(
-                    newExtractorLink(source = serverName, name = "$serverName - Auto", url = streamUrl, type = ExtractorLinkType.VIDEO) {
-                        this.referer = mainUrl
-                    }
-                )
-                return
-            }
-        } catch (_: Exception) {}
-    }
-
-    /**
-     * Google Photos - extract video URL from the shared photo page.
-     */
-    private suspend fun extractGooglePhotos(
-        url: String,
-        serverName: String,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        try {
-            val doc = app.get(url, headers = headers).document
-            val html = doc.toString()
-
-            val patterns = listOf(
-                Regex("https?://[^\"'\\s]+?googleusercontent\\.com/[^\"'\\s]+?(?:mp4|m3u8)[^\"'\\s]*"),
-                Regex("https?://[^\"'\\s]+?googlevideo\\.com/[^\"'\\s]+?(?:mp4|m3u8)[^\"'\\s]*"),
-                Regex("\"(https://lh3\\.[^\"']+)\""),
-                Regex("\"(https://video\\.google\\.com/[^\"']+)\"")
-            )
-
-            for (pattern in patterns) {
-                pattern.findAll(html).map { it.groupValues.last() }.distinct().forEach { videoUrl ->
-                    callback(
-                        newExtractorLink(
-                            source = "$serverName (GP)",
-                            name = "$serverName - Google Photos",
-                            url = videoUrl,
-                            type = INFER_TYPE
-                        ) {
-                            this.referer = "https://photos.google.com/"
-                        }
-                    )
-                }
-            }
-        } catch (_: Exception) {}
-    }
-
-    private fun getQualityFromUrl(url: String): String {
-        return when {
-            url.contains("1080") -> "1080p"
-            url.contains("720") -> "720p"
-            url.contains("480") -> "480p"
-            url.contains("360") -> "360p"
-            url.contains("240") -> "240p"
-            else -> "Auto"
-        }
-    }
-
-    private fun getQualityValue(quality: String): Int {
-        return when {
-            quality.contains("1080") -> Qualities.P1080.value
-            quality.contains("720") -> Qualities.P720.value
-            quality.contains("480") -> Qualities.P480.value
-            quality.contains("360") -> Qualities.P360.value
-            quality.contains("240") -> Qualities.P240.value
-            else -> Qualities.Unknown.value
-        }
+    private fun getQualityValue(quality: String): Int = when {
+        quality.contains("1080") -> Qualities.P1080.value
+        quality.contains("720") -> Qualities.P720.value
+        quality.contains("480") -> Qualities.P480.value
+        quality.contains("360") -> Qualities.P360.value
+        quality.contains("240") -> Qualities.P240.value
+        else -> Qualities.Unknown.value
     }
 }
