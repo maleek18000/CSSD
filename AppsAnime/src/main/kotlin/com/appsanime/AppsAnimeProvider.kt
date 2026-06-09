@@ -50,7 +50,13 @@ data class Episode(
     @JsonProperty("jResolver3") val jResolver3: Any? = null,
     @JsonProperty("jResolver4") val jResolver4: Any? = null,
     @JsonProperty("jResolver5") val jResolver5: Any? = null,
-    @JsonProperty("playlist_id") val playlistId: Any? = null
+    @JsonProperty("playlist_id") val playlistId: Any? = null,
+    @JsonProperty("story") val story: String? = null,
+    @JsonProperty("category") val category: String? = null,
+    @JsonProperty("world_rate") val worldRate: String? = null,
+    @JsonProperty("view_date") val viewDate: String? = null,
+    @JsonProperty("age_rate") val ageRate: String? = null,
+    @JsonProperty("status") val status: String? = null
 ) {
     fun getIdString(): String = when (id) {
         is Number -> id.toString()
@@ -250,10 +256,26 @@ class AppsAnimeProvider : MainAPI() {
 
     // ==================== Load Detail ====================
 
+    /**
+     * Determine if a playlist is a movie based on:
+     * - Playlist title contains "فيلم" (movie in Arabic)
+     * - OR it has only 1 episode AND the episode title doesn't look like a series episode
+     */
+    private fun isPlaylistMovie(playlist: Playlist, episodeCount: Int): Boolean {
+        // If playlist title contains "فيلم" (movie), it's definitely a movie
+        if (playlist.title?.contains("فيلم") == true) return true
+        // If playlist title contains "الجزء" or "الموسم" (season/part), it's a series
+        if (playlist.title?.contains("الجزء") == true || playlist.title?.contains("الموسم") == true) return false
+        // If there's only 1 episode and the title doesn't contain "الحلقة" or "Episode", likely a movie
+        if (episodeCount == 1) return true
+        // Multiple episodes = series
+        return false
+    }
+
     override suspend fun load(url: String): LoadResponse? {
         val cartoonId = url.substringAfterLast("/")
 
-        // Fetch playlists - gives us the cartoon structure (seasons/parts)
+        // Step 1: Fetch playlists (seasons/parts)
         val playlistsText = app.post(
             "$apiUrl/playlist/read.php",
             headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
@@ -263,34 +285,10 @@ class AppsAnimeProvider : MainAPI() {
 
         if (playlists.isEmpty()) return null
 
-        // Get cartoon info - we need type to distinguish movies from series
-        val cartoonInfo = fetchCartoonInfo(cartoonId, playlists)
-        val title = cartoonInfo.title ?: return null
-        val poster = cartoonInfo.thumb
-        val scoreValue = Score.from10(cartoonInfo.worldRate)
-        val categories = cartoonInfo.category?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
-
-        // type="2" = film, type="1" = series
-        // Also check if ALL playlist titles contain "فيلم" (movie) as secondary indicator
-        val isMovie = cartoonInfo.type == "2" ||
-            playlists.all { it.title?.contains("فيلم") == true }
-
-        if (isMovie) {
-            val playlistId = playlists.firstOrNull()?.id ?: return null
-            val linkData = MovieLinkData(
-                cartoonId = cartoonId,
-                playlistId = playlistId
-            )
-            return newMovieLoadResponse(title, url, TvType.Movie, linkData.toJson()) {
-                this.posterUrl = poster
-                this.score = scoreValue
-                this.tags = categories
-                plot = buildPlot(cartoonInfo)
-            }
-        }
-
-        // TV Series - fetch episodes for each playlist (season)
-        val tvEpisodes = mutableListOf<Episode>()
+        // Step 2: Fetch episodes for ALL playlists at once
+        // We also extract rating/category from the first episode
+        val playlistEpisodes = mutableMapOf<String, List<Episode>>()
+        var firstEpisodeInfo: Episode? = null
 
         for (playlist in playlists) {
             val playlistId = playlist.id ?: continue
@@ -301,13 +299,56 @@ class AppsAnimeProvider : MainAPI() {
                     data = mapOf("playlist_id" to playlistId)
                 ).text
                 val eps = parseList<Episode>(epsText)
-                tvEpisodes.addAll(eps)
+                playlistEpisodes[playlistId] = eps
+                if (firstEpisodeInfo == null && eps.isNotEmpty()) {
+                    firstEpisodeInfo = eps.first()
+                }
             } catch (_: Exception) {}
         }
 
-        if (tvEpisodes.isEmpty()) return null
+        // Determine if this is a movie or series
+        // Use the first playlist to decide
+        val firstPlaylist = playlists.first()
+        val firstPlaylistEps = playlistEpisodes[firstPlaylist.id] ?: emptyList()
+        val isMovie = isPlaylistMovie(firstPlaylist, firstPlaylistEps.size)
 
-        val episodes = tvEpisodes.mapIndexed { idx, ep ->
+        // Build title and poster from playlist data
+        val title = firstPlaylist.title
+            ?.trim()
+            ?: "Anime #$cartoonId"
+        val poster = firstPlaylist.thumb
+        val scoreValue = Score.from10(firstEpisodeInfo?.worldRate)
+        val categories = firstEpisodeInfo?.category?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
+            ?: emptyList()
+
+        // Build plot from episode data
+        val plot = buildPlotFromEpisode(firstEpisodeInfo)
+
+        if (isMovie) {
+            // Movie: use first playlist, first episode
+            val playlistId = firstPlaylist.id ?: return null
+            val linkData = MovieLinkData(
+                cartoonId = cartoonId,
+                playlistId = playlistId
+            )
+            return newMovieLoadResponse(title, url, TvType.Movie, linkData.toJson()) {
+                this.posterUrl = poster
+                this.score = scoreValue
+                this.tags = categories
+                this.plot = plot
+            }
+        }
+
+        // TV Series: build episodes list from all playlists
+        val allEpisodes = mutableListOf<Episode>()
+        for (playlist in playlists) {
+            val eps = playlistEpisodes[playlist.id] ?: continue
+            allEpisodes.addAll(eps)
+        }
+
+        if (allEpisodes.isEmpty()) return null
+
+        val episodes = allEpisodes.mapIndexed { idx, ep ->
             val epId = ep.getIdString()
             val pId = ep.getPlaylistIdString().ifEmpty { playlists.firstOrNull()?.id ?: "" }
             val linkData = EpisodeLinkData(
@@ -330,33 +371,22 @@ class AppsAnimeProvider : MainAPI() {
             }
         }
 
-        val classificationTag = when (cartoonInfo.classification) {
-            "1" -> "مدبلج"
-            "2" -> "مترجم"
-            else -> ""
-        }
-        val displayTitle = if (classificationTag.isNotEmpty()) "$title ($classificationTag)" else title
-
-        return newTvSeriesLoadResponse(displayTitle, url, TvType.TvSeries, episodes) {
+        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             this.posterUrl = poster
             this.score = scoreValue
             this.tags = categories
-            plot = buildPlot(cartoonInfo)
+            this.plot = plot
         }
     }
 
-    private fun buildPlot(info: CartoonWithInfo): String {
+    private fun buildPlotFromEpisode(ep: Episode?): String {
+        if (ep == null) return ""
         val parts = mutableListOf<String>()
-        info.classification?.let {
-            parts.add(if (it == "1") "مدبلج" else "مترجم")
-        }
-        info.viewDate?.let { parts.add(it) }
-        info.status?.let {
-            parts.add(if (it == "1") "مكتمل" else "مستمر")
-        }
-        info.worldRate?.let { parts.add("التقييم: $it") }
-        info.watchedUsers?.let { parts.add("المشاهدات: $it") }
-        info.category?.let { parts.add("التصنيفات: $it") }
+        ep.viewDate?.takeIf { it.isNotEmpty() }?.let { parts.add(it) }
+        ep.status?.takeIf { it == "1" }?.let { parts.add("مكتمل") }
+        ep.status?.takeIf { it == "2" }?.let { parts.add("مستمر") }
+        ep.worldRate?.takeIf { it.isNotEmpty() }?.let { parts.add("التقييم: $it") }
+        ep.category?.takeIf { it.isNotEmpty() }?.let { parts.add("التصنيفات: $it") }
         return parts.joinToString(" | ")
     }
 
@@ -365,54 +395,6 @@ class AppsAnimeProvider : MainAPI() {
         Regex("(?:Episode|Ep\\.?)\\s*(\\d+)", RegexOption.IGNORE_CASE).find(title)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
         Regex("^(\\d+)$").find(title.trim())?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
         return null
-    }
-
-    private suspend fun fetchCartoonInfo(cartoonId: String, playlists: List<Playlist>): CartoonWithInfo {
-        // Try to get info from the most viewed list
-        try {
-            val text = app.get(
-                "$apiUrl/cartoon_with_info/getMostViewedCartoons.php",
-                headers = authHeaders
-            ).text
-            val items = parseList<CartoonWithInfo>(text)
-            items.find { it.id == cartoonId }?.let { return it }
-        } catch (_: Exception) {}
-
-        // Try searching for the cartoon using playlist title
-        val searchTitle = playlists.firstOrNull()?.title
-            ?.replace(Regex("الجزء\\s*\\d+"), "")
-            ?.replace(Regex("الموسم\\s*\\d+"), "")
-            ?.trim()
-        if (!searchTitle.isNullOrBlank()) {
-            try {
-                for (classification in listOf("1", "2")) {
-                    for (type in listOf("1", "2")) {
-                        try {
-                            val text = app.get(
-                                "$apiUrl/cartoon_with_info/searchCartoon.php",
-                                params = mapOf("search" to searchTitle, "type" to type, "classification" to classification),
-                                headers = authHeaders
-                            ).text
-                            val items = parseList<CartoonWithInfo>(text)
-                            items.find { it.id == cartoonId }?.let { return it }
-                        } catch (_: Exception) {}
-                    }
-                }
-            } catch (_: Exception) {}
-        }
-
-        // Fallback: infer type from playlist info
-        val isInferredMovie = playlists.all { it.title?.contains("فيلم") == true }
-
-        return CartoonWithInfo(
-            id = cartoonId,
-            title = playlists.firstOrNull()?.title
-                ?.replace(Regex("الجزء\\s*\\d+"), "")
-                ?.replace(Regex("الموسم\\s*\\d+"), "")
-                ?.trim() ?: "Anime #$cartoonId",
-            type = if (isInferredMovie) "2" else "1",
-            thumb = playlists.firstOrNull()?.thumb
-        )
     }
 
     // ==================== Video Extraction ====================
@@ -537,12 +519,10 @@ class AppsAnimeProvider : MainAPI() {
     ) {
         when {
             // test-stream worker - returns JSON with availableQualities
-            // Each quality entry has a okcdn.ru URL which contains the ok.ru video ID
             url.contains("test-stream") -> {
                 extractTestStream(url, serverName, subtitleCallback, callback)
             }
             // cdnlink worker - returns 302 redirect to okcdn.ru
-            // Extract ok.ru video ID from the redirect URL
             url.contains("cdnlink.developer-pro.workers.dev") -> {
                 extractCdnLink(url, serverName, subtitleCallback, callback)
             }
@@ -600,6 +580,8 @@ class AppsAnimeProvider : MainAPI() {
         val idParam = okcdnUrl.substringAfter("id=", "")
             .substringBefore("&")
             .substringBefore(" ")
+            .substringBefore("\r")
+            .substringBefore("\n")
             .trim()
         return idParam.takeIf { it.isNotEmpty() && it.all { c -> c.isDigit() } }
     }
@@ -638,7 +620,6 @@ class AppsAnimeProvider : MainAPI() {
             }
 
             // Fallback: try each quality URL as a direct link
-            // (okcdn.ru URLs are IP-restricted but may work on the user's device)
             qualities.forEach { q ->
                 val qualityStr = q.quality ?: return@forEach
                 val streamUrl = q.url ?: return@forEach
