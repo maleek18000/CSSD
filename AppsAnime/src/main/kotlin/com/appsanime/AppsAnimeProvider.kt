@@ -100,9 +100,18 @@ data class StreamResponse(
     @JsonProperty("availableQualities") val availableQualities: List<VideoQuality>? = null
 )
 
-// Link data stores raw video URLs from the episode - resolved in loadLinks()
+data class AgentsCookies(
+    @JsonProperty("oKru_Agent") val okRuAgent: String? = null,
+    @JsonProperty("okRu_Cookie") val okRuCookie: String? = null,
+    @JsonProperty("gPhotos_Agent") val gPhotosAgent: String? = null,
+    @JsonProperty("gPhotos_Cookie") val gPhotosCookie: String? = null,
+    @JsonProperty("MF_Agent") val mfAgent: String? = null,
+    @JsonProperty("MF_Cookie") val mfCookie: String? = null
+)
+
+// Link data stores raw video URLs and jResolver flags from the episode
 data class LinkData(
-    val videoUrls: Map<String, String>  // server name -> raw URL from API
+    val videoUrls: Map<String, Pair<String, Boolean>>  // server name -> (raw URL, needsExtraction)
 )
 
 // ==================== Provider ====================
@@ -159,24 +168,43 @@ class AppsAnimeProvider : MainAPI() {
 
     // ==================== Helpers ====================
 
-    private fun extractOkVideoId(okcdnUrl: String): String? {
-        val idParam = okcdnUrl.substringAfter("id=", "")
-            .substringBefore("&")
-            .substringBefore(" ")
-            .substringBefore("\r")
-            .substringBefore("\n")
-            .trim()
-        return idParam.takeIf { it.isNotEmpty() && it.all { c -> c.isDigit() } }
+    /**
+     * Convert jResolver value to Boolean.
+     * jResolver=1 means the URL needs extraction (Google Photos, ok.ru page, etc.)
+     * jResolver="" or jResolver=0 means the URL is direct-play or redirect-only
+     */
+    private fun needsExtraction(jResolver: Any?): Boolean {
+        return when (jResolver) {
+            is Number -> jResolver.toInt() == 1
+            is String -> jResolver.trim() == "1"
+            else -> false
+        }
     }
 
-    private fun collectVideoUrls(episode: Episode): Map<String, String> {
-        val videos = mutableMapOf<String, String>()
-        episode.video?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 1"] = it }
-        episode.video1?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 2"] = it }
-        episode.video2?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 3"] = it }
-        episode.video3?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 4"] = it }
-        episode.video4?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 5"] = it }
-        episode.video5?.trim()?.takeIf { it.isNotEmpty() }?.let { videos["سيرفر 6"] = it }
+    /**
+     * Collect video URLs and their jResolver flags from an episode.
+     * Returns map of server name -> (URL, needsExtraction)
+     */
+    private fun collectVideoUrls(episode: Episode): Map<String, Pair<String, Boolean>> {
+        val videos = mutableMapOf<String, Pair<String, Boolean>>()
+        episode.video?.trim()?.takeIf { it.isNotEmpty() }?.let {
+            videos["سيرفر 1"] = Pair(it, needsExtraction(episode.jResolver))
+        }
+        episode.video1?.trim()?.takeIf { it.isNotEmpty() }?.let {
+            videos["سيرفر 2"] = Pair(it, needsExtraction(episode.jResolver1))
+        }
+        episode.video2?.trim()?.takeIf { it.isNotEmpty() }?.let {
+            videos["سيرفر 3"] = Pair(it, needsExtraction(episode.jResolver2))
+        }
+        episode.video3?.trim()?.takeIf { it.isNotEmpty() }?.let {
+            videos["سيرفر 4"] = Pair(it, needsExtraction(episode.jResolver3))
+        }
+        episode.video4?.trim()?.takeIf { it.isNotEmpty() }?.let {
+            videos["سيرفر 5"] = Pair(it, needsExtraction(episode.jResolver4))
+        }
+        episode.video5?.trim()?.takeIf { it.isNotEmpty() }?.let {
+            videos["سيرفر 6"] = Pair(it, needsExtraction(episode.jResolver5))
+        }
         return videos
     }
 
@@ -192,6 +220,480 @@ class AppsAnimeProvider : MainAPI() {
         Regex("(?:Episode|Ep\\.?)\\s*(\\d+)", RegexOption.IGNORE_CASE).find(title)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
         Regex("^(\\d+)$").find(title.trim())?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
         return null
+    }
+
+    /**
+     * Fetch agents and cookies from the API.
+     * These are needed for Google Photos and ok.ru extraction.
+     */
+    private suspend fun fetchAgentsAndCookies(): AgentsCookies? {
+        return try {
+            val text = app.post(
+                "$apiUrl/AgentsAndCookies/getData.php",
+                headers = authHeaders
+            ).text
+            parseObject<AgentsCookies>(text)
+        } catch (_: Exception) { null }
+    }
+
+    // ==================== Video Extraction ====================
+
+    /**
+     * Extract video URLs from a workers.dev URL (test-stream, cdnlink, link, etc.)
+     * All workers.dev URLs require Basic Auth.
+     * 
+     * The APK uses the same OkHttp client (with Basic Auth interceptor) for all workers.dev URLs.
+     * - test-stream workers return JSON with availableQualities
+     * - cdnlink/link workers return 302 redirects to CDN URLs (okcdn.ru/vkuser.net)
+     * - Some workers return JSON arrays
+     * 
+     * CDN URLs (okcdn.ru/vkuser.net) are IP-restricted but should work from the user's device
+     * because the worker sets srcIp based on the request's CF-Connecting-IP header.
+     */
+    private suspend fun extractWorkerUrl(
+        url: String,
+        serverName: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        try {
+            val response = app.get(url, headers = authHeaders)
+            val responseText = response.text
+
+            // Try parsing as JSON object with availableQualities (test-stream format)
+            if (responseText.trim().startsWith("{")) {
+                val streamRes = parseObject<StreamResponse>(responseText)
+                val qualities = streamRes?.availableQualities
+                if (qualities != null && qualities.isNotEmpty()) {
+                    for (q in qualities) {
+                        val qualityStr = q.quality ?: continue
+                        val streamUrl = q.url ?: continue
+                        callback(
+                            newExtractorLink(
+                                source = serverName,
+                                name = "$serverName - $qualityStr",
+                                url = streamUrl,
+                                type = INFER_TYPE
+                            ) {
+                                this.referer = ""
+                                this.quality = getQualityValue(qualityStr)
+                            }
+                        )
+                    }
+                    return true
+                }
+            }
+
+            // Try parsing as JSON array [{url, quality}, ...]
+            if (responseText.trim().startsWith("[")) {
+                try {
+                    val qualityList = parseList<VideoQuality>(responseText)
+                    if (qualityList.isNotEmpty()) {
+                        for (q in qualityList) {
+                            val qualityStr = q.quality ?: continue
+                            val streamUrl = q.url ?: continue
+                            callback(
+                                newExtractorLink(
+                                    source = serverName,
+                                    name = "$serverName - $qualityStr",
+                                    url = streamUrl,
+                                    type = INFER_TYPE
+                                ) {
+                                    this.referer = ""
+                                    this.quality = getQualityValue(qualityStr)
+                                }
+                            )
+                        }
+                        return true
+                    }
+                } catch (_: Exception) {}
+            }
+
+            // If the response URL is different from the request URL, it means a redirect occurred
+            // (cdnlink/link workers redirect to CDN URLs)
+            val finalUrl = response.url
+            if (finalUrl != url && finalUrl.isNotEmpty()) {
+                // The worker redirected to a CDN URL (okcdn.ru/vkuser.net)
+                // These URLs should work from the user's device
+                callback(
+                    newExtractorLink(
+                        source = serverName,
+                        name = "$serverName - تلقائي",
+                        url = finalUrl,
+                        type = INFER_TYPE
+                    ) {
+                        this.referer = ""
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+                return true
+            }
+
+            return false
+        } catch (e: Exception) {
+            // If app.get() fails (e.g., CDN returns 400 from server),
+            // pass the worker URL directly with auth headers so the player can resolve it
+            // from the user's device where the IP should match
+            try {
+                callback(
+                    newExtractorLink(
+                        source = serverName,
+                        name = serverName,
+                        url = url,
+                        type = INFER_TYPE
+                    ) {
+                        this.referer = ""
+                        this.headers = mapOf("Authorization" to getAuthHeader())
+                    }
+                )
+                return true
+            } catch (_: Exception) {
+                return false
+            }
+        }
+    }
+
+    /**
+     * Extract video URLs from a Google Photos share page.
+     * 
+     * The APK fetches the Google Photos page with custom User-Agent and Cookie,
+     * then parses the HTML to find lh3.googleusercontent.com/pw/ URLs with quality
+     * variants (=m18 for 360p/480p, =m22 for 720p, =m37 for 1080p) and
+     * video-downloads.googleusercontent.com URLs for "Original" quality.
+     * 
+     * Since Google Photos pages are often JavaScript-rendered, we first try
+     * CloudStream's built-in extractors, then fall back to custom HTML parsing.
+     */
+    private suspend fun extractGooglePhotos(
+        url: String,
+        serverName: String,
+        agents: AgentsCookies?,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        // First, try CloudStream's built-in extractor
+        try {
+            loadExtractor(url, mainUrl, subtitleCallback = { }, callback = callback)
+            return true
+        } catch (_: Exception) {}
+
+        // Fallback: Custom HTML extraction (mirrors APK's bo0.java logic)
+        try {
+            val gPhotosHeaders = mutableMapOf<String, String>()
+            val agent = agents?.gPhotosAgent?.takeIf { it.isNotEmpty() }
+                ?: "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Mobile Safari/537.36"
+            gPhotosHeaders["User-Agent"] = agent
+            agents?.gPhotosCookie?.takeIf { it.isNotEmpty() }?.let {
+                gPhotosHeaders["Cookie"] = it
+            }
+
+            val pageText = app.get(url, headers = gPhotosHeaders).text
+
+            // Fix malformed percent encoding (from APK's bo0.d pattern)
+            val fixed = Regex("%(?![0-9a-fA-F]{2})").replace(pageText) { "%25" }
+            val decoded = java.net.URLDecoder.decode(fixed, "UTF-8")
+
+            val links = mutableListOf<ExtractorLink>()
+
+            // 1. Extract video-downloads URL (Original quality)
+            val videoDownloadPattern = Regex("""https://video-downloads\.googleusercontent\.com/[^"\\\s]+""")
+            videoDownloadPattern.find(decoded)?.value?.let { videoUrl ->
+                links.add(
+                    newExtractorLink(
+                        source = serverName,
+                        name = "$serverName - Original",
+                        url = videoUrl,
+                        type = INFER_TYPE
+                    ) {
+                        this.referer = ""
+                        this.quality = Qualities.P1080.value
+                    }
+                )
+            }
+
+            // 2. Extract lh3.googleusercontent.com/pw/ base URL
+            val lh3Pattern = Regex("""https://lh3\.googleusercontent\.com/pw/[^"\\\s]+""")
+            var lh3BaseUrl: String? = null
+            for (match in lh3Pattern.findAll(decoded)) {
+                val foundUrl = match.value
+                // Prefer URLs without quality suffixes
+                if (!foundUrl.contains("=s") && !foundUrl.contains("=w") &&
+                    !foundUrl.contains("=d") && !foundUrl.contains("=m") && !foundUrl.contains("=h")) {
+                    lh3BaseUrl = foundUrl
+                    break
+                }
+            }
+            if (lh3BaseUrl == null) {
+                lh3Pattern.find(decoded)?.value?.let { rawUrl ->
+                    val lastEqIndex = rawUrl.lastIndexOf('=')
+                    lh3BaseUrl = if (lastEqIndex > 0) rawUrl.substring(0, lastEqIndex) else rawUrl
+                }
+            }
+
+            // 3. Check for quality arrays in the page [itag,width,height]
+            val qualityArrayPattern = Regex("""\[(\d+),(\d+),(\d+)\]""")
+            val availableQualities = mutableSetOf<Int>()
+            qualityArrayPattern.findAll(decoded).forEach { match ->
+                val itag = match.groupValues[1].toIntOrNull() ?: return@forEach
+                if (itag == 18 || itag == 22 || itag == 37) {
+                    availableQualities.add(itag)
+                }
+            }
+
+            // 4. Generate quality URLs from lh3 base URL
+            if (lh3BaseUrl != null && availableQualities.isNotEmpty()) {
+                data class QualityInfo(val itag: Int, val suffix: String, val qualityName: String, val qualityValue: Int)
+                val qualityMap = listOf(
+                    QualityInfo(18, "=m18", "480p", Qualities.P480.value),
+                    QualityInfo(22, "=m22", "720p", Qualities.P720.value),
+                    QualityInfo(37, "=m37", "1080p", Qualities.P1080.value)
+                )
+                for (qi in qualityMap) {
+                    if (availableQualities.contains(qi.itag)) {
+                        val qualityUrl = lh3BaseUrl!! + qi.suffix
+                        links.add(
+                            newExtractorLink(
+                                source = serverName,
+                                name = "$serverName - ${qi.qualityName}",
+                                url = qualityUrl,
+                                type = INFER_TYPE
+                            ) {
+                                this.referer = ""
+                                this.quality = qi.qualityValue
+                            }
+                        )
+                    }
+                }
+            }
+
+            // 5. If no quality arrays found but we have lh3 base URL, try common qualities
+            if (lh3BaseUrl != null && availableQualities.isEmpty() && links.isEmpty()) {
+                data class SimpleQuality(val suffix: String, val qualityName: String, val qualityValue: Int)
+                for (sq in listOf(
+                    SimpleQuality("=m22", "720p", Qualities.P720.value),
+                    SimpleQuality("=m37", "1080p", Qualities.P1080.value),
+                    SimpleQuality("=m18", "480p", Qualities.P480.value)
+                )) {
+                    links.add(
+                        newExtractorLink(
+                            source = serverName,
+                            name = "$serverName - ${sq.qualityName}",
+                            url = lh3BaseUrl!! + sq.suffix,
+                            type = INFER_TYPE
+                        ) {
+                            this.referer = ""
+                            this.quality = sq.qualityValue
+                        }
+                    )
+                }
+            }
+
+            for (link in links) {
+                callback(link)
+            }
+            return links.isNotEmpty()
+        } catch (_: Exception) {
+            return false
+        }
+    }
+
+    /**
+     * Extract video from an ok.ru video page URL.
+     * The APK uses the ok.ru metadata API:
+     * POST https://ok.ru/dk?cmd=videoPlayerMetadata&mid={id}
+     * 
+     * We try CloudStream's built-in ok.ru extractor first.
+     */
+    private suspend fun extractOkRu(
+        url: String,
+        serverName: String,
+        agents: AgentsCookies?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        // Try CloudStream's built-in ok.ru extractor
+        try {
+            loadExtractor(url, mainUrl, subtitleCallback, callback)
+            return true
+        } catch (_: Exception) {}
+
+        // Fallback: Use ok.ru metadata API (as in the APK)
+        try {
+            // Extract video ID from URL
+            val videoId = Regex("""ok\.ru/video(?:embed)?/(\d+)""").find(url)?.groupValues?.get(1)
+                ?: return false
+
+            val userAgent = agents?.okRuAgent?.takeIf { it.isNotEmpty() }
+                ?: System.getProperty("http.agent")
+                ?: "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Mobile Safari/537.36"
+
+            val cookie = agents?.okRuCookie?.takeIf { it.isNotEmpty() } ?: ""
+
+            // POST to ok.ru metadata API
+            val metadataUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
+            val metaResponse = app.post(
+                metadataUrl,
+                headers = mapOf(
+                    "User-Agent" to userAgent,
+                    "Cookie" to cookie,
+                    "Content-Type" to "application/x-www-form-urlencoded"
+                ),
+                data = mapOf("" to "")
+            ).text
+
+            // Parse the response to get HLS manifest URL
+            val metadata = mapper.readTree(metaResponse)
+            val hlsUrl = metadata?.get("ondemandHls")?.asText()
+
+            if (hlsUrl != null && hlsUrl.isNotEmpty()) {
+                // Fetch the HLS manifest and parse quality variants
+                val hlsResponse = app.get(
+                    hlsUrl,
+                    headers = mapOf(
+                        "User-Agent" to userAgent,
+                        "Cookie" to cookie
+                    )
+                ).text
+
+                // Parse HLS manifest
+                val lines = hlsResponse.lines()
+                var foundAny = false
+                for (i in lines.indices) {
+                    val line = lines[i]
+                    if (line.startsWith("#EXT-X-STREAM-INF:")) {
+                        val resolution = Regex("RESOLUTION=(\\d+x\\d+)").find(line)?.groupValues?.get(1)
+                        val bandwidth = Regex("BANDWIDTH=(\\d+)").find(line)?.groupValues?.get(1)
+                        // Next line is the URL
+                        if (i + 1 < lines.size) {
+                            val streamUrl = lines[i + 1].trim()
+                            if (streamUrl.isNotEmpty() && !streamUrl.startsWith("#")) {
+                                val qualityLabel = resolution?.let { res ->
+                                    val height = res.substringAfter("x")
+                                    "${height}p"
+                                } ?: bandwidth?.let { "Auto" } ?: "Auto"
+                                
+                                callback(
+                                    newExtractorLink(
+                                        source = serverName,
+                                        name = "$serverName - $qualityLabel",
+                                        url = streamUrl,
+                                        type = INFER_TYPE
+                                    ) {
+                                        this.referer = ""
+                                        this.quality = getQualityValue(qualityLabel)
+                                    }
+                                )
+                                foundAny = true
+                            }
+                        }
+                    }
+                }
+                return foundAny
+            }
+        } catch (_: Exception) {}
+
+        return false
+    }
+
+    /**
+     * Extract video from a URL based on its type.
+     * This mirrors the APK's ServersActivity.x() method which dispatches based on URL pattern.
+     */
+    private suspend fun extractFromUrl(
+        url: String,
+        serverName: String,
+        needsExtraction: Boolean,
+        agents: AgentsCookies?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val cleanUrl = url.trim()
+
+        // 1. Workers.dev URLs - ALL require Basic Auth
+        // This includes: test-stream, cdnlink, link, linkcdn, multiplecdnqualities, etc.
+        if (cleanUrl.contains(".workers.dev/")) {
+            return extractWorkerUrl(cleanUrl, serverName, callback)
+        }
+
+        // 2. Google Photos URLs
+        if (cleanUrl.contains("photos.google.com")) {
+            return extractGooglePhotos(cleanUrl, serverName, agents, callback)
+        }
+
+        // 3. ok.ru video URLs
+        if (cleanUrl.contains("ok.ru/video") || cleanUrl.contains("ok.ru/videoembed")) {
+            return extractOkRu(cleanUrl, serverName, agents, subtitleCallback, callback)
+        }
+
+        // 4. Direct video URLs (mp4, m3u8)
+        if (cleanUrl.contains(".mp4") || cleanUrl.contains(".m3u8")) {
+            val quality = getQualityFromUrl(cleanUrl)
+            callback(
+                newExtractorLink(
+                    source = serverName,
+                    name = "$serverName - $quality",
+                    url = cleanUrl,
+                    type = if (cleanUrl.contains(".m3u8")) INFER_TYPE else ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = mainUrl
+                    this.quality = getQualityValue(quality)
+                }
+            )
+            return true
+        }
+
+        // 5. CDN URLs (okcdn.ru, vkuser.net) - pass directly, they should work from user's device
+        if (cleanUrl.contains("okcdn.ru") || cleanUrl.contains("vkuser.net")) {
+            callback(
+                newExtractorLink(
+                    source = serverName,
+                    name = "$serverName - تلقائي",
+                    url = cleanUrl,
+                    type = INFER_TYPE
+                ) {
+                    this.referer = ""
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+            return true
+        }
+
+        // 6. Google CDN URLs (lh3.googleusercontent.com)
+        if (cleanUrl.contains("googleusercontent.com")) {
+            callback(
+                newExtractorLink(
+                    source = serverName,
+                    name = serverName,
+                    url = cleanUrl,
+                    type = INFER_TYPE
+                ) {
+                    this.referer = ""
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+            return true
+        }
+
+        // 7. Unknown URL - try CloudStream's built-in extractor first, then direct link
+        try {
+            loadExtractor(cleanUrl, mainUrl, subtitleCallback, callback)
+            return true
+        } catch (_: Exception) {}
+
+        // 8. Last resort: pass as direct link
+        try {
+            callback(
+                newExtractorLink(
+                    source = serverName,
+                    name = serverName,
+                    url = cleanUrl,
+                    type = INFER_TYPE
+                ) {
+                    this.referer = ""
+                }
+            )
+            return true
+        } catch (_: Exception) {
+            return false
+        }
     }
 
     // ==================== Home Page ====================
@@ -383,7 +885,7 @@ class AppsAnimeProvider : MainAPI() {
         return parts.joinToString(" | ")
     }
 
-    // ==================== Video Extraction ====================
+    // ==================== Video Extraction Entry Point ====================
 
     override suspend fun loadLinks(
         data: String,
@@ -395,25 +897,16 @@ class AppsAnimeProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        // Try to resolve ok.ru video ID from the available URLs
-        // and use CloudStream's built-in ok.ru extractor
-        val okVideoId = resolveOkVideoIdFromUrls(videoUrls)
+        // Fetch agents and cookies once for all extractions
+        val agents = fetchAgentsAndCookies()
 
-        if (okVideoId != null) {
-            val okUrl = "https://ok.ru/video/$okVideoId"
-            try {
-                loadExtractor(okUrl, mainUrl, subtitleCallback, callback)
-                return true
-            } catch (_: Exception) {}
-        }
-
-        // Fallback: try each URL individually
         var foundAny = false
         coroutineScope {
-            videoUrls.entries.map { (serverName, url) ->
+            videoUrls.entries.map { (serverName, urlAndExtraction) ->
                 async {
                     try {
-                        if (extractFromUrl(url, serverName, subtitleCallback, callback)) {
+                        val (url, needsExtraction) = urlAndExtraction
+                        if (extractFromUrl(url, serverName, needsExtraction, agents, subtitleCallback, callback)) {
                             foundAny = true
                         }
                     } catch (_: Exception) {}
@@ -422,157 +915,6 @@ class AppsAnimeProvider : MainAPI() {
         }
 
         return foundAny
-    }
-
-    /**
-     * Try to resolve the ok.ru video ID from a map of video URLs.
-     * Tries test-stream first (reliable), then cdnlink.
-     */
-    private suspend fun resolveOkVideoIdFromUrls(videoUrls: Map<String, String>): String? {
-        // Try test-stream URLs first (they return JSON reliably)
-        for ((_, url) in videoUrls) {
-            if (url.contains("test-stream")) {
-                try {
-                    val responseText = app.get(url, headers = headers).text
-                    val res = parseObject<StreamResponse>(responseText) ?: continue
-                    val firstUrl = res.availableQualities?.firstOrNull()?.url ?: continue
-                    extractOkVideoId(firstUrl)?.let { return it }
-                } catch (_: Exception) {}
-            }
-        }
-
-        // Try cdnlink URLs (they redirect to okcdn.ru)
-        for ((_, url) in videoUrls) {
-            if (url.contains("cdnlink.developer-pro.workers.dev")) {
-                try {
-                    val response = app.get(url, headers = headers)
-                    // Check final URL after redirect (even on 400, URL might be accessible)
-                    val finalUrl = response.url
-                    if (finalUrl != url && finalUrl.contains("okcdn.ru")) {
-                        extractOkVideoId(finalUrl)?.let { return it }
-                    }
-                    // Check Location header for redirect
-                    val location = response.headers?.get("location")
-                    if (!location.isNullOrBlank() && location.contains("okcdn.ru")) {
-                        extractOkVideoId(location)?.let { return it }
-                    }
-                } catch (_: Exception) {}
-            }
-        }
-
-        return null
-    }
-
-    /**
-     * Extract video from a single URL. Returns true if links were found.
-     */
-    private suspend fun extractFromUrl(
-        url: String,
-        serverName: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        when {
-            // test-stream worker - returns JSON with qualities
-            url.contains("test-stream") -> {
-                try {
-                    val responseText = app.get(url, headers = headers).text
-                    val res = parseObject<StreamResponse>(responseText) ?: return false
-                    val qualities = res.availableQualities ?: return false
-                    if (qualities.isEmpty()) return false
-
-                    // Try ok.ru extractor first
-                    val firstUrl = qualities.firstOrNull()?.url ?: return false
-                    val okVideoId = extractOkVideoId(firstUrl)
-                    if (okVideoId != null) {
-                        try {
-                            loadExtractor("https://ok.ru/video/$okVideoId", mainUrl, subtitleCallback, callback)
-                            return true
-                        } catch (_: Exception) {}
-                    }
-
-                    // Fallback: direct links
-                    qualities.forEach { q ->
-                        val qualityStr = q.quality ?: return@forEach
-                        val streamUrl = q.url ?: return@forEach
-                        callback(
-                            newExtractorLink(source = serverName, name = "$serverName - $qualityStr", url = streamUrl, type = INFER_TYPE) {
-                                this.referer = ""
-                                this.quality = getQualityValue(qualityStr)
-                            }
-                        )
-                    }
-                    return true
-                } catch (_: Exception) { return false }
-            }
-
-            // cdnlink worker - 302 redirect to okcdn.ru
-            url.contains("cdnlink.developer-pro.workers.dev") -> {
-                try {
-                    val response = app.get(url, headers = headers)
-                    val finalUrl = response.url
-
-                    if (finalUrl != url && finalUrl.contains("okcdn.ru")) {
-                        val okVideoId = extractOkVideoId(finalUrl)
-                        if (okVideoId != null) {
-                            try {
-                                loadExtractor("https://ok.ru/video/$okVideoId", mainUrl, subtitleCallback, callback)
-                                return true
-                            } catch (_: Exception) {}
-                        }
-                        // Direct link fallback
-                        callback(
-                            newExtractorLink(source = serverName, name = "$serverName - Auto", url = finalUrl, type = INFER_TYPE) {
-                                this.referer = ""
-                            }
-                        )
-                        return true
-                    }
-
-                    // Check Location header
-                    val location = response.headers?.get("location")
-                    if (!location.isNullOrBlank() && location.contains("okcdn.ru")) {
-                        val okVideoId = extractOkVideoId(location)
-                        if (okVideoId != null) {
-                            try {
-                                loadExtractor("https://ok.ru/video/$okVideoId", mainUrl, subtitleCallback, callback)
-                                return true
-                            } catch (_: Exception) {}
-                        }
-                    }
-                } catch (_: Exception) {}
-                return false
-            }
-
-            // Google Photos - use CloudStream's built-in extractor
-            url.contains("photos.google.com") -> {
-                try {
-                    loadExtractor(url, mainUrl, subtitleCallback, callback)
-                    return true
-                } catch (_: Exception) { return false }
-            }
-
-            // Direct video URLs
-            url.contains(".mp4") || url.contains(".m3u8") -> {
-                val quality = getQualityFromUrl(url)
-                callback(
-                    newExtractorLink(source = serverName, name = "$serverName - $quality", url = url,
-                        type = if (url.contains(".m3u8")) INFER_TYPE else ExtractorLinkType.VIDEO) {
-                        this.referer = mainUrl
-                        this.quality = getQualityValue(quality)
-                    }
-                )
-                return true
-            }
-
-            // ok.ru or other known hosts - use built-in extractor
-            else -> {
-                try {
-                    loadExtractor(url, mainUrl, subtitleCallback, callback)
-                    return true
-                } catch (_: Exception) { return false }
-            }
-        }
     }
 
     private fun getQualityFromUrl(url: String): String = when {
