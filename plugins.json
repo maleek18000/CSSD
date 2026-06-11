@@ -885,7 +885,28 @@
     "description": "Apps Anime - انمي وكرتون مدبلج ومترجم من تطبيق Apps Anime",
     "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/AppsAnime.cs3",
     "name": "AppsAnime"
+  },
+  {
+    "iconUrl": "https://www.stremio.com/website/favicon.ico",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/maleek18000/CSSD",
+    "fileSize": 110000,
+    "status": 1,
+    "authors": [
+      "anhdaden",
+      "hexated",
+      "Cloudburst"
+    ],
+    "tvTypes": [
+      "TvSeries",
+      "Anime",
+      "Movie"
+    ],
+    "version": 7,
+    "internalName": "StremioProvider",
+    "description": "Allows you to use Stremio addons. Supports both Catalog (StremioC) and TMDb-based (StremioX) providers. Requires setup.",
+    "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/StremioProvider.cs3",
+    "name": "StremioProvider"
   }
 ]
-
 
