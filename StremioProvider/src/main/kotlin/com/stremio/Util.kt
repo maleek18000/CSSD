@@ -1,5 +1,6 @@
 package com.stremio
 
+import android.util.Log
 import com.lagradost.cloudstream3.AcraApplication
 import com.lagradost.cloudstream3.CloudStreamApp
 import com.lagradost.cloudstream3.MainAPI
@@ -58,7 +59,11 @@ fun fixSourceUrl(url: String): String {
 }
 
 suspend fun generateMagnetLink(infoHash: String): String {
-    val trackers = app.get(TRACKER_LIST_URL).text.trim().split("\n")
+    val trackers = try {
+        app.get(TRACKER_LIST_URL).text.trim().split("\n")
+    } catch (e: Exception) {
+        emptyList()
+    }
     val magnet = StringBuilder("magnet:?xt=urn:btih:$infoHash")
     for (tracker in trackers) {
         if (tracker.isNotBlank()) {
@@ -78,86 +83,115 @@ suspend fun invokeMainSource(
     callback: (ExtractorLink) -> Unit
 ) {
     val fixedUrl = fixSourceUrl(baseUrl)
-    val streamUrl = if (season != null) {
+
+    // Construct proper Stremio stream URL
+    // Movies: /stream/movie/{id}.json
+    // Series: /stream/series/{id}:{season}:{episode}.json
+    val streamUrl = if (season != null && episode != null) {
         "$fixedUrl/stream/series/$imdbId:$season:$episode.json"
+    } else if (season != null) {
+        "$fixedUrl/stream/series/$imdbId:$season:1.json"
     } else {
         "$fixedUrl/stream/movie/$imdbId.json"
     }
 
+    Log.d("StremioUtil", "invokeMainSource: $streamUrl")
+
     val response = try {
-        app.get(streamUrl, timeout = 120)
+        app.get(streamUrl, timeout = 30)
     } catch (e: Exception) {
+        Log.e("StremioUtil", "Stream request failed: ${e.message}")
+        return
+    }
+
+    if (!response.isSuccessful) {
+        Log.e("StremioUtil", "Stream response not successful: ${response.code}")
         return
     }
 
     val streamsResponse = tryParseJson<StreamsResponse>(response.text) ?: return
-    val streams = streamsResponse.streams ?: return
+    val streams = streamsResponse.streams
+
+    if (streams.isNullOrEmpty()) {
+        Log.w("StremioUtil", "No streams found from $fixedUrl")
+        return
+    }
+
+    Log.d("StremioUtil", "Found ${streams.size} streams from $fixedUrl")
 
     for (stream in streams) {
         val streamName = stream.name ?: ""
         val streamTitle = stream.title ?: stream.name ?: ""
 
-        when {
-            stream.url != null -> {
-                var referer: String? = null
-                try {
-                    val headers = stream.behaviorHints?.proxyHeaders?.request
-                    referer = headers?.get("referer") ?: headers?.get("origin")
-                } catch (e: Exception) {}
+        try {
+            when {
+                stream.url != null -> {
+                    var referer: String? = null
+                    try {
+                        val headers = stream.behaviorHints?.proxyHeaders?.request
+                        referer = headers?.get("referer") ?: headers?.get("origin")
+                    } catch (e: Exception) {}
 
-                val isM3u8 = stream.url.endsWith(".m3u8")
-                val linkType = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                callback.invoke(
-                    newExtractorLink(
-                        source = streamName,
-                        name = streamTitle,
-                        url = stream.url,
-                        type = linkType
-                    ) {
-                        this.referer = referer ?: ""
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-            }
-
-            stream.ytId != null -> {
-                loadExtractor("https://www.youtube.com/watch?v=${stream.ytId}", subtitleCallback, callback)
-            }
-
-            stream.externalUrl != null -> {
-                loadExtractor(stream.externalUrl, subtitleCallback, callback)
-            }
-
-            stream.infoHash != null -> {
-                val magnet = generateMagnetLink(stream.infoHash)
-                val displayName = stream.title ?: stream.name ?: ""
-                val extractedTitle = buildExtractedTitle(extractSpecs(displayName))
-                val fullTitle = "$extractedTitle$displayName"
-
-                val sizeInfo = when {
-                    fullTitle.contains("\uD83D\uDCBE") && fullTitle.contains("\uD83D\uDC64") -> {
-                        val sizeIdx = fullTitle.indexOf("\uD83D\uDCBE")
-                        val userIdx = fullTitle.indexOf("\uD83D\uDC64")
-                        if (sizeIdx >= userIdx) fullTitle.substringAfter("\uD83D\uDC64")
-                        else fullTitle.substringAfter("\uD83D\uDCBE")
-                    }
-                    fullTitle.contains("\uD83D\uDCBE") -> fullTitle.substringAfter("\uD83D\uDCBE")
-                    fullTitle.contains("\uD83D\uDC64") -> fullTitle.substringAfter("\uD83D\uDC64")
-                    fullTitle.contains("Name: ") -> fullTitle.substringBefore("Size")
-                    else -> extractedTitle
+                    val isM3u8 = stream.url.endsWith(".m3u8")
+                    val linkType = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    callback.invoke(
+                        newExtractorLink(
+                            source = streamName,
+                            name = streamTitle,
+                            url = stream.url,
+                            type = linkType
+                        ) {
+                            this.referer = referer ?: ""
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
                 }
 
-                callback.invoke(
-                    newExtractorLink(
-                        source = providerName,
-                        name = sizeInfo.ifBlank { extractedTitle },
-                        url = magnet,
-                        type = ExtractorLinkType.MAGNET
-                    ) {
-                        this.quality = getQuality(listOf(displayName))
+                stream.ytId != null -> {
+                    loadExtractor("https://www.youtube.com/watch?v=${stream.ytId}", subtitleCallback, callback)
+                }
+
+                stream.externalUrl != null -> {
+                    loadExtractor(stream.externalUrl, subtitleCallback, callback)
+                }
+
+                stream.infoHash != null -> {
+                    val magnet = generateMagnetLink(stream.infoHash)
+                    val displayName = stream.title ?: stream.name ?: ""
+                    val extractedTitle = buildExtractedTitle(extractSpecs(displayName))
+                    val fullTitle = "$extractedTitle$displayName"
+
+                    val sizeInfo = when {
+                        fullTitle.contains("\uD83D\uDCBE") && fullTitle.contains("\uD83D\uDC64") -> {
+                            val sizeIdx = fullTitle.indexOf("\uD83D\uDCBE")
+                            val userIdx = fullTitle.indexOf("\uD83D\uDC64")
+                            if (sizeIdx >= userIdx) fullTitle.substringAfter("\uD83D\uDC64")
+                            else fullTitle.substringAfter("\uD83D\uDCBE")
+                        }
+                        fullTitle.contains("\uD83D\uDCBE") -> fullTitle.substringAfter("\uD83D\uDCBE")
+                        fullTitle.contains("\uD83D\uDC64") -> fullTitle.substringAfter("\uD83D\uDC64")
+                        fullTitle.contains("Name: ") -> fullTitle.substringBefore("Size")
+                        else -> extractedTitle
                     }
-                )
+
+                    callback.invoke(
+                        newExtractorLink(
+                            source = providerName,
+                            name = sizeInfo.ifBlank { extractedTitle },
+                            url = magnet,
+                            type = ExtractorLinkType.MAGNET
+                        ) {
+                            this.quality = getQuality(listOf(displayName))
+                        }
+                    )
+                }
+
+                else -> {
+                    Log.w("StremioUtil", "Stream has no recognizable URL/ytId/externalUrl/infoHash: $streamTitle")
+                }
             }
+        } catch (e: Exception) {
+            Log.e("StremioUtil", "Error processing stream '$streamTitle': ${e.message}")
         }
 
         // Handle subtitles in streams

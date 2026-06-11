@@ -13,6 +13,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
+import android.util.Log
 import okhttp3.Interceptor
 
 class StremioX(
@@ -104,10 +106,8 @@ class StremioX(
         val date = releaseDate?.ifBlank { null } ?: firstAirDate
         val year = date?.split("-")?.firstOrNull()?.toIntOrNull()
 
-        // Only show if has poster and meets certain conditions
         if (posterPath == null) return null
 
-        // Skip certain content based on language and genre
         val originalLang = originalLanguage
         if (originalLang in listOf("zh", "pt") && year != null && year > 1980) {
             val genreIds = genreIds
@@ -135,14 +135,12 @@ class StremioX(
         val type = getType(data.type)
         val isTv = type != TvType.Movie
 
-        // Fetch localized metadata
         val detailUrl = if (isTv) {
             "$tmdbAPI/tv/${data.id}?api_key=$apiKey&language=$language&append_to_response=credits,recommendations"
         } else {
             "$tmdbAPI/movie/${data.id}?api_key=$apiKey&language=$language&append_to_response=credits,recommendations"
         }
 
-        // Fetch English metadata for original titles and external IDs
         val englishUrl = if (isTv) {
             "$tmdbAPI/tv/${data.id}?api_key=$apiKey&language=en&append_to_response=external_ids,credits,videos"
         } else {
@@ -155,7 +153,6 @@ class StremioX(
         val englishDetail = tryParseJson<MediaDetail>(app.get(englishUrl).text)
             ?: throw ErrorLoadingException("Invalid Json Response")
 
-        // Determine title
         var title = localDetail.title ?: localDetail.name ?: return null
         val englishTitle = englishDetail.title ?: englishDetail.name ?: return null
         val originalTitle = englishDetail.originalTitle ?: englishDetail.originalName ?: return null
@@ -170,12 +167,10 @@ class StremioX(
         val dateStr = englishDetail.releaseDate ?: englishDetail.firstAirDate
         val year = dateStr?.split("-")?.firstOrNull()?.toIntOrNull()
 
-        // Parse genres (remove "Phim" prefix for Vietnamese)
         val genres = localDetail.genres?.mapNotNull {
             it.name?.substringAfter("Phim")?.trim()
         } ?: emptyList()
 
-        // Determine if anime
         val isAnime = genres.contains("Hoat Hinh") &&
             (englishDetail.original_language in listOf("zh", "ja"))
 
@@ -191,12 +186,10 @@ class StremioX(
             else -> TvType.Movie
         }
 
-        // External IDs
         val imdbId = englishDetail.external_ids?.imdb_id
         val tvdbId = englishDetail.external_ids?.tvdb_id
 
         if (!isTv) {
-            // Movie
             val linkData = LinkData(
                 id = data.id,
                 imdbId = imdbId,
@@ -231,7 +224,6 @@ class StremioX(
                 } ?: emptyList()
 
                 val seasonEpisodes = if (seasonEps.isEmpty()) {
-                    // Fetch episodes from TMDb
                     val seasonUrl = "$tmdbAPI/tv/${data.id}/season/${seasonData.seasonNumber}?api_key=$apiKey&language=$language"
                     val seasonDetail = tryParseJson<MediaDetail>(app.get(seasonUrl).text)
                     seasonDetail?.episodes?.map { ep ->
@@ -302,14 +294,54 @@ class StremioX(
             callback
         )
 
-        // Run subtitle extractors in parallel
+        // Run subtitle extractors in parallel with individual timeouts (10s each)
         coroutineScope {
             listOf(
-                async(Dispatchers.IO) { invokeStremio(linkData.imdbId, linkData.season, linkData.episode, subtitleCallback) },
-                async(Dispatchers.IO) { invokeOpensub(linkData.imdbId, linkData.season, linkData.episode, subtitleCallback) },
-                async(Dispatchers.IO) { invokeSubsource(linkData.title, linkData.imdbId, linkData.season, linkData.episode, subtitleCallback) },
-                async(Dispatchers.IO) { invokeWatchsomuch(linkData.imdbId, linkData.season, linkData.episode, subtitleCallback) },
-                async(Dispatchers.IO) { invokeXemphim(linkData.title, linkData.year, linkData.isAnime, subtitleCallback) }
+                async(Dispatchers.IO) {
+                    try {
+                        withTimeoutOrNull(10_000L) {
+                            invokeStremio(linkData.imdbId, linkData.season, linkData.episode, subtitleCallback)
+                        }
+                    } catch (e: Exception) {
+                        Log.w("StremioX", "Stremio subs failed: ${e.message}")
+                    }
+                },
+                async(Dispatchers.IO) {
+                    try {
+                        withTimeoutOrNull(10_000L) {
+                            invokeOpensub(linkData.imdbId, linkData.season, linkData.episode, subtitleCallback)
+                        }
+                    } catch (e: Exception) {
+                        Log.w("StremioX", "Opensub subs failed: ${e.message}")
+                    }
+                },
+                async(Dispatchers.IO) {
+                    try {
+                        withTimeoutOrNull(10_000L) {
+                            invokeSubsource(linkData.title, linkData.imdbId, linkData.season, linkData.episode, subtitleCallback)
+                        }
+                    } catch (e: Exception) {
+                        Log.w("StremioX", "Subsource subs failed: ${e.message}")
+                    }
+                },
+                async(Dispatchers.IO) {
+                    try {
+                        withTimeoutOrNull(10_000L) {
+                            invokeWatchsomuch(linkData.imdbId, linkData.season, linkData.episode, subtitleCallback)
+                        }
+                    } catch (e: Exception) {
+                        Log.w("StremioX", "Watchsomuch subs failed: ${e.message}")
+                    }
+                },
+                async(Dispatchers.IO) {
+                    try {
+                        withTimeoutOrNull(10_000L) {
+                            invokeXemphim(linkData.title, linkData.year, linkData.isAnime, subtitleCallback)
+                        }
+                    } catch (e: Exception) {
+                        Log.w("StremioX", "Xemphim subs failed: ${e.message}")
+                    }
+                }
             ).awaitAll()
         }
 

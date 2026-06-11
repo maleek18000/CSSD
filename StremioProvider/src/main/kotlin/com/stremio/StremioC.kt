@@ -15,6 +15,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Interceptor
 
 class StremioC(
@@ -85,6 +86,8 @@ class StremioC(
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        mainUrl = fixSourceUrl(mainUrl)
+
         try {
             val context = CloudStreamApp.context
             val prefs = context?.getSharedPreferences("stremio_prefs", 0)
@@ -95,50 +98,130 @@ class StremioC(
         } catch (e: Exception) {}
 
         val loadData = mapper.readValue(data, LoadData::class.java)
-        val streamUrl = "$mainUrl/stream/${loadData.type}/${loadData.id}.json"
 
-        val response = app.get(streamUrl, timeout = 120)
-        if (!response.isSuccessful) {
+        // Construct proper Stremio stream URL:
+        // Movies: /stream/movie/{id}.json
+        // Series: /stream/series/{id}:{season}:{episode}.json
+        val baseId = (loadData.imdbId ?: loadData.id ?: "").split(":").firstOrNull() ?: ""
+        val streamUrl = if (loadData.season != null && loadData.episode != null) {
+            "$mainUrl/stream/series/$baseId:${loadData.season}:${loadData.episode}.json"
+        } else if (loadData.season != null) {
+            "$mainUrl/stream/series/$baseId:${loadData.season}:1.json"
+        } else {
+            "$mainUrl/stream/movie/$baseId.json"
+        }
+
+        Log.d("StremioC", "Loading streams from: $streamUrl")
+
+        val response = try {
+            app.get(streamUrl, timeout = 30)
+        } catch (e: Exception) {
+            Log.e("StremioC", "Stream request failed: ${e.message}")
+            responseSearch = ""
             // Fallback to torrentio
             invokeMainSource(
                 "https://torrentio.strem.fun",
                 name,
-                loadData.imdbId ?: loadData.id ?: "",
+                baseId,
                 loadData.season,
                 loadData.episode,
                 subtitleCallback,
                 callback
             )
-            // Run subtitle extractors in parallel
-            coroutineScope {
-                listOf(
-                    async(Dispatchers.IO) { invokeStremio(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback) },
-                    async(Dispatchers.IO) { invokeOpensub(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback) },
-                    async(Dispatchers.IO) { invokeSubsource(loadData.title, loadData.imdbId, loadData.season, loadData.episode, subtitleCallback) },
-                    async(Dispatchers.IO) { invokeWatchsomuch(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback) }
-                ).awaitAll()
-            }
+            loadSubtitles(loadData, subtitleCallback)
+            return true
+        }
+
+        if (!response.isSuccessful) {
+            Log.e("StremioC", "Stream response not successful: ${response.code}")
+            // Fallback to torrentio
+            invokeMainSource(
+                "https://torrentio.strem.fun",
+                name,
+                baseId,
+                loadData.season,
+                loadData.episode,
+                subtitleCallback,
+                callback
+            )
+            loadSubtitles(loadData, subtitleCallback)
             return true
         }
 
         val streamsResponse = tryParseJson<StreamsResponse>(response.text)
-        if (streamsResponse?.streams != null) {
+        if (streamsResponse?.streams.isNullOrEmpty()) {
+            Log.w("StremioC", "No streams found in response")
+            // Try fallback to torrentio as well
+            invokeMainSource(
+                "https://torrentio.strem.fun",
+                name,
+                baseId,
+                loadData.season,
+                loadData.episode,
+                subtitleCallback,
+                callback
+            )
+        } else {
+            Log.d("StremioC", "Found ${streamsResponse!!.streams!!.size} streams")
             for (stream in streamsResponse.streams) {
                 processStream(stream, subtitleCallback, callback)
             }
         }
 
-        // Run subtitle extractors in parallel
-        coroutineScope {
-            listOf(
-                async(Dispatchers.IO) { invokeStremio(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback) },
-                async(Dispatchers.IO) { invokeOpensub(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback) },
-                async(Dispatchers.IO) { invokeSubsource(loadData.title, loadData.imdbId, loadData.season, loadData.episode, subtitleCallback) },
-                async(Dispatchers.IO) { invokeWatchsomuch(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback) }
-            ).awaitAll()
-        }
+        // Load subtitles with timeout protection
+        loadSubtitles(loadData, subtitleCallback)
 
         return true
+    }
+
+    /**
+     * Load subtitles from external sources with individual timeouts.
+     * Each extractor gets 10 seconds; one failure won't block the others.
+     */
+    private suspend fun loadSubtitles(
+        loadData: LoadData,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ) {
+        coroutineScope {
+            listOf(
+                async(Dispatchers.IO) {
+                    try {
+                        withTimeoutOrNull(10_000L) {
+                            invokeStremio(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback)
+                        }
+                    } catch (e: Exception) {
+                        Log.w("StremioC", "Stremio subs failed: ${e.message}")
+                    }
+                },
+                async(Dispatchers.IO) {
+                    try {
+                        withTimeoutOrNull(10_000L) {
+                            invokeOpensub(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback)
+                        }
+                    } catch (e: Exception) {
+                        Log.w("StremioC", "Opensub subs failed: ${e.message}")
+                    }
+                },
+                async(Dispatchers.IO) {
+                    try {
+                        withTimeoutOrNull(10_000L) {
+                            invokeSubsource(loadData.title, loadData.imdbId, loadData.season, loadData.episode, subtitleCallback)
+                        }
+                    } catch (e: Exception) {
+                        Log.w("StremioC", "Subsource subs failed: ${e.message}")
+                    }
+                },
+                async(Dispatchers.IO) {
+                    try {
+                        withTimeoutOrNull(10_000L) {
+                            invokeWatchsomuch(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback)
+                        }
+                    } catch (e: Exception) {
+                        Log.w("StremioC", "Watchsomuch subs failed: ${e.message}")
+                    }
+                }
+            ).awaitAll()
+        }
     }
 
     private suspend fun processStream(
@@ -210,6 +293,10 @@ class StremioC(
                         this.quality = getQualityFromName(displayName)
                     }
                 )
+            }
+
+            else -> {
+                Log.w("StremioC", "Stream has no recognizable URL/ytId/externalUrl/infoHash: $streamName")
             }
         }
 
