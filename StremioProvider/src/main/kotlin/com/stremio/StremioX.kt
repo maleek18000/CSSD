@@ -190,6 +190,7 @@ class StremioX(
         val tvdbId = englishDetail.external_ids?.tvdb_id
 
         if (!isTv) {
+            // Movie - pass full LinkData as JSON string for loadLinks()
             val linkData = LinkData(
                 id = data.id,
                 imdbId = imdbId,
@@ -209,38 +210,10 @@ class StremioX(
                 this.tags = genres
             }
         } else {
-            // TV Series - renamed 'season' loop variable to 'seasonData' to avoid
-            // shadowing the Episode builder's 'season' property
-            val episodes = englishDetail.seasons?.map { seasonData ->
-                val seasonEps = seasonData.episodes?.map { ep ->
-                    val epName = "${ep.name}${ep.episodeNumber?.let { " - E$it" } ?: ""}"
-                    newEpisode(ep.id ?: "") {
-                        name = epName
-                        season = ep.seasonNumber ?: seasonData.seasonNumber
-                        episode = ep.episodeNumber
-                        posterUrl = getImageUrl(ep.stillPath)
-                        description = ep.overview
-                    }
-                } ?: emptyList()
-
-                val seasonEpisodes = if (seasonEps.isEmpty()) {
-                    val seasonUrl = "$tmdbAPI/tv/${data.id}/season/${seasonData.seasonNumber}?api_key=$apiKey&language=$language"
-                    val seasonDetail = tryParseJson<MediaDetail>(app.get(seasonUrl).text)
-                    seasonDetail?.episodes?.map { ep ->
-                        newEpisode(ep.id ?: "") {
-                            name = "${ep.name}${ep.episodeNumber?.let { " - E$it" } ?: ""}"
-                            season = ep.seasonNumber ?: seasonData.seasonNumber
-                            episode = ep.episodeNumber
-                            posterUrl = getImageUrl(ep.stillPath)
-                            description = ep.overview
-                        }
-                    } ?: emptyList()
-                } else seasonEps
-
-                seasonEpisodes
-            }?.flatten() ?: emptyList()
-
-            val linkData = LinkData(
+            // TV Series - create base LinkData first, then copy for each episode
+            // CRITICAL: Each episode's data must be a LinkData JSON string,
+            // NOT just the TMDb episode ID. loadLinks() needs the full LinkData.
+            val baseLinkData = LinkData(
                 id = data.id,
                 imdbId = imdbId,
                 tvdbId = tvdbId,
@@ -254,6 +227,46 @@ class StremioX(
                 originalLanguage = englishDetail.original_language,
                 lastSeason = englishDetail.seasons?.lastOrNull()?.seasonNumber
             )
+
+            val episodes = englishDetail.seasons?.map { seasonData ->
+                val seasonEps = seasonData.episodes?.map { ep ->
+                    val epLinkData = baseLinkData.copy(
+                        season = ep.seasonNumber ?: seasonData.seasonNumber,
+                        episode = ep.episodeNumber
+                    )
+                    val epName = "${ep.name}${ep.episodeNumber?.let { " - E$it" } ?: ""}"
+                    newEpisode(epLinkData.toJson()) {
+                        name = epName
+                        season = ep.seasonNumber ?: seasonData.seasonNumber
+                        episode = ep.episodeNumber
+                        posterUrl = getImageUrl(ep.stillPath)
+                        description = ep.overview
+                    }
+                } ?: emptyList()
+
+                val seasonEpisodes = if (seasonEps.isEmpty()) {
+                    // Fetch episodes from TMDb
+                    val seasonUrl = "$tmdbAPI/tv/${data.id}/season/${seasonData.seasonNumber}?api_key=$apiKey&language=$language"
+                    val seasonDetail = tryParseJson<MediaDetail>(app.get(seasonUrl).text)
+                    seasonDetail?.episodes?.map { ep ->
+                        val epLinkData = baseLinkData.copy(
+                            season = ep.seasonNumber ?: seasonData.seasonNumber,
+                            episode = ep.episodeNumber
+                        )
+                        val epName = "${ep.name}${ep.episodeNumber?.let { " - E$it" } ?: ""}"
+                        newEpisode(epLinkData.toJson()) {
+                            name = epName
+                            season = ep.seasonNumber ?: seasonData.seasonNumber
+                            episode = ep.episodeNumber
+                            posterUrl = getImageUrl(ep.stillPath)
+                            description = ep.overview
+                        }
+                    } ?: emptyList()
+                } else seasonEps
+
+                seasonEpisodes
+            }?.flatten() ?: emptyList()
+
             return newTvSeriesLoadResponse(title, url, tvType, episodes) {
                 posterUrl = poster
                 this.plot = localDetail.overview
@@ -269,7 +282,14 @@ class StremioX(
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val linkData = mapper.readValue(data, LinkData::class.java)
+        val linkData = try {
+            mapper.readValue(data, LinkData::class.java)
+        } catch (e: Exception) {
+            Log.e("StremioX", "Failed to parse loadLinks data: $data", e)
+            return false
+        }
+
+        Log.d("StremioX", "loadLinks called: imdbId=${linkData.imdbId}, id=${linkData.id}, season=${linkData.season}, episode=${linkData.episode}, mainUrl=$mainUrl")
 
         // Set subtitle auto-select language
         try {
@@ -284,15 +304,19 @@ class StremioX(
         } catch (e: Exception) {}
 
         // Load streams from the Stremio addon
-        invokeMainSource(
-            mainUrl,
-            name,
-            linkData.imdbId ?: linkData.id.toString(),
-            linkData.season,
-            linkData.episode,
-            subtitleCallback,
-            callback
-        )
+        try {
+            invokeMainSource(
+                mainUrl,
+                name,
+                linkData.imdbId ?: linkData.id.toString(),
+                linkData.season,
+                linkData.episode,
+                subtitleCallback,
+                callback
+            )
+        } catch (e: Exception) {
+            Log.e("StremioX", "invokeMainSource failed: ${e.message}", e)
+        }
 
         // Run subtitle extractors in parallel with individual timeouts (10s each)
         coroutineScope {
@@ -302,45 +326,35 @@ class StremioX(
                         withTimeoutOrNull(10_000L) {
                             invokeStremio(linkData.imdbId, linkData.season, linkData.episode, subtitleCallback)
                         }
-                    } catch (e: Exception) {
-                        Log.w("StremioX", "Stremio subs failed: ${e.message}")
-                    }
+                    } catch (_: Exception) {}
                 },
                 async(Dispatchers.IO) {
                     try {
                         withTimeoutOrNull(10_000L) {
                             invokeOpensub(linkData.imdbId, linkData.season, linkData.episode, subtitleCallback)
                         }
-                    } catch (e: Exception) {
-                        Log.w("StremioX", "Opensub subs failed: ${e.message}")
-                    }
+                    } catch (_: Exception) {}
                 },
                 async(Dispatchers.IO) {
                     try {
                         withTimeoutOrNull(10_000L) {
                             invokeSubsource(linkData.title, linkData.imdbId, linkData.season, linkData.episode, subtitleCallback)
                         }
-                    } catch (e: Exception) {
-                        Log.w("StremioX", "Subsource subs failed: ${e.message}")
-                    }
+                    } catch (_: Exception) {}
                 },
                 async(Dispatchers.IO) {
                     try {
                         withTimeoutOrNull(10_000L) {
                             invokeWatchsomuch(linkData.imdbId, linkData.season, linkData.episode, subtitleCallback)
                         }
-                    } catch (e: Exception) {
-                        Log.w("StremioX", "Watchsomuch subs failed: ${e.message}")
-                    }
+                    } catch (_: Exception) {}
                 },
                 async(Dispatchers.IO) {
                     try {
                         withTimeoutOrNull(10_000L) {
                             invokeXemphim(linkData.title, linkData.year, linkData.isAnime, subtitleCallback)
                         }
-                    } catch (e: Exception) {
-                        Log.w("StremioX", "Xemphim subs failed: ${e.message}")
-                    }
+                    } catch (_: Exception) {}
                 }
             ).awaitAll()
         }

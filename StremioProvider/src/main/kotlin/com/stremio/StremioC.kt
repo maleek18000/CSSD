@@ -88,6 +88,16 @@ class StremioC(
     ): Boolean {
         mainUrl = fixSourceUrl(mainUrl)
 
+        val loadData = try {
+            mapper.readValue(data, LoadData::class.java)
+        } catch (e: Exception) {
+            Log.e("StremioC", "Failed to parse loadLinks data: $data", e)
+            return false
+        }
+
+        Log.d("StremioC", "loadLinks called: type=${loadData.type}, id=${loadData.id}, season=${loadData.season}, episode=${loadData.episode}, imdbId=${loadData.imdbId}, mainUrl=$mainUrl")
+
+        // Set subtitle auto-select language
         try {
             val context = CloudStreamApp.context
             val prefs = context?.getSharedPreferences("stremio_prefs", 0)
@@ -97,78 +107,71 @@ class StremioC(
             }
         } catch (e: Exception) {}
 
-        val loadData = mapper.readValue(data, LoadData::class.java)
+        // Construct stream URL using the type and id from the catalog
+        // The id for episodes is typically "tt0903747:1:1" format (imdbId:season:episode)
+        val streamType = loadData.type ?: if (loadData.season != null) "series" else "movie"
+        val streamId = loadData.id ?: loadData.imdbId ?: ""
 
-        // Construct proper Stremio stream URL:
-        // Movies: /stream/movie/{id}.json
-        // Series: /stream/series/{id}:{season}:{episode}.json
-        val baseId = (loadData.imdbId ?: loadData.id ?: "").split(":").firstOrNull() ?: ""
-        val streamUrl = if (loadData.season != null && loadData.episode != null) {
-            "$mainUrl/stream/series/$baseId:${loadData.season}:${loadData.episode}.json"
-        } else if (loadData.season != null) {
-            "$mainUrl/stream/series/$baseId:${loadData.season}:1.json"
+        val streamUrl = if (streamId.contains(":")) {
+            // ID already contains season:episode info (e.g., "tt0903747:1:1")
+            "$mainUrl/stream/$streamType/$streamId.json"
+        } else if (loadData.season != null && loadData.episode != null) {
+            // Separate season/episode fields - construct compound ID
+            "$mainUrl/stream/$streamType/$streamId:${loadData.season}:${loadData.episode}.json"
         } else {
-            "$mainUrl/stream/movie/$baseId.json"
+            // Movie or no episode info
+            "$mainUrl/stream/$streamType/$streamId.json"
         }
 
-        Log.d("StremioC", "Loading streams from: $streamUrl")
+        Log.d("StremioC", "Stream URL: $streamUrl")
 
-        val response = try {
-            app.get(streamUrl, timeout = 30)
+        var foundLinks = false
+
+        try {
+            val response = app.get(streamUrl, timeout = 30)
+            Log.d("StremioC", "Stream response code: ${response.code}, length: ${response.text.length}")
+
+            if (response.isSuccessful) {
+                val streamsResponse = tryParseJson<StreamsResponse>(response.text)
+                val streams = streamsResponse?.streams
+                Log.d("StremioC", "Parsed ${streams?.size ?: 0} streams")
+
+                if (!streams.isNullOrEmpty()) {
+                    for (stream in streams) {
+                        try {
+                            processStream(stream, subtitleCallback, callback)
+                            foundLinks = true
+                        } catch (e: Exception) {
+                            Log.e("StremioC", "Error processing stream: ${e.message}", e)
+                        }
+                    }
+                }
+            } else {
+                Log.w("StremioC", "Stream URL returned ${response.code}")
+            }
         } catch (e: Exception) {
-            Log.e("StremioC", "Stream request failed: ${e.message}")
-            responseSearch = ""
-            // Fallback to torrentio
-            invokeMainSource(
-                "https://torrentio.strem.fun",
-                name,
-                baseId,
-                loadData.season,
-                loadData.episode,
-                subtitleCallback,
-                callback
-            )
-            loadSubtitles(loadData, subtitleCallback)
-            return true
+            Log.e("StremioC", "Stream request failed: ${e.message}", e)
         }
 
-        if (!response.isSuccessful) {
-            Log.e("StremioC", "Stream response not successful: ${response.code}")
-            // Fallback to torrentio
-            invokeMainSource(
-                "https://torrentio.strem.fun",
-                name,
-                baseId,
-                loadData.season,
-                loadData.episode,
-                subtitleCallback,
-                callback
-            )
-            loadSubtitles(loadData, subtitleCallback)
-            return true
-        }
-
-        val streamsResponse = tryParseJson<StreamsResponse>(response.text)
-        if (streamsResponse?.streams.isNullOrEmpty()) {
-            Log.w("StremioC", "No streams found in response")
-            // Try fallback to torrentio as well
-            invokeMainSource(
-                "https://torrentio.strem.fun",
-                name,
-                baseId,
-                loadData.season,
-                loadData.episode,
-                subtitleCallback,
-                callback
-            )
-        } else {
-            Log.d("StremioC", "Found ${streamsResponse!!.streams!!.size} streams")
-            for (stream in streamsResponse.streams) {
-                processStream(stream, subtitleCallback, callback)
+        // If no links found from addon, try torrentio as fallback
+        if (!foundLinks) {
+            Log.d("StremioC", "No links from addon, trying torrentio fallback")
+            try {
+                invokeMainSource(
+                    "https://torrentio.strem.fun",
+                    name,
+                    loadData.imdbId ?: loadData.id ?: "",
+                    loadData.season,
+                    loadData.episode,
+                    subtitleCallback,
+                    callback
+                )
+            } catch (e: Exception) {
+                Log.e("StremioC", "Torrentio fallback failed: ${e.message}", e)
             }
         }
 
-        // Load subtitles with timeout protection
+        // Load subtitles with timeout protection (each gets 10 seconds max)
         loadSubtitles(loadData, subtitleCallback)
 
         return true
@@ -189,36 +192,28 @@ class StremioC(
                         withTimeoutOrNull(10_000L) {
                             invokeStremio(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback)
                         }
-                    } catch (e: Exception) {
-                        Log.w("StremioC", "Stremio subs failed: ${e.message}")
-                    }
+                    } catch (_: Exception) {}
                 },
                 async(Dispatchers.IO) {
                     try {
                         withTimeoutOrNull(10_000L) {
                             invokeOpensub(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback)
                         }
-                    } catch (e: Exception) {
-                        Log.w("StremioC", "Opensub subs failed: ${e.message}")
-                    }
+                    } catch (_: Exception) {}
                 },
                 async(Dispatchers.IO) {
                     try {
                         withTimeoutOrNull(10_000L) {
                             invokeSubsource(loadData.title, loadData.imdbId, loadData.season, loadData.episode, subtitleCallback)
                         }
-                    } catch (e: Exception) {
-                        Log.w("StremioC", "Subsource subs failed: ${e.message}")
-                    }
+                    } catch (_: Exception) {}
                 },
                 async(Dispatchers.IO) {
                     try {
                         withTimeoutOrNull(10_000L) {
                             invokeWatchsomuch(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback)
                         }
-                    } catch (e: Exception) {
-                        Log.w("StremioC", "Watchsomuch subs failed: ${e.message}")
-                    }
+                    } catch (_: Exception) {}
                 }
             ).awaitAll()
         }
@@ -296,11 +291,11 @@ class StremioC(
             }
 
             else -> {
-                Log.w("StremioC", "Stream has no recognizable URL/ytId/externalUrl/infoHash: $streamName")
+                Log.w("StremioC", "Stream has no url/ytId/externalUrl/infoHash: $streamName")
             }
         }
 
-        // Handle subtitles in streams
+        // Handle subtitles embedded in streams
         stream.subtitles?.forEach { sub ->
             if (sub.url != null && sub.lang != null) {
                 subtitleCallback.invoke(SubtitleFile(sub.lang, sub.url))
@@ -425,17 +420,19 @@ class StremioC(
 
         suspend fun toLoadResponse(provider: StremioC, entryId: String): LoadResponse {
             return if (videos.isNullOrEmpty()) {
+                // Movie - pass LoadData as JSON string for loadLinks()
                 provider.newMovieLoadResponse(
                     name,
                     "${provider.mainUrl}/meta/${type}/${id}.json",
                     TvType.Movie,
-                    LoadData(type, id, imdbId = entryId)
+                    LoadData(type, id, imdbId = entryId).toJson()
                 ) {
                     posterUrl = poster
                     plot = description
                     tags = genres ?: genre
                 }
             } else {
+                // TV Series - each episode's data must be a JSON string
                 val episodes = videos.map { it.toEpisode(provider, type, entryId) }
                 provider.newTvSeriesLoadResponse(
                     name,
@@ -465,9 +462,9 @@ class StremioC(
         fun toEpisode(provider: StremioC, type: String?, entryId: String): Episode {
             val epNum = episode ?: number
             val epName = name ?: title
-            return provider.newEpisode(
-                LoadData(type, id, seasonNumber, epNum, epName, entryId)
-            ) {
+            // IMPORTANT: Pass LoadData as JSON string so loadLinks() can parse it
+            val loadData = LoadData(type, id, seasonNumber, epNum, epName, entryId)
+            return provider.newEpisode(loadData.toJson()) {
                 this.name = title
                 this.posterUrl = thumbnail
                 this.description = overview ?: this.description
