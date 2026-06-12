@@ -473,111 +473,98 @@ class XtreamIPTVProvider : MainAPI() {
         return if (lists.isEmpty()) null else newHomePageResponse(lists, false)
     }
 
-    companion object {
-        // Max categories shown per type on the home screen (when no filter)
-        private const val MAX_CATEGORIES = 8
-    }
-
     /**
-     * Build home page lists from parsed M3U entries with category management.
+     * Build home page lists from parsed M3U entries.
+     *
+     * Home screen layout:
+     *   1. 📂 Browse Movie Categories  — clickable cards for each category
+     *   2. 📂 Browse Series Categories  — clickable cards for each category
+     *   3. 📺 Browse Live TV Categories — clickable cards for each category
+     *   4. 🎬 Featured Movies           — 20 recent movies across all categories
+     *   5. 🎞️ Featured Series           — 20 recent series across all categories
+     *   6. 📺 Live TV                   — 20 live channels across all categories
      *
      * If the user added a category filter (~Cat1~Cat2...) in the URL,
-     * only matching categories are shown.
-     *
-     * Otherwise, shows top 8 categories per type (by item count) + "Other" for the rest,
-     * plus "Browse Categories" sections with ALL categories as clickable cards.
+     * only matching categories appear in the browse sections,
+     * and featured rows only show items from those categories.
      */
     private fun buildM3UHomePage(entries: List<M3UEntry>, lists: MutableList<HomePageList>) {
         val filter = parseCategoryFilter()
 
-        // ══════════════════════════════════════════════════════════════
-        //  BROWSE CATEGORIES section (always shown when there are many categories)
-        // ══════════════════════════════════════════════════════════════
-        val movieGroups = entries.filter { it.type == "movie" }.groupBy { it.group }
-        val seriesGroups = entries.filter { it.type == "series" }.groupBy { it.group }
-        val liveGroups = entries.filter { it.type == "live" }.groupBy { it.group }
+        val allMovies = entries.filter { it.type == "movie" }
+        val allSeries = entries.filter { it.type == "series" }
+        val allLive = entries.filter { it.type == "live" }
 
-        // Category browser: show category cards that expand when clicked
-        if (movieGroups.size > MAX_CATEGORIES || seriesGroups.size > MAX_CATEGORIES) {
-            val catCards = mutableListOf<SearchResponse>()
+        val movieGroups = allMovies.groupBy { it.group }
+        val seriesGroups = allSeries.groupBy { it.group }
+        val liveGroups = allLive.groupBy { it.group }
 
-            // Movie category cards
-            movieGroups.keys.sorted().forEach { group ->
-                val count = movieGroups[group]?.size ?: 0
+        // Apply category filter to groups
+        val filteredMovieGroups = filterGroups(movieGroups, filter)
+        val filteredSeriesGroups = filterGroups(seriesGroups, filter)
+        val filteredLiveGroups = filterGroups(liveGroups, filter)
+
+        // ══════════════════════════════════════════════════════════════
+        //  BROWSE CATEGORIES — clickable category cards
+        // ══════════════════════════════════════════════════════════════
+
+        // Movie categories
+        if (filteredMovieGroups.isNotEmpty()) {
+            val catCards = filteredMovieGroups.keys.sorted().map { group ->
+                val count = filteredMovieGroups[group]?.size ?: 0
                 val ref = EntryRef("", "movie_cat", group, group)
-                catCards.add(newMovieSearchResponse("$group ($count)", ref.toJson(), TvType.Movie) {})
-            }
-            // Series category cards
-            seriesGroups.keys.sorted().forEach { group ->
-                val items = seriesGroups[group] ?: emptyList()
-                val uniqueSeries = items.map { it.seriesName.ifBlank { extractSeriesName(it.name) } }.distinct().size
-                val ref = EntryRef("", "series_cat", group, group)
-                catCards.add(newTvSeriesSearchResponse("$group ($uniqueSeries)", ref.toJson(), TvType.TvSeries) {})
+                newMovieSearchResponse("$group ($count)", ref.toJson(), TvType.Movie) {}
             }
             if (catCards.isNotEmpty()) {
-                lists.add(HomePageList("\uD83D\uDCC2 Browse Categories", catCards))
+                lists.add(HomePageList("\uD83D\uDCC2 Movie Categories", catCards))
+            }
+        }
+
+        // Series categories
+        if (filteredSeriesGroups.isNotEmpty()) {
+            val catCards = filteredSeriesGroups.keys.sorted().map { group ->
+                val items = filteredSeriesGroups[group] ?: emptyList()
+                val uniqueSeries = items.map { it.seriesName.ifBlank { extractSeriesName(it.name) } }.distinct().size
+                val ref = EntryRef("", "series_cat", group, group)
+                newTvSeriesSearchResponse("$group ($uniqueSeries)", ref.toJson(), TvType.TvSeries) {}
+            }
+            if (catCards.isNotEmpty()) {
+                lists.add(HomePageList("\uD83D\uDCC2 Series Categories", catCards))
+            }
+        }
+
+        // Live TV categories
+        if (filteredLiveGroups.isNotEmpty()) {
+            val catCards = filteredLiveGroups.keys.sorted().map { group ->
+                val count = filteredLiveGroups[group]?.size ?: 0
+                val ref = EntryRef("", "live_cat", group, group)
+                newMovieSearchResponse("$group ($count)", ref.toJson(), TvType.Live) {}
+            }
+            if (catCards.isNotEmpty()) {
+                lists.add(HomePageList("\uD83D\uDCC2 Live TV Categories", catCards))
             }
         }
 
         // ══════════════════════════════════════════════════════════════
-        //  LIVE TV
+        //  FEATURED ROWS — sample content across filtered categories
         // ══════════════════════════════════════════════════════════════
-        val filteredLiveGroups = filterGroups(liveGroups, filter, MAX_CATEGORIES)
-        filteredLiveGroups.shown.forEach { (group, items) ->
-            val homeItems = items.take(40).map { entry ->
-                val ref = EntryRef(entry.streamUrl, "live", entry.name, entry.group, entry.logo)
-                newMovieSearchResponse(entry.name, ref.toJson(), TvType.Live) { posterUrl = entry.logo }
-            }
-            if (homeItems.isNotEmpty()) lists.add(HomePageList("\uD83D\uDCFA $group", homeItems))
-        }
-        if (filteredLiveGroups.other.isNotEmpty()) {
-            val homeItems = filteredLiveGroups.other.take(40).map { entry ->
-                val ref = EntryRef(entry.streamUrl, "live", entry.name, entry.group, entry.logo)
-                newMovieSearchResponse(entry.name, ref.toJson(), TvType.Live) { posterUrl = entry.logo }
-            }
-            if (homeItems.isNotEmpty()) lists.add(HomePageList("\uD83D\uDCFA Other Live", homeItems))
-        }
+        val filteredMovies = filteredMovieGroups.values.flatten()
+        val filteredSeries = filteredSeriesGroups.values.flatten()
+        val filteredLive = filteredLiveGroups.values.flatten()
 
-        // ══════════════════════════════════════════════════════════════
-        //  MOVIES
-        // ══════════════════════════════════════════════════════════════
-        val filteredMovieGroups = filterGroups(movieGroups, filter, MAX_CATEGORIES)
-        filteredMovieGroups.shown.forEach { (group, items) ->
-            val homeItems = items.take(40).map { entry ->
+        // Featured Movies (pick 20 from largest categories)
+        if (filteredMovies.isNotEmpty()) {
+            val homeItems = filteredMovies.take(20).map { entry ->
                 val ref = EntryRef(entry.streamUrl, "movie", entry.name, entry.group, entry.logo)
                 newMovieSearchResponse(entry.name, ref.toJson(), TvType.Movie) { posterUrl = entry.logo }
             }
-            if (homeItems.isNotEmpty()) lists.add(HomePageList("\uD83C\uDFAC $group", homeItems))
-        }
-        if (filteredMovieGroups.other.isNotEmpty()) {
-            val homeItems = filteredMovieGroups.other.take(40).map { entry ->
-                val ref = EntryRef(entry.streamUrl, "movie", entry.name, entry.group, entry.logo)
-                newMovieSearchResponse(entry.name, ref.toJson(), TvType.Movie) { posterUrl = entry.logo }
-            }
-            if (homeItems.isNotEmpty()) lists.add(HomePageList("\uD83C\uDFAC Other Movies", homeItems))
+            lists.add(HomePageList("\uD83C\uDFAC Featured Movies", homeItems))
         }
 
-        // ══════════════════════════════════════════════════════════════
-        //  SERIES
-        // ══════════════════════════════════════════════════════════════
-        val filteredSeriesGroups = filterGroups(seriesGroups, filter, MAX_CATEGORIES)
-        filteredSeriesGroups.shown.forEach { (group, items) ->
-            val uniqueSeries = items.groupBy { it.seriesName.ifBlank { extractSeriesName(it.name) } }
-            val homeItems = uniqueSeries.map { (seriesName, episodes) ->
-                val first = episodes.first()
-                val ref = EntryRef(first.streamUrl, "series", seriesName, group, first.logo, seriesName)
-                if (episodes.size > 1) {
-                    newTvSeriesSearchResponse(seriesName, ref.toJson(), TvType.TvSeries) { posterUrl = first.logo }
-                } else {
-                    newMovieSearchResponse(seriesName, ref.toJson(), TvType.Movie) { posterUrl = first.logo }
-                }
-            }.take(40)
-            if (homeItems.isNotEmpty()) lists.add(HomePageList("\uD83C\uDFB6 $group", homeItems))
-        }
-        if (filteredSeriesGroups.other.isNotEmpty()) {
-            val allOther = filteredSeriesGroups.other
-            val uniqueSeries = allOther.groupBy { it.seriesName.ifBlank { extractSeriesName(it.name) } }
-            val homeItems = uniqueSeries.map { (seriesName, episodes) ->
+        // Featured Series (pick 20 unique series)
+        if (filteredSeries.isNotEmpty()) {
+            val uniqueSeries = filteredSeries.groupBy { it.seriesName.ifBlank { extractSeriesName(it.name) } }
+            val homeItems = uniqueSeries.entries.take(20).map { (seriesName, episodes) ->
                 val first = episodes.first()
                 val ref = EntryRef(first.streamUrl, "series", seriesName, first.group, first.logo, seriesName)
                 if (episodes.size > 1) {
@@ -585,38 +572,33 @@ class XtreamIPTVProvider : MainAPI() {
                 } else {
                     newMovieSearchResponse(seriesName, ref.toJson(), TvType.Movie) { posterUrl = first.logo }
                 }
-            }.take(40)
-            if (homeItems.isNotEmpty()) lists.add(HomePageList("\uD83C\uDFB6 Other Series", homeItems))
+            }
+            lists.add(HomePageList("\uD83C\uDFB6 Featured Series", homeItems))
+        }
+
+        // Live TV (pick 20 channels)
+        if (filteredLive.isNotEmpty()) {
+            val homeItems = filteredLive.take(20).map { entry ->
+                val ref = EntryRef(entry.streamUrl, "live", entry.name, entry.group, entry.logo)
+                newMovieSearchResponse(entry.name, ref.toJson(), TvType.Live) { posterUrl = entry.logo }
+            }
+            lists.add(HomePageList("\uD83D\uDCFA Live TV", homeItems))
         }
     }
 
     /**
-     * Filter and limit groups based on category filter and max count.
-     * Returns the top groups to show individually, and remaining items in "other".
+     * Filter groups based on category filter from URL.
+     * If no filter specified, returns all groups.
+     * If filter specified, only returns groups matching any filter fragment.
      */
-    private data class FilteredGroups(
-        val shown: Map<String, List<M3UEntry>>,
-        val other: List<M3UEntry>
-    )
-
     private fun filterGroups(
         groups: Map<String, List<M3UEntry>>,
-        filter: List<String>?,
-        maxCategories: Int
-    ): FilteredGroups {
-        if (filter != null) {
-            // User specified category filter - show only matching categories
-            val matched = groups.filter { (group, _) ->
-                filter.any { f -> group.contains(f, ignoreCase = true) }
-            }
-            return FilteredGroups(matched, emptyList())
+        filter: List<String>?
+    ): Map<String, List<M3UEntry>> {
+        if (filter == null) return groups
+        return groups.filter { (group, _) ->
+            filter.any { f -> group.contains(f, ignoreCase = true) }
         }
-
-        // No filter: show top N categories by item count, rest go to "other"
-        val sorted = groups.entries.sortedByDescending { it.value.size }
-        val shown = sorted.take(maxCategories).associate { it.key to it.value }
-        val otherItems = sorted.drop(maxCategories).flatMap { it.value }
-        return FilteredGroups(shown, otherItems)
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -715,6 +697,26 @@ class XtreamIPTVProvider : MainAPI() {
                 }
                 newTvSeriesLoadResponse(ref.group, ref.toJson(), TvType.TvSeries, episodes) {
                     plot = "${uniqueSeries.size} series in this category"
+                }
+            }
+            // ── Category browser: Live TV category card clicked ──
+            "live_cat" -> {
+                val allEntries = cachedM3U ?: return null
+                val catEntries = allEntries.filter { it.group == ref.group && it.type == "live" }
+                if (catEntries.isEmpty()) return null
+
+                // Show live channels in this category as "episodes"
+                val episodes = catEntries.mapIndexed { idx, entry ->
+                    val epRef = EntryRef(entry.streamUrl, "live", entry.name, entry.group, entry.logo)
+                    newEpisode(epRef.toJson()) {
+                        name = entry.name
+                        season = 1
+                        episode = idx + 1
+                        posterUrl = entry.logo
+                    }
+                }
+                newTvSeriesLoadResponse(ref.group, ref.toJson(), TvType.TvSeries, episodes) {
+                    plot = "${catEntries.size} channels in this category"
                 }
             }
             "series" -> {
