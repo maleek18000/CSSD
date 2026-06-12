@@ -712,14 +712,13 @@ class XtreamIPTVProvider : MainAPI() {
                 val catEntries = allEntries.filter { it.group == ref.group && it.type == "movie" }
                 if (catEntries.isEmpty()) return null
 
-                // Show each movie as its own season with 1 episode, so they're
-                // listed as separate cards rather than numbered episodes
+                // Each movie as a clickable entry in the episode list
                 val episodes = catEntries.mapIndexed { idx, entry ->
                     val epRef = EntryRef(entry.streamUrl, "movie", entry.name, entry.group, entry.logo)
                     newEpisode(epRef.toJson()) {
                         name = entry.name
-                        season = idx + 1
-                        episode = 1
+                        season = 1
+                        episode = idx + 1
                         posterUrl = entry.logo
                     }
                 }
@@ -733,17 +732,17 @@ class XtreamIPTVProvider : MainAPI() {
                 val catEntries = allEntries.filter { it.group == ref.group && it.type == "series" }
                 if (catEntries.isEmpty()) return null
 
-                // Group by series name, show each series as its own "season"
-                // This way each show appears as a separate season tab,
-                // and clicking it opens the show's detail page with real seasons/episodes
+                // Group by series name — each series appears as a clickable entry
+                // in the episode list. Clicking it opens the show's detail page
+                // with its real seasons and episodes.
                 val uniqueSeries = catEntries.groupBy { it.seriesName.ifBlank { extractSeriesName(it.name) } }
                 val episodes = uniqueSeries.entries.mapIndexed { idx, (seriesName, sEpisodes) ->
                     val first = sEpisodes.first()
                     val epRef = EntryRef(first.streamUrl, "series", seriesName, ref.group, first.logo, seriesName)
                     newEpisode(epRef.toJson()) {
                         name = seriesName
-                        season = idx + 1
-                        episode = 1
+                        season = 1
+                        episode = idx + 1
                         posterUrl = first.logo
                     }
                 }
@@ -761,8 +760,8 @@ class XtreamIPTVProvider : MainAPI() {
                     val epRef = EntryRef(entry.streamUrl, "live", entry.name, entry.group, entry.logo)
                     newEpisode(epRef.toJson()) {
                         name = entry.name
-                        season = idx + 1
-                        episode = 1
+                        season = 1
+                        episode = idx + 1
                         posterUrl = entry.logo
                     }
                 }
@@ -780,12 +779,11 @@ class XtreamIPTVProvider : MainAPI() {
                 val streams = tryParseJson<List<XVod>>(streamsText) ?: return null
                 if (streams.isEmpty()) return null
 
-                // Each movie as its own season
                 val episodes = streams.mapIndexed { idx, s ->
                     newEpisode(ItemRef("m", s.stream_id, s.name, s.container_extension ?: "mp4").toJson()) {
                         name = s.name
-                        season = idx + 1
-                        episode = 1
+                        season = 1
+                        episode = idx + 1
                         posterUrl = s.stream_icon
                     }
                 }
@@ -803,12 +801,12 @@ class XtreamIPTVProvider : MainAPI() {
                 val series = tryParseJson<List<XSeries>>(seriesText) ?: return null
                 if (series.isEmpty()) return null
 
-                // Each series as its own season, clicking opens show detail
+                // Each series as a clickable entry — clicking opens show detail
                 val episodes = series.mapIndexed { idx, s ->
                     newEpisode(ItemRef("s", s.series_id, s.name).toJson()) {
                         name = s.name
-                        season = idx + 1
-                        episode = 1
+                        season = 1
+                        episode = idx + 1
                         posterUrl = s.cover
                     }
                 }
@@ -826,12 +824,11 @@ class XtreamIPTVProvider : MainAPI() {
                 val streams = tryParseJson<List<XLive>>(streamsText) ?: return null
                 if (streams.isEmpty()) return null
 
-                // Each channel as its own season
                 val episodes = streams.mapIndexed { idx, s ->
                     newEpisode(ItemRef("l", s.stream_id, s.name).toJson()) {
                         name = s.name
-                        season = idx + 1
-                        episode = 1
+                        season = 1
+                        episode = idx + 1
                         posterUrl = s.stream_icon
                     }
                 }
@@ -959,11 +956,60 @@ class XtreamIPTVProvider : MainAPI() {
     }
 
     private suspend fun loadM3ULinks(ref: EntryRef, callback: (ExtractorLink) -> Unit): Boolean {
+        val streamHeaders = mapOf("User-Agent" to "okhttp/4.12.0")
+
+        // ── Series browse: clicked a series from category page ──
+        // Return all episodes of this series as separate links
+        if (ref.type == "series_browse") {
+            val allEntries = cachedM3U ?: return false
+            val seriesName = ref.seriesName.ifBlank { extractSeriesName(ref.name) }
+            val episodes = allEntries.filter {
+                (it.seriesName.ifBlank { extractSeriesName(it.name) }) == seriesName && it.type == "series"
+            }
+            if (episodes.isEmpty()) return false
+
+            episodes.forEach { entry ->
+                val url = entry.streamUrl
+                val lower = url.lowercase()
+                val (sNum, eNum) = parseSeasonEpisode(entry.name)
+                val epLabel = "S${sNum}E${eNum} - ${entry.name}"
+
+                if (lower.endsWith(".m3u8")) {
+                    callback(
+                        newExtractorLink(name, epLabel, url) {
+                            quality = guessQuality(entry.name)
+                            type = ExtractorLinkType.M3U8
+                            headers = streamHeaders
+                        }
+                    )
+                } else {
+                    callback(
+                        newExtractorLink(name, epLabel, url) {
+                            quality = guessQuality(entry.name)
+                            type = ExtractorLinkType.VIDEO
+                            headers = streamHeaders
+                        }
+                    )
+                    // Also try .m3u8 variant for /series/ paths
+                    if (lower.contains("/series/")) {
+                        val base = url.substringBeforeLast(".")
+                        callback(
+                            newExtractorLink(name, "$epLabel (HLS)", "$base.m3u8") {
+                                quality = guessQuality(entry.name)
+                                type = ExtractorLinkType.M3U8
+                                headers = streamHeaders
+                            }
+                        )
+                    }
+                }
+            }
+            return true
+        }
+
         val url = ref.url
         if (url.isEmpty()) return false
 
         val lower = url.lowercase()
-        val streamHeaders = mapOf("User-Agent" to "okhttp/4.12.0")
 
         when {
             // Live stream with /live/ path: offer both .m3u8 and .ts
