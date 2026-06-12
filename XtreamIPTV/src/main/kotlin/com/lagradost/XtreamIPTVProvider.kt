@@ -68,9 +68,13 @@ data class XEpInfo(val plot: String? = null, val image: String? = null)
 data class ItemRef(val t: String, val id: Int, val n: String, val e: String? = null)
 data class LinkData(val t: String, val id: Int, val e: String? = null)
 
-// Pre-embedded episode data — no need for cachedM3U in loadLinks()
-data class EpLink(val name: String, val url: String, val season: Int, val episode: Int)
-data class SeriesEpisodesData(val type: String = "series_episodes", val episodes: List<EpLink>)
+// Category episode data — uses List<String> (not custom objects) for reliable Gson parsing
+// All fields have defaults so Gson can construct this on Android
+data class CatEpData(
+    val _cat_ep: Boolean = true,
+    val urls: List<String> = emptyList(),
+    val labels: List<String> = emptyList()
+)
 
 // ═══════════════════════════════════════════════════════════════════
 //  RAW HTTP CLIENT  (bypasses CloudStream's app.get to avoid 403)
@@ -862,7 +866,7 @@ class XtreamIPTVProvider : MainAPI() {
             }
             // ── Category browser: Series category card clicked ──
             // Each series is shown as an episode. All episode stream URLs
-            // are pre-embedded so loadLinks() works without cachedM3U.
+            // are pre-embedded as List<String> so loadLinks() works without cachedM3U.
             // Clicking a series shows all its episodes in the source picker.
             "series_cat" -> {
                 val allEntries = cachedM3U ?: return null
@@ -871,12 +875,13 @@ class XtreamIPTVProvider : MainAPI() {
 
                 val uniqueSeries = catEntries.groupBy { it.seriesName.ifBlank { extractSeriesName(it.name) } }
                 val episodes = uniqueSeries.entries.mapIndexed { idx, (seriesName, sEpisodes) ->
-                    // Pre-embed ALL episode URLs into the episode data
-                    val epLinks = sEpisodes.map { entry ->
+                    // Pre-embed ALL episode URLs as simple string arrays
+                    val urls = sEpisodes.map { it.streamUrl }
+                    val labels = sEpisodes.map { entry ->
                         val (sNum, eNum) = parseSeasonEpisode(entry.name)
-                        EpLink(entry.name, entry.streamUrl, sNum, if (eNum > 0) eNum else 1)
+                        "S${sNum}E${if (eNum > 0) eNum else 1}"
                     }
-                    val data = SeriesEpisodesData("series_episodes", epLinks)
+                    val data = CatEpData(true, urls, labels)
                     newEpisode(data.toJson()) {
                         name = seriesName
                         season = 1
@@ -1081,19 +1086,22 @@ class XtreamIPTVProvider : MainAPI() {
         val streamHeaders = mapOf("User-Agent" to "okhttp/4.12.0")
 
         // ── Pre-embedded series episodes (from category page) ──
-        // All episode URLs are embedded in the data — no need for cachedM3U.
+        // Uses CatEpData with List<String> (not custom objects) for reliable Gson parsing.
         // Clicking a series from a category shows all its episodes as source links.
-        val seriesData = tryParseJson<SeriesEpisodesData>(data)
-        if (seriesData != null && seriesData.type == "series_episodes") {
-            if (seriesData.episodes.isEmpty()) return false
+        val catEpData = tryParseJson<CatEpData>(data)
+        if (catEpData != null && catEpData._cat_ep) {
+            val urls = catEpData.urls
+            val labels = catEpData.labels
+            if (urls.isNullOrEmpty()) return false
 
-            seriesData.episodes.forEach { ep ->
-                val lower = ep.url.lowercase()
-                val epLabel = "S${ep.season}E${ep.episode}"
+            urls.forEachIndexed { idx, url ->
+                if (url.isEmpty()) return@forEachIndexed
+                val lower = url.lowercase()
+                val label = if (idx < labels.size) labels[idx] else "Episode ${idx + 1}"
 
                 if (lower.endsWith(".m3u8")) {
                     callback(
-                        newExtractorLink(name, epLabel, ep.url) {
+                        newExtractorLink(name, label, url) {
                             quality = Qualities.Unknown.value
                             type = ExtractorLinkType.M3U8
                             headers = streamHeaders
@@ -1101,7 +1109,7 @@ class XtreamIPTVProvider : MainAPI() {
                     )
                 } else {
                     callback(
-                        newExtractorLink(name, epLabel, ep.url) {
+                        newExtractorLink(name, label, url) {
                             quality = Qualities.Unknown.value
                             type = ExtractorLinkType.VIDEO
                             headers = streamHeaders
@@ -1109,9 +1117,9 @@ class XtreamIPTVProvider : MainAPI() {
                     )
                     // Also try .m3u8 variant for /series/ paths
                     if (lower.contains("/series/")) {
-                        val base = ep.url.substringBeforeLast(".")
+                        val base = url.substringBeforeLast(".")
                         callback(
-                            newExtractorLink(name, "$epLabel (HLS)", "$base.m3u8") {
+                            newExtractorLink(name, "$label (HLS)", "$base.m3u8") {
                                 quality = Qualities.Unknown.value
                                 type = ExtractorLinkType.M3U8
                                 headers = streamHeaders
