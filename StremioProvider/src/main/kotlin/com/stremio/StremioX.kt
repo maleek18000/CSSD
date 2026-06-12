@@ -7,13 +7,11 @@ import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Interceptor
 
 class StremioX(
@@ -170,7 +168,7 @@ class StremioX(
             it.name?.substringAfter("Phim")?.trim()
         } ?: emptyList()
 
-        val isAnime = genres.contains("Hoat Hinh") &&
+        val isAnime = genres.contains("Hoạt Hình") &&
             (englishDetail.original_language in listOf("zh", "ja"))
 
         val isAsian = when {
@@ -276,95 +274,45 @@ class StremioX(
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        Log.d("StremioX", "=== loadLinks START ===")
-        Log.d("StremioX", "mainUrl=$mainUrl")
-        Log.d("StremioX", "raw data=$data")
-
         val linkData = try {
             mapper.readValue(data, LinkData::class.java)
         } catch (e: Exception) {
-            Log.e("StremioX", "Failed to parse LinkData: $data", e)
             return false
         }
 
-        Log.d("StremioX", "Parsed LinkData: imdbId=${linkData.imdbId}, id=${linkData.id}, season=${linkData.season}, episode=${linkData.episode}")
-
         // Set subtitle auto-select language
         try {
-            val context = CloudStreamApp.context
-            val subsAutoSelect = try {
-                val prefs = context?.getSharedPreferences("stremio_prefs", 0)
-                prefs?.getString("app_locale", null)
-            } catch (e: Exception) { null }
-            if (subsAutoSelect != null) {
-                AcraApplication.setKey("subs_auto_select", subsAutoSelect)
-            }
+            AcraApplication.setKey("subs_auto_select", language)
         } catch (_: Exception) {}
 
-        val streamId = linkData.imdbId ?: linkData.id?.toString() ?: ""
-
-        // Try the configured addon first
-        try {
-            invokeMainSource(mainUrl, name, streamId, linkData.season, linkData.episode, subtitleCallback, callback)
-        } catch (e: Exception) {
-            Log.e("StremioX", "invokeMainSource failed for $mainUrl: ${e.message}")
+        // Run all async: addon streams + subtitle extractors
+        coroutineScope {
+            listOf(
+                async(Dispatchers.IO) {
+                    try {
+                        invokeMainSource(
+                            mainUrl, name,
+                            linkData.imdbId ?: linkData.id?.toString() ?: "",
+                            linkData.season, linkData.episode,
+                            subtitleCallback, callback
+                        )
+                    } catch (_: Exception) {}
+                },
+                async(Dispatchers.IO) {
+                    try { invokeStremio(linkData.imdbId, linkData.season, linkData.episode, subtitleCallback) } catch (_: Exception) {}
+                },
+                async(Dispatchers.IO) {
+                    try { invokeOpensub(linkData.imdbId, linkData.season, linkData.episode, subtitleCallback) } catch (_: Exception) {}
+                },
+                async(Dispatchers.IO) {
+                    try { invokeSubsource(linkData.title, linkData.imdbId, linkData.season, linkData.episode, subtitleCallback) } catch (_: Exception) {}
+                },
+                async(Dispatchers.IO) {
+                    try { invokeWatchsomuch(linkData.imdbId, linkData.season, linkData.episode, subtitleCallback) } catch (_: Exception) {}
+                }
+            ).awaitAll()
         }
 
-        // If imdbId exists, also try torrentio as a backup
-        if (linkData.imdbId != null) {
-            try {
-                invokeMainSource("https://torrentio.strem.fun", name, linkData.imdbId, linkData.season, linkData.episode, subtitleCallback, callback)
-            } catch (e: Exception) {
-                Log.e("StremioX", "Torrentio fallback failed: ${e.message}")
-            }
-        }
-
-        // Load subtitles with timeout protection
-        try {
-            coroutineScope {
-                listOf(
-                    async(Dispatchers.IO) {
-                        try {
-                            withTimeoutOrNull(8_000L) {
-                                invokeStremio(linkData.imdbId, linkData.season, linkData.episode, subtitleCallback)
-                            }
-                        } catch (_: Exception) {}
-                    },
-                    async(Dispatchers.IO) {
-                        try {
-                            withTimeoutOrNull(8_000L) {
-                                invokeOpensub(linkData.imdbId, linkData.season, linkData.episode, subtitleCallback)
-                            }
-                        } catch (_: Exception) {}
-                    },
-                    async(Dispatchers.IO) {
-                        try {
-                            withTimeoutOrNull(8_000L) {
-                                invokeSubsource(linkData.title, linkData.imdbId, linkData.season, linkData.episode, subtitleCallback)
-                            }
-                        } catch (_: Exception) {}
-                    },
-                    async(Dispatchers.IO) {
-                        try {
-                            withTimeoutOrNull(8_000L) {
-                                invokeWatchsomuch(linkData.imdbId, linkData.season, linkData.episode, subtitleCallback)
-                            }
-                        } catch (_: Exception) {}
-                    },
-                    async(Dispatchers.IO) {
-                        try {
-                            withTimeoutOrNull(8_000L) {
-                                invokeXemphim(linkData.title, linkData.year, linkData.isAnime, subtitleCallback)
-                            }
-                        } catch (_: Exception) {}
-                    }
-                ).awaitAll()
-            }
-        } catch (e: Exception) {
-            Log.e("StremioX", "Subtitle loading failed: ${e.message}")
-        }
-
-        Log.d("StremioX", "=== loadLinks END ===")
         return true
     }
 

@@ -92,72 +92,55 @@ suspend fun invokeMainSource(
 
     val fixedUrl = fixSourceUrl(baseUrl)
 
-    // Construct stream URLs - try multiple formats
-    val streamUrls = mutableListOf<String>()
-
-    // Format 1: Standard Stremio protocol
-    if (season != null && episode != null) {
-        streamUrls.add("$fixedUrl/stream/series/$imdbId:$season:$episode.json")
+    // Construct stream URL - matching original: $baseUrl/stream/$type/$id.json
+    // For series with season/episode, the ID should be: imdbId:season:episode
+    val streamUrl = if (season != null && episode != null) {
+        "$fixedUrl/stream/series/$imdbId:$season:$episode.json"
     } else if (season != null) {
-        streamUrls.add("$fixedUrl/stream/series/$imdbId:$season:1.json")
+        "$fixedUrl/stream/series/$imdbId:$season:1.json"
     } else {
-        streamUrls.add("$fixedUrl/stream/movie/$imdbId.json")
+        "$fixedUrl/stream/movie/$imdbId.json"
     }
 
-    // Format 2: If ID already has colons, try it directly
-    if (imdbId.contains(":")) {
-        val type = if (season != null) "series" else "movie"
-        streamUrls.add("$fixedUrl/stream/$type/$imdbId.json")
-    }
+    Log.d("StremioUtil", "invokeMainSource URL: $streamUrl")
 
-    // Format 3: Try with just the base ID (strip :season:episode if present)
-    val baseId = imdbId.split(":").firstOrNull() ?: imdbId
-    if (baseId != imdbId && season != null && episode != null) {
-        streamUrls.add("$fixedUrl/stream/series/$baseId:$season:$episode.json")
-    }
+    try {
+        val response = app.get(streamUrl, timeout = 15)
+        Log.d("StremioUtil", "Response: code=${response.code}, length=${response.text.length}")
 
-    for (streamUrl in streamUrls.distinct()) {
-        try {
-            Log.d("StremioUtil", "Trying: $streamUrl")
-            val response = app.get(streamUrl, timeout = 15)
-            Log.d("StremioUtil", "Response: code=${response.code}, length=${response.text.length}")
+        if (!response.isSuccessful || response.text.isEmpty()) return
 
-            if (!response.isSuccessful || response.text.isEmpty()) continue
+        // Try standard parsing first
+        val streamsResponse = tryParseJson<StreamsResponse>(response.text)
+        val streams = streamsResponse?.streams
 
-            // Try standard parsing first
-            val streamsResponse = tryParseJson<StreamsResponse>(response.text)
-            val streams = streamsResponse?.streams
-
-            if (!streams.isNullOrEmpty()) {
-                Log.d("StremioUtil", "Found ${streams.size} streams via tryParseJson")
-                for (stream in streams) {
-                    try {
-                        processStreamUtil(stream, providerName, subtitleCallback, callback)
-                    } catch (e: Exception) {
-                        Log.e("StremioUtil", "Error processing stream: ${e.message}")
-                    }
+        if (!streams.isNullOrEmpty()) {
+            Log.d("StremioUtil", "Found ${streams.size} streams via tryParseJson")
+            for (stream in streams) {
+                try {
+                    processStreamUtil(stream, providerName, subtitleCallback, callback)
+                } catch (e: Exception) {
+                    Log.e("StremioUtil", "Error processing stream: ${e.message}")
                 }
-                return // Success, don't try more URLs
             }
-
-            // tryParseJson failed or returned empty - try manual JSON parsing
-            Log.d("StremioUtil", "tryParseJson returned no streams, trying manual parse")
-            val found = tryManualStreamParse(response.text, providerName, subtitleCallback, callback)
-            if (found) {
-                Log.d("StremioUtil", "Found streams via manual parse")
-                return
-            }
-
-            Log.d("StremioUtil", "Response preview: ${response.text.take(200)}")
-
-        } catch (e: Exception) {
-            Log.e("StremioUtil", "URL failed: $streamUrl - ${e.message}")
+            return
         }
+
+        // tryParseJson failed or returned empty - try manual JSON parsing
+        Log.d("StremioUtil", "tryParseJson returned no streams, trying manual parse")
+        val found = tryManualStreamParseUtil(response.text, providerName, subtitleCallback, callback)
+        if (found) {
+            Log.d("StremioUtil", "Found streams via manual parse")
+        }
+
+    } catch (e: Exception) {
+        Log.e("StremioUtil", "URL failed: $streamUrl - ${e.message}")
     }
 }
 
 /**
- * Process a single Stream object into extractor links
+ * Process a single Stream object into extractor links.
+ * Matches the original working implementation's logic.
  */
 private suspend fun processStreamUtil(
     stream: Stream,
@@ -165,28 +148,26 @@ private suspend fun processStreamUtil(
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit
 ) {
-    val streamName = stream.name ?: ""
-    val streamTitle = stream.title ?: stream.name ?: ""
-
     when {
         stream.url != null -> {
-            var referer: String? = null
-            try {
-                val headers = stream.behaviorHints?.proxyHeaders?.request
-                referer = headers?.get("referer") ?: headers?.get("origin")
-            } catch (_: Exception) {}
+            val fixedName = fixSourceName(stream.name, stream.title, stream.description)
+            val qualityTitle = buildExtractedTitle(extractSpecs(fixedName))
 
-            val isM3u8 = stream.url.endsWith(".m3u8")
-            val linkType = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            // Get headers from proxyHeaders.request first, then fallback to behaviorHints.headers
+            val headers = stream.behaviorHints?.proxyHeaders?.request
+                ?: stream.behaviorHints?.headers
+                ?: emptyMap()
+
             callback.invoke(
                 newExtractorLink(
-                    source = streamName,
-                    name = streamTitle,
+                    source = stream.name ?: "",
+                    name = qualityTitle,
                     url = stream.url,
-                    type = linkType
+                    type = if (stream.url.endsWith(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                 ) {
-                    this.referer = referer ?: ""
-                    this.quality = Qualities.Unknown.value
+                    this.referer = ""
+                    this.quality = getQuality(listOf(stream.description, stream.title, stream.name))
+                    this.headers = headers
                 }
             )
         }
@@ -231,7 +212,7 @@ private suspend fun processStreamUtil(
         }
 
         else -> {
-            Log.w("StremioUtil", "Stream has no url/ytId/externalUrl/infoHash: $streamTitle")
+            Log.w("StremioUtil", "Stream has no url/ytId/externalUrl/infoHash: ${stream.title}")
         }
     }
 
@@ -251,7 +232,7 @@ private suspend fun processStreamUtil(
  * Manual JSON parsing fallback - uses Jackson's JsonNode tree model
  * which is much more forgiving than data class binding.
  */
-private suspend fun tryManualStreamParse(
+private suspend fun tryManualStreamParseUtil(
     responseText: String,
     providerName: String,
     subtitleCallback: (SubtitleFile) -> Unit,
@@ -271,28 +252,38 @@ private suspend fun tryManualStreamParse(
                 val infoHash = streamNode.get("infoHash")?.asText()
                 val streamTitle = streamNode.get("title")?.asText() ?: streamNode.get("name")?.asText() ?: ""
                 val streamName = streamNode.get("name")?.asText() ?: ""
+                val streamDesc = streamNode.get("description")?.asText() ?: ""
 
                 when {
                     url != null -> {
-                        val isM3u8 = url.endsWith(".m3u8")
-                        val linkType = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                        var referer = ""
-                        try {
-                            val headers = streamNode.get("behaviorHints")
+                        val fixedName = fixSourceName(streamName, streamTitle, streamDesc)
+                        val qualityTitle = buildExtractedTitle(extractSpecs(fixedName))
+
+                        // Get headers from proxyHeaders or behaviorHints.headers (as Map<String, String>)
+                        val headers = try {
+                            streamNode.get("behaviorHints")
                                 ?.get("proxyHeaders")?.get("request")
-                            referer = headers?.get("referer")?.asText()
-                                ?: headers?.get("origin")?.asText() ?: ""
-                        } catch (_: Exception) {}
+                                ?.fields()?.asSequence()
+                                ?.associate { it.key to it.value.asText() }
+                                ?: streamNode.get("behaviorHints")
+                                    ?.get("headers")
+                                    ?.fields()?.asSequence()
+                                    ?.associate { it.key to it.value.asText() }
+                                ?: emptyMap()
+                        } catch (_: Exception) {
+                            emptyMap()
+                        }
 
                         callback.invoke(
                             newExtractorLink(
                                 source = streamName.ifBlank { streamTitle },
-                                name = streamTitle.ifBlank { streamName },
+                                name = qualityTitle.ifBlank { streamTitle },
                                 url = url,
-                                type = linkType
+                                type = if (url.endsWith(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                             ) {
-                                this.referer = referer
-                                this.quality = Qualities.Unknown.value
+                                this.referer = ""
+                                this.quality = getQuality(listOf(streamDesc, streamTitle, streamName))
+                                this.headers = headers
                             }
                         )
                         found = true
