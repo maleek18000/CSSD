@@ -12,6 +12,7 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
@@ -31,7 +32,7 @@ class XtreamIPTVPlugin : Plugin() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  DATA CLASSES
+//  DATA CLASSES  (top-level to avoid D8 metadata crash)
 // ═══════════════════════════════════════════════════════════════════
 
 data class M3UEntry(
@@ -39,7 +40,8 @@ data class M3UEntry(
     val group: String,
     val logo: String?,
     val streamUrl: String,
-    val type: String
+    val type: String,
+    val seriesName: String = ""
 )
 
 data class EntryRef(
@@ -47,8 +49,24 @@ data class EntryRef(
     val type: String,
     val name: String,
     val group: String,
-    val logo: String? = null
+    val logo: String? = null,
+    val seriesName: String = ""
 )
+
+data class XCat(val category_id: String? = null, val category_name: String? = null)
+data class XLive(val name: String = "", val stream_id: Int = 0, val stream_icon: String? = null, val category_id: String = "")
+data class XVod(val name: String = "", val stream_id: Int = 0, val stream_icon: String? = null, val category_id: String = "", val container_extension: String? = null)
+data class XVodInfo(val info: XVodInfoDetail? = null, val movie_data: XVodStreamData? = null)
+data class XVodInfoDetail(val name: String? = null, val plot: String? = null, val genre: String? = null, val rating: String? = null, val duration: String? = null, val movie_image: String? = null, val cover: String? = null)
+data class XVodStreamData(val stream_id: Int? = null, val container_extension: String? = null)
+data class XSeries(val name: String = "", val series_id: Int = 0, val cover: String? = null, val category_id: String? = null)
+data class XSeriesInfo(val info: XSeriesDetail? = null, val episodes: Map<String, List<XEp>>? = null)
+data class XSeriesDetail(val name: String? = null, val plot: String? = null, val genre: String? = null, val rating: String? = null, val cover: String? = null)
+data class XEp(val id: Int = 0, val episode_num: Int = 0, val season_num: Int = 0, val title: String? = null, val container_extension: String? = null, val info: XEpInfo? = null)
+data class XEpInfo(val plot: String? = null, val image: String? = null)
+
+data class ItemRef(val t: String, val id: Int, val n: String, val e: String? = null)
+data class LinkData(val t: String, val id: Int, val e: String? = null)
 
 // ═══════════════════════════════════════════════════════════════════
 //  RAW HTTP CLIENT  (bypasses CloudStream's app.get to avoid 403)
@@ -59,55 +77,41 @@ object RawHttp {
     private val userAgents = listOf(
         "okhttp/4.12.0",
         "IPTVSmarters/2",
-        "TiviMate/4.7.0",
-        "okhttp/4.9.3",
-        "ExoPlayerLib/2.19.1",
-        "Lavf/60.3.100"
+        "TiviMate/4.7.0"
     )
 
     /**
      * Download a URL using raw HttpURLConnection with IPTV User-Agents.
-     * Tries each User-Agent until one returns valid data.
+     * Short timeouts to avoid CloudStream's 120s page timeout.
      */
-    suspend fun get(url: String): String? = withContext(Dispatchers.IO) {
+    suspend fun get(url: String, readTimeout: Int = 25000): String? = withContext(Dispatchers.IO) {
+        val uri = try { URI(url) } catch (_: Exception) { return@withContext null }
+        val referer = "${uri.scheme}://${uri.host}/"
+
         for (ua in userAgents) {
             try {
-                val result = fetch(url, ua)
-                if (result != null && (result.startsWith("#EXTM3U") || result.startsWith("#EXTINF") || result.startsWith("["))) {
-                    return@withContext result
-                }
+                val result = fetch(url, ua, readTimeout, mapOf(
+                    "Referer" to referer,
+                    "Accept" to "*/*"
+                ))
+                if (result != null && result.length > 10) return@withContext result
             } catch (_: Exception) { continue }
         }
-
-        // Fallback: try with referer header
-        try {
-            val uri = URI(url)
-            val referer = "${uri.scheme}://${uri.host}/"
-            for (ua in userAgents) {
-                try {
-                    val result = fetch(url, ua, mapOf("Referer" to referer, "Accept" to "*/*"))
-                    if (result != null && (result.startsWith("#EXTM3U") || result.startsWith("#EXTINF") || result.startsWith("["))) {
-                        return@withContext result
-                    }
-                } catch (_: Exception) { continue }
-            }
-        } catch (_: Exception) {}
-
         null
     }
 
-    private fun fetch(url: String, userAgent: String, extraHeaders: Map<String, String> = emptyMap()): String? {
+    private fun fetch(url: String, userAgent: String, readTimeout: Int, extraHeaders: Map<String, String>): String? {
         val conn = URL(url).openConnection() as HttpURLConnection
         try {
             conn.requestMethod = "GET"
             conn.setRequestProperty("User-Agent", userAgent)
             extraHeaders.forEach { (k, v) -> conn.setRequestProperty(k, v) }
-            conn.connectTimeout = 15000
-            conn.readTimeout = 60000  // M3U can be large
+            conn.connectTimeout = 8000
+            conn.readTimeout = readTimeout
             conn.instanceFollowRedirects = true
 
             val code = conn.responseCode
-            if (code == 403 || code == 521 || code == 503) return null
+            if (code in 400..599) return null
 
             val reader = BufferedReader(InputStreamReader(conn.inputStream, "UTF-8"))
             val sb = StringBuilder()
@@ -124,25 +128,6 @@ object RawHttp {
         }
     }
 }
-
-// ═══════════════════════════════════════════════════════════════════
-//  XTREAM API DATA CLASSES
-// ═══════════════════════════════════════════════════════════════════
-
-data class XCat(val category_id: String? = null, val category_name: String? = null)
-data class XLive(val name: String = "", val stream_id: Int = 0, val stream_icon: String? = null, val category_id: String = "")
-data class XVod(val name: String = "", val stream_id: Int = 0, val stream_icon: String? = null, val category_id: String = "", val container_extension: String? = null)
-data class XVodInfo(val info: XVodInfoDetail? = null, val movie_data: XVodStreamData? = null)
-data class XVodInfoDetail(val name: String? = null, val plot: String? = null, val genre: String? = null, val rating: String? = null, val duration: String? = null, val movie_image: String? = null, val cover: String? = null)
-data class XVodStreamData(val stream_id: Int? = null, val container_extension: String? = null)
-data class XSeries(val name: String = "", val series_id: Int = 0, val cover: String? = null, val category_id: String? = null)
-data class XSeriesInfo(val info: XSeriesDetail? = null, val episodes: Map<String, List<XEp>>? = null)
-data class XSeriesDetail(val name: String? = null, val plot: String? = null, val genre: String? = null, val rating: String? = null, val cover: String? = null)
-data class XEp(val id: Int = 0, val episode_num: Int = 0, val season_num: Int = 0, val title: String? = null, val container_extension: String? = null, val info: XEpInfo? = null)
-data class XEpInfo(val plot: String? = null, val image: String? = null)
-
-data class ItemRef(val t: String, val id: Int, val n: String, val e: String? = null)
-data class LinkData(val t: String, val id: Int, val e: String? = null)
 
 // ═══════════════════════════════════════════════════════════════════
 //  PROVIDER
@@ -165,7 +150,7 @@ class XtreamIPTVProvider : MainAPI() {
     private fun cfg(): Cfg? {
         val raw = mainUrl.trim()
 
-        // M3U URL → extract username & password from query params
+        // M3U URL -> extract username & password from query params
         if (raw.contains("get.php") || raw.contains(".m3u") || raw.contains("m3u_plus")) {
             try {
                 val qMark = raw.indexOf("?")
@@ -245,7 +230,9 @@ class XtreamIPTVProvider : MainAPI() {
                 }
 
                 if (url.isNotEmpty()) {
-                    entries.add(M3UEntry(name, group, logo, url, detectType(url, group)))
+                    val detectedType = detectType(url, group, name)
+                    val sName = if (detectedType == "series") extractSeriesName(name) else ""
+                    entries.add(M3UEntry(name, group, logo, url, detectedType, sName))
                 }
                 i = j + 1
             } else {
@@ -256,24 +243,115 @@ class XtreamIPTVProvider : MainAPI() {
     }
 
     private fun extractAttr(line: String, attr: String): String? {
-        val pattern = """$attr\s*=\s*["']([^"']*?)["']""".toRegex(RegexOption.IGNORE_CASE)
-        return pattern.find(line)?.groupValues?.getOrNull(1)?.ifBlank { null }
+        // Try double-quoted value
+        val quotedPattern = """$attr\s*=\s*"([^"]*?)"""".toRegex(RegexOption.IGNORE_CASE)
+        quotedPattern.find(line)?.let { match ->
+            return match.groupValues.getOrNull(1)?.ifBlank { null }
+        }
+        // Try single-quoted value
+        val singlePattern = """$attr\s*=\s*'([^']*?)'""".toRegex(RegexOption.IGNORE_CASE)
+        singlePattern.find(line)?.let { match ->
+            return match.groupValues.getOrNull(1)?.ifBlank { null }
+        }
+        // Try unquoted value
+        val unquotedPattern = """$attr\s*=\s*([^\s,]+)""".toRegex(RegexOption.IGNORE_CASE)
+        unquotedPattern.find(line)?.let { match ->
+            return match.groupValues.getOrNull(1)?.ifBlank { null }
+        }
+        return null
     }
 
-    private fun detectType(url: String, group: String): String {
+    /**
+     * Detect content type from URL path, group name, and entry name.
+     * Name-based detection is important for M3U playlists where URLs
+     * may not contain /series/ or /movie/ paths.
+     */
+    private fun detectType(url: String, group: String, name: String): String {
         val lower = url.lowercase()
         val groupLower = group.lowercase()
-        return when {
-            lower.contains("/live/") -> "live"
-            lower.contains("/movie/") -> "movie"
-            lower.contains("/series/") -> "series"
-            groupLower.contains("vod") || groupLower.contains("movie") ||
-            groupLower.contains("film") || groupLower.contains("أفلام") -> "movie"
-            groupLower.contains("series") || groupLower.contains("مسلسلات") -> "series"
-            lower.endsWith(".ts") || lower.endsWith(".m3u8") -> "live"
-            lower.endsWith(".mp4") || lower.endsWith(".mkv") -> "movie"
-            else -> "live"
+
+        // URL path-based detection (most reliable for Xtream Codes)
+        if (lower.contains("/live/")) return "live"
+        if (lower.contains("/movie/")) return "movie"
+        if (lower.contains("/series/")) return "series"
+
+        // Group name-based detection
+        if (groupLower.contains("series") || groupLower.contains("مسلسلات") ||
+            groupLower.contains("مسلسل") || groupLower.contains("حلقات") ||
+            groupLower.contains("série") || groupLower.contains("serien") ||
+            groupLower.contains("episod") || groupLower.contains("موسم")) return "series"
+
+        if (groupLower.contains("vod") || groupLower.contains("movie") ||
+            groupLower.contains("film") || groupLower.contains("أفلام") ||
+            groupLower.contains("فيلم") || groupLower.contains("أفلام")) return "movie"
+
+        // Name-based detection: season/episode patterns strongly suggest series
+        if (name.contains(Regex("""[Ss]\s*\d+\s*[Ee]\s*\d+""")) ||
+            name.contains(Regex("""\d+\s*[xX]\s*\d+""")) ||
+            name.contains(Regex("""[Ee][Pp]\s*\d+""")) ||
+            name.contains(Regex("""Season\s*\d+""", RegexOption.IGNORE_CASE)) ||
+            name.contains(Regex("""حلقة"""))) return "series"
+
+        // Extension-based detection (fallback)
+        if (lower.endsWith(".ts") || lower.endsWith(".m3u8")) return "live"
+        if (lower.endsWith(".mp4") || lower.endsWith(".mkv") || lower.endsWith(".avi")) return "movie"
+
+        return "live" // default
+    }
+
+    /**
+     * Extract the base series name by removing season/episode patterns.
+     * e.g. "Breaking Bad S01 E03 - Pilot" -> "Breaking Bad"
+     */
+    private fun extractSeriesName(name: String): String {
+        var result = name
+            .replace(Regex("""\s*[Ss]\s*\d+\s*[Ee]\s*\d+.*$"""), "")
+            .replace(Regex("""\s*\d+\s*[xX]\s*\d+.*$"""), "")
+            .replace(Regex("""\s*[Ee][Pp]?\s*\d+.*$"""), "")
+            .replace(Regex("""\s*-\s*[Ss]\d+.*$"""), "")
+            .replace(Regex("""\s*Season\s*\d+.*$""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\s*حلقة.*$"""), "")
+            .replace(Regex("""\s*الموسم.*$"""), "")
+            .trim()
+            .trimEnd('-', '_', ':', '.', ' ')
+            .trim()
+        return result.ifBlank { name }
+    }
+
+    /**
+     * Parse season and episode numbers from an entry name.
+     */
+    private fun parseSeasonEpisode(name: String): Pair<Int, Int> {
+        // S01E02, S1E2, S01 E02
+        Regex("""[Ss]\s*(\d+)\s*[Ee]\s*(\d+)""").find(name)?.let { m ->
+            val s = m.groupValues[1].toIntOrNull() ?: 1
+            val e = m.groupValues[2].toIntOrNull() ?: 1
+            return s to e
         }
+        // 1x02
+        Regex("""(\d+)\s*[xX]\s*(\d+)""").find(name)?.let { m ->
+            val s = m.groupValues[1].toIntOrNull() ?: 1
+            val e = m.groupValues[2].toIntOrNull() ?: 1
+            return s to e
+        }
+        // Season 1 Episode 2
+        Regex("""Season\s*(\d+).*Episode\s*(\d+)""", RegexOption.IGNORE_CASE).find(name)?.let { m ->
+            val s = m.groupValues[1].toIntOrNull() ?: 1
+            val e = m.groupValues[2].toIntOrNull() ?: 1
+            return s to e
+        }
+        // EP 2 or E02 (season 1 assumed)
+        Regex("""[Ee][Pp]?\s*(\d+)""").find(name)?.let { m ->
+            val e = m.groupValues[1].toIntOrNull() ?: 1
+            return 1 to e
+        }
+        // Arabic: الموسم 1 الحلقة 2
+        Regex("""الموسم\s*(\d+).*الحلقة\s*(\d+)""").find(name)?.let { m ->
+            val s = m.groupValues[1].toIntOrNull() ?: 1
+            val e = m.groupValues[2].toIntOrNull() ?: 1
+            return s to e
+        }
+        return 1 to 0
     }
 
     private fun guessQuality(name: String?): Int {
@@ -303,34 +381,28 @@ class XtreamIPTVProvider : MainAPI() {
 
         val lists = mutableListOf<HomePageList>()
 
-        // Strategy 1: Try M3U download via raw HTTP
-        try {
-            val m3uText = RawHttp.get(url)
-            if (m3uText != null && (m3uText.startsWith("#EXTM3U") || m3uText.startsWith("#EXTINF"))) {
-                val entries = parseM3U(m3uText)
-                if (entries.isNotEmpty()) {
-                    cachedM3U = entries
-                    buildM3UHomePage(entries, lists)
-                    if (lists.isNotEmpty()) return newHomePageResponse(lists, false)
-                }
-            }
-        } catch (_: Exception) {}
+        // ── Return from cache if already loaded ──
+        val cached = cachedM3U
+        if (cached != null && cached.isNotEmpty()) {
+            buildM3UHomePage(cached, lists)
+            if (lists.isNotEmpty()) return newHomePageResponse(lists, false)
+        }
 
-        // Strategy 2: Try M3U via CloudStream's app.get
-        try {
-            val m3uText = app.get(url, headers = mapOf("User-Agent" to "okhttp/4.12.0"), timeout = 30000L).text
-            if (m3uText.startsWith("#EXTM3U") || m3uText.startsWith("#EXTINF")) {
-                val entries = parseM3U(m3uText)
-                if (entries.isNotEmpty()) {
-                    cachedM3U = entries
-                    lists.clear()
-                    buildM3UHomePage(entries, lists)
-                    if (lists.isNotEmpty()) return newHomePageResponse(lists, false)
-                }
+        // ── Try M3U download with 80s overall timeout ──
+        val m3uText = withTimeoutOrNull(80000L) {
+            RawHttp.get(url, readTimeout = 60000)
+        }
+        if (m3uText != null && (m3uText.startsWith("#EXTM3U") || m3uText.startsWith("#EXTINF"))) {
+            val entries = parseM3U(m3uText)
+            if (entries.isNotEmpty()) {
+                cachedM3U = entries
+                lists.clear()
+                buildM3UHomePage(entries, lists)
+                if (lists.isNotEmpty()) return newHomePageResponse(lists, false)
             }
-        } catch (_: Exception) {}
+        }
 
-        // Strategy 3: Try Xtream Codes API via raw HTTP
+        // ── Try Xtream Codes API fallback ──
         val c = cfg()
         if (c != null) {
             try {
@@ -339,8 +411,8 @@ class XtreamIPTVProvider : MainAPI() {
                 val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
 
                 // Live
-                val liveCatsText = RawHttp.get("$apiBase&action=get_live_categories")
-                val liveStreamsText = RawHttp.get("$apiBase&action=get_live_streams")
+                val liveCatsText = RawHttp.get("$apiBase&action=get_live_categories", 15000)
+                val liveStreamsText = RawHttp.get("$apiBase&action=get_live_streams", 15000)
                 if (liveCatsText != null && liveStreamsText != null) {
                     val cats = tryParseJson<List<XCat>>(liveCatsText) ?: emptyList()
                     val streams = tryParseJson<List<XLive>>(liveStreamsText) ?: emptyList()
@@ -357,8 +429,8 @@ class XtreamIPTVProvider : MainAPI() {
                 }
 
                 // Movies
-                val vodCatsText = RawHttp.get("$apiBase&action=get_vod_categories")
-                val vodStreamsText = RawHttp.get("$apiBase&action=get_vod_streams")
+                val vodCatsText = RawHttp.get("$apiBase&action=get_vod_categories", 15000)
+                val vodStreamsText = RawHttp.get("$apiBase&action=get_vod_streams", 15000)
                 if (vodCatsText != null && vodStreamsText != null) {
                     val cats = tryParseJson<List<XCat>>(vodCatsText) ?: emptyList()
                     val streams = tryParseJson<List<XVod>>(vodStreamsText) ?: emptyList()
@@ -375,8 +447,8 @@ class XtreamIPTVProvider : MainAPI() {
                 }
 
                 // Series
-                val seriesCatsText = RawHttp.get("$apiBase&action=get_series_categories")
-                val seriesText = RawHttp.get("$apiBase&action=get_series")
+                val seriesCatsText = RawHttp.get("$apiBase&action=get_series_categories", 15000)
+                val seriesText = RawHttp.get("$apiBase&action=get_series", 15000)
                 if (seriesCatsText != null && seriesText != null) {
                     val cats = tryParseJson<List<XCat>>(seriesCatsText) ?: emptyList()
                     val series = tryParseJson<List<XSeries>>(seriesText) ?: emptyList()
@@ -397,23 +469,57 @@ class XtreamIPTVProvider : MainAPI() {
         return if (lists.isEmpty()) null else newHomePageResponse(lists, false)
     }
 
+    /**
+     * Build home page lists from parsed M3U entries.
+     * - Live & Movies: group by M3U group-title
+     * - Series: group by M3U group-title, then each unique series name gets its own card
+     */
     private fun buildM3UHomePage(entries: List<M3UEntry>, lists: MutableList<HomePageList>) {
-        entries.groupBy { it.group }.forEach { (group, items) ->
+        // ── Live channels: group by M3U group ──
+        entries.filter { it.type == "live" }.groupBy { it.group }.forEach { (group, items) ->
             val homeItems = items.take(40).map { entry ->
-                val ref = EntryRef(entry.streamUrl, entry.type, entry.name, entry.group, entry.logo)
-                when (entry.type) {
-                    "movie" -> newMovieSearchResponse(entry.name, ref.toJson(), TvType.Movie) { posterUrl = entry.logo }
-                    "series" -> newTvSeriesSearchResponse(entry.name, ref.toJson(), TvType.TvSeries) { posterUrl = entry.logo }
-                    else -> newMovieSearchResponse(entry.name, ref.toJson(), TvType.Live) { posterUrl = entry.logo }
-                }
+                val ref = EntryRef(entry.streamUrl, "live", entry.name, entry.group, entry.logo)
+                newMovieSearchResponse(entry.name, ref.toJson(), TvType.Live) { posterUrl = entry.logo }
             }
             if (homeItems.isNotEmpty()) {
-                val prefix = when (items.firstOrNull()?.type) {
-                    "movie" -> "\uD83C\uDFAC"
-                    "series" -> "\uD83C\uDFB6"
-                    else -> "\uD83D\uDCFA"
+                lists.add(HomePageList("\uD83D\uDCFA $group", homeItems))
+            }
+        }
+
+        // ── Movies: group by M3U group ──
+        entries.filter { it.type == "movie" }.groupBy { it.group }.forEach { (group, items) ->
+            val homeItems = items.take(40).map { entry ->
+                val ref = EntryRef(entry.streamUrl, "movie", entry.name, entry.group, entry.logo)
+                newMovieSearchResponse(entry.name, ref.toJson(), TvType.Movie) { posterUrl = entry.logo }
+            }
+            if (homeItems.isNotEmpty()) {
+                lists.add(HomePageList("\uD83C\uDFAC $group", homeItems))
+            }
+        }
+
+        // ── Series: group by M3U group, then by series name ──
+        // Each unique series (not each episode) gets its own card
+        entries.filter { it.type == "series" }.groupBy { it.group }.forEach { (group, items) ->
+            val uniqueSeries = items.groupBy { it.seriesName.ifBlank { extractSeriesName(it.name) } }
+            val homeItems = uniqueSeries.map { (seriesName, episodes) ->
+                val first = episodes.first()
+                val ref = EntryRef(
+                    first.streamUrl,
+                    "series",
+                    seriesName,
+                    group,
+                    first.logo,
+                    seriesName
+                )
+                if (episodes.size > 1) {
+                    newTvSeriesSearchResponse(seriesName, ref.toJson(), TvType.TvSeries) { posterUrl = first.logo }
+                } else {
+                    // Single episode - show as movie for simplicity
+                    newMovieSearchResponse(seriesName, ref.toJson(), TvType.Movie) { posterUrl = first.logo }
                 }
-                lists.add(HomePageList("$prefix $group", homeItems))
+            }.take(40)
+            if (homeItems.isNotEmpty()) {
+                lists.add(HomePageList("\uD83C\uDFB6 $group", homeItems))
             }
         }
     }
@@ -429,11 +535,13 @@ class XtreamIPTVProvider : MainAPI() {
         val results = mutableListOf<SearchResponse>()
 
         val entries = cachedM3U ?: return null
-        entries.filter { it.name.lowercase().contains(q) || it.group.lowercase().contains(q) }.take(30).forEach { entry ->
-            val ref = EntryRef(entry.streamUrl, entry.type, entry.name, entry.group, entry.logo)
+        entries.filter {
+            it.name.lowercase().contains(q) || it.group.lowercase().contains(q)
+        }.take(30).forEach { entry ->
+            val ref = EntryRef(entry.streamUrl, entry.type, entry.name, entry.group, entry.logo, entry.seriesName)
             when (entry.type) {
                 "movie" -> results.add(newMovieSearchResponse(entry.name, ref.toJson(), TvType.Movie) { posterUrl = entry.logo })
-                "series" -> results.add(newTvSeriesSearchResponse(entry.name, ref.toJson(), TvType.TvSeries) { posterUrl = entry.logo })
+                "series" -> results.add(newTvSeriesSearchResponse(entry.seriesName.ifBlank { entry.name }, ref.toJson(), TvType.TvSeries) { posterUrl = entry.logo })
                 else -> results.add(newMovieSearchResponse(entry.name, ref.toJson(), TvType.Live) { posterUrl = entry.logo })
             }
         }
@@ -462,16 +570,40 @@ class XtreamIPTVProvider : MainAPI() {
 
     private suspend fun loadM3UEntry(ref: EntryRef): LoadResponse? {
         return when (ref.type) {
-            "live" -> newMovieLoadResponse(ref.name, ref.toJson(), TvType.Live, ref.toJson()) { posterUrl = ref.logo }
-            "movie" -> newMovieLoadResponse(ref.name, ref.toJson(), TvType.Movie, ref.toJson()) { posterUrl = ref.logo }
+            "live" -> {
+                newMovieLoadResponse(ref.name, ref.toJson(), TvType.Live, ref.toJson()) {
+                    posterUrl = ref.logo
+                }
+            }
+            "movie" -> {
+                newMovieLoadResponse(ref.name, ref.toJson(), TvType.Movie, ref.toJson()) {
+                    posterUrl = ref.logo
+                }
+            }
             "series" -> {
                 val allEntries = cachedM3U ?: return null
-                val groupEntries = allEntries.filter { it.group == ref.group && it.type == "series" }
-                if (groupEntries.size <= 1) {
-                    newMovieLoadResponse(ref.name, ref.toJson(), TvType.Movie, ref.toJson()) { posterUrl = ref.logo }
+                // Find all episodes belonging to this series by matching the series name
+                val seriesName = ref.seriesName.ifBlank { extractSeriesName(ref.name) }
+                val groupEntries = allEntries.filter {
+                    (it.seriesName.ifBlank { extractSeriesName(it.name) }) == seriesName && it.type == "series"
+                }
+
+                if (groupEntries.isEmpty()) {
+                    // Fallback: treat as movie
+                    newMovieLoadResponse(ref.name, ref.toJson(), TvType.Movie, ref.toJson()) {
+                        posterUrl = ref.logo
+                    }
+                } else if (groupEntries.size == 1) {
+                    // Single episode - show as movie for easy playback
+                    val entry = groupEntries.first()
+                    val epRef = EntryRef(entry.streamUrl, "series", entry.name, entry.group, entry.logo, entry.seriesName)
+                    newMovieLoadResponse(entry.name, epRef.toJson(), TvType.Movie, epRef.toJson()) {
+                        posterUrl = entry.logo
+                    }
                 } else {
+                    // Multiple episodes - show as TvSeries
                     val episodes = groupEntries.map { entry ->
-                        val epRef = EntryRef(entry.streamUrl, "series", entry.name, entry.group, entry.logo)
+                        val epRef = EntryRef(entry.streamUrl, "series", entry.name, entry.group, entry.logo, entry.seriesName)
                         val (sNum, eNum) = parseSeasonEpisode(entry.name)
                         newEpisode(epRef.toJson()) {
                             name = entry.name
@@ -480,10 +612,16 @@ class XtreamIPTVProvider : MainAPI() {
                             posterUrl = entry.logo
                         }
                     }
-                    newTvSeriesLoadResponse(ref.name, ref.toJson(), TvType.TvSeries, episodes) { posterUrl = ref.logo }
+                    newTvSeriesLoadResponse(seriesName, ref.toJson(), TvType.TvSeries, episodes) {
+                        posterUrl = ref.logo
+                    }
                 }
             }
-            else -> newMovieLoadResponse(ref.name, ref.toJson(), TvType.Movie, ref.toJson()) { posterUrl = ref.logo }
+            else -> {
+                newMovieLoadResponse(ref.name, ref.toJson(), TvType.Movie, ref.toJson()) {
+                    posterUrl = ref.logo
+                }
+            }
         }
     }
 
@@ -494,7 +632,7 @@ class XtreamIPTVProvider : MainAPI() {
             "l" -> newMovieLoadResponse(ref.n, ref.toJson(), TvType.Live, LinkData("l", ref.id).toJson()) {}
             "m" -> {
                 val apiBase = "${c.server}/player_api.php?username=${c.user}&password=${c.pass}"
-                val infoText = RawHttp.get("$apiBase&action=get_vod_info&vod_id=${ref.id}")
+                val infoText = RawHttp.get("$apiBase&action=get_vod_info&vod_id=${ref.id}", 15000)
                 val info = if (!infoText.isNullOrEmpty()) tryParseJson<XVodInfo>(infoText) else null
                 val detail = info?.info
                 val ext = info?.movie_data?.container_extension ?: ref.e ?: "mp4"
@@ -507,14 +645,13 @@ class XtreamIPTVProvider : MainAPI() {
             }
             "s" -> {
                 val apiBase = "${c.server}/player_api.php?username=${c.user}&password=${c.pass}"
-                val infoText = RawHttp.get("$apiBase&action=get_series_info&series_id=${ref.id}")
+                val infoText = RawHttp.get("$apiBase&action=get_series_info&series_id=${ref.id}", 15000)
                 val info = if (!infoText.isNullOrEmpty()) tryParseJson<XSeriesInfo>(infoText) else null
                 val detail = info?.info
                 val epMap = info?.episodes
                 if (epMap.isNullOrEmpty()) {
-                    // Series info API failed - treat as movie with direct stream
                     newMovieLoadResponse(detail?.name ?: ref.n, ref.toJson(), TvType.Movie, LinkData("m", ref.id, "mp4").toJson()) {
-                        posterUrl = detail?.cover ?: ref.n.let { null }
+                        posterUrl = detail?.cover
                         plot = detail?.plot
                     }
                 } else {
@@ -531,18 +668,14 @@ class XtreamIPTVProvider : MainAPI() {
                         }
                     }
                     newTvSeriesLoadResponse(detail?.name ?: ref.n, ref.toJson(), TvType.TvSeries, episodes) {
-                        posterUrl = detail?.cover; plot = detail?.plot; score = Score.from10(detail?.rating)
+                        posterUrl = detail?.cover
+                        plot = detail?.plot
+                        score = Score.from10(detail?.rating)
                     }
                 }
             }
             else -> null
         }
-    }
-
-    private fun parseSeasonEpisode(name: String): Pair<Int, Int> {
-        val season = """[Ss]\s*(\d+)""".toRegex().find(name)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
-        val episode = """[Ee]\s*(\d+)""".toRegex().find(name)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
-        return season to episode
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -573,55 +706,108 @@ class XtreamIPTVProvider : MainAPI() {
     private suspend fun loadM3ULinks(ref: EntryRef, callback: (ExtractorLink) -> Unit): Boolean {
         val url = ref.url
         if (url.isEmpty()) return false
+
         val lower = url.lowercase()
         val streamHeaders = mapOf("User-Agent" to "okhttp/4.12.0")
 
-        if (ref.type == "live" && lower.contains("/live/")) {
-            val base = url.substringBeforeLast(".")
-            callback(newExtractorLink(name, "HLS (.m3u8)", "$base.m3u8") {
-                referer = ""; quality = guessQuality(ref.name); type = ExtractorLinkType.M3U8; headers = streamHeaders
-            })
-            callback(newExtractorLink(name, "MPEG-TS (.ts)", "$base.ts") {
-                referer = ""; quality = guessQuality(ref.name); type = ExtractorLinkType.VIDEO; headers = streamHeaders
-            })
-        } else {
-            val isHls = lower.endsWith(".m3u8")
-            callback(newExtractorLink(name, "Play", url) {
-                referer = ""; quality = Qualities.Unknown.value
-                type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO; headers = streamHeaders
-            })
+        when {
+            // Live stream with /live/ path: offer both .m3u8 and .ts
+            ref.type == "live" && lower.contains("/live/") -> {
+                val base = url.substringBeforeLast(".")
+                callback(
+                    newExtractorLink(name, "HLS", "$base.m3u8") {
+                        quality = guessQuality(ref.name)
+                        type = ExtractorLinkType.M3U8
+                        headers = streamHeaders
+                    }
+                )
+                callback(
+                    newExtractorLink(name, "MPEG-TS", "$base.ts") {
+                        quality = guessQuality(ref.name)
+                        type = ExtractorLinkType.VIDEO
+                        headers = streamHeaders
+                    }
+                )
+            }
+            // Any stream ending in .m3u8
+            lower.endsWith(".m3u8") -> {
+                callback(
+                    newExtractorLink(name, "HLS", url) {
+                        quality = guessQuality(ref.name)
+                        type = ExtractorLinkType.M3U8
+                        headers = streamHeaders
+                    }
+                )
+            }
+            // Everything else (movie files, series episodes, etc.)
+            else -> {
+                val isHls = lower.endsWith(".m3u8")
+                callback(
+                    newExtractorLink(name, "Play", url) {
+                        quality = guessQuality(ref.name)
+                        type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        headers = streamHeaders
+                    }
+                )
+                // For /series/ and /movie/ paths, also try .m3u8 variant
+                if (lower.contains("/series/") || lower.contains("/movie/")) {
+                    val base = url.substringBeforeLast(".")
+                    callback(
+                        newExtractorLink(name, "HLS Alt", "$base.m3u8") {
+                            quality = guessQuality(ref.name)
+                            type = ExtractorLinkType.M3U8
+                            headers = streamHeaders
+                        }
+                    )
+                }
+            }
         }
         return true
     }
 
     private suspend fun loadXtreamLinks(ld: LinkData, callback: (ExtractorLink) -> Unit): Boolean {
         val c = cfg() ?: return false
-        // IPTV headers so the server doesn't block stream requests
         val streamHeaders = mapOf("User-Agent" to "okhttp/4.12.0")
 
         when (ld.t) {
             "l" -> {
                 val base = "${c.server}/live/${c.user}/${c.pass}/${ld.id}"
-                callback(newExtractorLink(name, "HLS (.m3u8)", "$base.m3u8") {
-                    referer = ""; quality = Qualities.Unknown.value; type = ExtractorLinkType.M3U8; headers = streamHeaders
-                })
-                callback(newExtractorLink(name, "MPEG-TS (.ts)", "$base.ts") {
-                    referer = ""; quality = Qualities.Unknown.value; type = ExtractorLinkType.VIDEO; headers = streamHeaders
-                })
+                callback(
+                    newExtractorLink(name, "HLS", "$base.m3u8") {
+                        quality = Qualities.Unknown.value
+                        type = ExtractorLinkType.M3U8
+                        headers = streamHeaders
+                    }
+                )
+                callback(
+                    newExtractorLink(name, "MPEG-TS", "$base.ts") {
+                        quality = Qualities.Unknown.value
+                        type = ExtractorLinkType.VIDEO
+                        headers = streamHeaders
+                    }
+                )
             }
             "m" -> {
                 val ext = ld.e ?: "mp4"
                 val isHls = ext == "m3u8"
-                callback(newExtractorLink(name, "Movie", "${c.server}/movie/${c.user}/${c.pass}/${ld.id}.$ext") {
-                    referer = ""; quality = Qualities.Unknown.value; type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO; headers = streamHeaders
-                })
+                callback(
+                    newExtractorLink(name, "Movie", "${c.server}/movie/${c.user}/${c.pass}/${ld.id}.$ext") {
+                        quality = Qualities.Unknown.value
+                        type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        headers = streamHeaders
+                    }
+                )
             }
             "e" -> {
                 val ext = ld.e ?: "mp4"
                 val isHls = ext == "m3u8"
-                callback(newExtractorLink(name, "Episode", "${c.server}/series/${c.user}/${c.pass}/${ld.id}.$ext") {
-                    referer = ""; quality = Qualities.Unknown.value; type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO; headers = streamHeaders
-                })
+                callback(
+                    newExtractorLink(name, "Episode", "${c.server}/series/${c.user}/${c.pass}/${ld.id}.$ext") {
+                        quality = Qualities.Unknown.value
+                        type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        headers = streamHeaders
+                    }
+                )
             }
         }
         return true
