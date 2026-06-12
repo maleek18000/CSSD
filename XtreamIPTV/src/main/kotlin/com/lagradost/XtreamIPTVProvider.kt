@@ -10,10 +10,10 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import java.net.URLEncoder
+import java.net.URI
 
 // ═══════════════════════════════════════════════════════════════════
-//  PLUGIN ENTRY POINT  (required by CloudStream)
+//  PLUGIN ENTRY POINT
 // ═══════════════════════════════════════════════════════════════════
 
 @CloudstreamPlugin
@@ -24,118 +24,26 @@ class XtreamIPTVPlugin : Plugin() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  XTREAM API DATA CLASSES  (top-level to avoid D8 metadata issues)
+//  DATA CLASSES
 // ═══════════════════════════════════════════════════════════════════
 
-data class XCat(
-    val category_id: String? = null,
-    val category_name: String? = null
+/** A parsed M3U entry with metadata and stream URL. */
+data class M3UEntry(
+    val name: String,
+    val group: String,
+    val logo: String?,
+    val streamUrl: String,
+    val type: String,       // "live", "movie", "series"
+    val tvgId: String?
 )
 
-data class XLive(
-    val name: String = "",
-    val stream_id: Int = 0,
-    val stream_icon: String? = null,
-    val epg_channel_id: String? = null,
-    val category_id: String = "",
-    val tv_archive: Int? = null,
-    val direct_source: String? = null
-)
-
-data class XVod(
-    val name: String = "",
-    val stream_id: Int = 0,
-    val stream_icon: String? = null,
-    val rating: String? = null,
-    val rating_5based: Double? = null,
-    val category_id: String = "",
-    val container_extension: String? = null,
-    val added: String? = null
-)
-
-data class XVodInfo(
-    val info: XVodInfoDetail? = null,
-    val movie_data: XVodStreamData? = null
-)
-
-data class XVodInfoDetail(
-    val name: String? = null,
-    val plot: String? = null,
-    val cast: String? = null,
-    val director: String? = null,
-    val genre: String? = null,
-    val release_date: String? = null,
-    val rating: String? = null,
-    val duration: String? = null,
-    val movie_image: String? = null,
-    val cover: String? = null,
-    val backdrop: String? = null
-)
-
-data class XVodStreamData(
-    val stream_id: Int? = null,
-    val container_extension: String? = null
-)
-
-data class XSeries(
-    val name: String = "",
-    val series_id: Int = 0,
-    val cover: String? = null,
-    val plot: String? = null,
-    val cast: String? = null,
-    val director: String? = null,
-    val genre: String? = null,
-    val release_date: String? = null,
-    val rating: String? = null,
-    val rating_5based: Double? = null,
-    val category_id: String? = null
-)
-
-data class XSeriesInfo(
-    val info: XSeriesDetail? = null,
-    val episodes: Map<String, List<XEp>>? = null
-)
-
-data class XSeriesDetail(
-    val name: String? = null,
-    val plot: String? = null,
-    val cast: String? = null,
-    val director: String? = null,
-    val genre: String? = null,
-    val release_date: String? = null,
-    val rating: String? = null,
-    val cover: String? = null,
-    val backdrop: String? = null
-)
-
-data class XEp(
-    val id: Int = 0,
-    val episode_num: Int = 0,
-    val season_num: Int = 0,
-    val title: String? = null,
-    val container_extension: String? = null,
-    val info: XEpInfo? = null
-)
-
-data class XEpInfo(
-    val plot: String? = null,
-    val duration: String? = null,
-    val image: String? = null
-)
-
-/** Light reference stored in SearchResponse.url -> passed to load(). */
-data class ItemRef(
-    val t: String,      // "l"=live, "m"=movie, "s"=series
-    val id: Int,
-    val n: String,      // display name
-    val e: String? = null // container extension (movies)
-)
-
-/** Stream data stored in LoadResponse.data -> passed to loadLinks(). */
-data class LinkData(
-    val t: String,      // "l"=live, "m"=movie, "e"=episode
-    val id: Int,
-    val e: String? = null // container extension
+/** Stored in SearchResponse.url / LoadResponse.data for passing between methods. */
+data class EntryRef(
+    val url: String,
+    val type: String,
+    val name: String,
+    val group: String,
+    val logo: String? = null
 )
 
 // ═══════════════════════════════════════════════════════════════════
@@ -143,23 +51,15 @@ data class LinkData(
 // ═══════════════════════════════════════════════════════════════════
 
 /**
- * CloudStream provider for Xtream Codes IPTV services.
- *
- * Supports Live TV, Movies (VOD), and Series with full playback.
+ * CloudStream provider for IPTV via M3U playlists or Xtream Codes API.
  *
  * SETUP:
  * In CloudStream, go to Settings -> General -> Clone site -> Xtream IPTV
- * Enter your credentials as the URL in one of these formats:
+ * Enter your M3U playlist URL or Xtream credentials:
  *
- *   Format 1 (simple):  http://server:port/username/password
- *   Format 2 (explicit): http://server:port|username|password
- *
- * Examples:
- *   http://myprovider.tv:80/john/secret123
- *   http://myprovider.tv:80|john|secret123
- *
- * The pipe format is useful if your server has a path prefix:
- *   http://myprovider.tv/portal|john|secret123
+ *   M3U URL:  http://server/get.php?username=X&password=X&type=m3u_plus
+ *   Xtream:   http://server:port/username/password
+ *   Xtream:   http://server:port|username|password
  */
 class XtreamIPTVProvider : MainAPI() {
 
@@ -170,20 +70,31 @@ class XtreamIPTVProvider : MainAPI() {
     override val hasQuickSearch = false
 
     // ═══════════════════════════════════════════════════════════════════
-    //  CONFIGURATION
+    //  URL DETECTION
+    // ═══════════════════════════════════════════════════════════════════
+
+    /** Detect if the URL is an M3U playlist. */
+    private fun isM3UUrl(url: String): Boolean {
+        val lower = url.lowercase()
+        return lower.contains("get.php") ||
+                lower.contains(".m3u") ||
+                lower.contains("type=m3u") ||
+                lower.contains("/playlist") ||
+                lower.contains("m3u_plus")
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  XTREAM API HELPERS
     // ═══════════════════════════════════════════════════════════════════
 
     private data class Cfg(val server: String, val user: String, val pass: String)
 
-    /** Parse Xtream credentials from the mainUrl set during site cloning. */
-    private fun cfg(): Cfg? {
+    private fun parseXtream(): Cfg? {
         val raw = mainUrl.trim()
-        // Pipe format: http://server:port|user|pass  (unambiguous)
         if (raw.contains("|")) {
             val p = raw.split("|")
             if (p.size >= 3) return Cfg(p[0].trimEnd('/'), p[1], p[2])
         }
-        // Path format: http://server:port/user/pass  (last two segments)
         try {
             val proto = raw.indexOf("//")
             if (proto < 0) return null
@@ -204,150 +115,254 @@ class XtreamIPTVProvider : MainAPI() {
         return null
     }
 
+    private fun xtreamApi(action: String): String {
+        val c = parseXtream() ?: return ""
+        return "${c.server}/player_api.php?username=${c.user}&password=${c.pass}&action=$action"
+    }
+
     // ═══════════════════════════════════════════════════════════════════
-    //  XTREAM API HELPERS
+    //  M3U PARSER
     // ═══════════════════════════════════════════════════════════════════
 
-    private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
+    private data class XCat(
+        val category_id: String? = null,
+        val category_name: String? = null
+    )
 
-    /** Build an Xtream Codes API URL. */
-    private fun api(action: String, vararg kv: Pair<String, String>): String {
-        val c = cfg() ?: return ""
-        val sb = StringBuilder()
-        sb.append("${c.server}/player_api.php")
-        sb.append("?username=${enc(c.user)}")
-        sb.append("&password=${enc(c.pass)}")
-        sb.append("&action=$action")
-        kv.forEach { (k, v) -> sb.append("&$k=${enc(v)}") }
-        return sb.toString()
+    private data class XLive(
+        val name: String = "",
+        val stream_id: Int = 0,
+        val stream_icon: String? = null,
+        val category_id: String = ""
+    )
+
+    private data class XVod(
+        val name: String = "",
+        val stream_id: Int = 0,
+        val stream_icon: String? = null,
+        val category_id: String = "",
+        val container_extension: String? = null
+    )
+
+    private data class XSeries(
+        val name: String = "",
+        val series_id: Int = 0,
+        val cover: String? = null,
+        val category_id: String? = null
+    )
+
+    /**
+     * Parse an M3U/M3U_plus playlist into entries.
+     * Handles #EXTINF lines with tvg-logo, group-title, tvg-id attributes.
+     */
+    private fun parseM3U(text: String): List<M3UEntry> {
+        val entries = mutableListOf<M3UEntry>()
+        val lines = text.lines()
+        var i = 0
+
+        while (i < lines.size) {
+            val line = lines[i].trim()
+
+            if (line.startsWith("#EXTINF")) {
+                // Parse attributes from the EXTINF line
+                val logo = extractAttr(line, "tvg-logo")
+                val group = extractAttr(line, "group-title") ?: "Uncategorized"
+                val tvgId = extractAttr(line, "tvg-id")
+
+                // Channel name is after the last comma
+                val commaIdx = line.lastIndexOf(',')
+                val name = if (commaIdx >= 0) line.substring(commaIdx + 1).trim() else "Unknown"
+
+                // Next non-comment line is the stream URL
+                var url = ""
+                var j = i + 1
+                while (j < lines.size) {
+                    val nextLine = lines[j].trim()
+                    if (nextLine.isNotEmpty() && !nextLine.startsWith("#")) {
+                        url = nextLine
+                        break
+                    }
+                    j++
+                }
+
+                if (url.isNotEmpty()) {
+                    val type = detectType(url, group, name)
+                    entries.add(M3UEntry(
+                        name = name,
+                        group = group,
+                        logo = logo,
+                        streamUrl = url,
+                        type = type,
+                        tvgId = tvgId
+                    ))
+                }
+                i = j + 1
+            } else {
+                i++
+            }
+        }
+        return entries
     }
 
-    /** Live stream base URL (append .ts or .m3u8). */
-    private fun liveBase(id: Int): String {
-        val c = cfg() ?: return ""
-        return "${c.server}/live/${c.user}/${c.pass}/$id"
+    /** Extract an attribute value from #EXTINF line, e.g. tvg-logo="http://..." */
+    private fun extractAttr(line: String, attr: String): String? {
+        // Match: attr="value" or attr='value'
+        val pattern = """$attr\s*=\s*["']([^"']*?)["']""".toRegex(RegexOption.IGNORE_CASE)
+        return pattern.find(line)?.groupValues?.getOrNull(1)?.ifBlank { null }
     }
 
-    /** Movie stream URL. */
-    private fun movieUrl(id: Int, ext: String): String {
-        val c = cfg() ?: return ""
-        return "${c.server}/movie/${c.user}/${c.pass}/$id.${ext.trimStart('.')}"
+    /** Detect content type from the stream URL and group name. */
+    private fun detectType(url: String, group: String, name: String): String {
+        val lower = url.lowercase()
+        val groupLower = group.lowercase()
+
+        // URL-based detection (most reliable for Xtream Codes URLs)
+        return when {
+            lower.contains("/live/") -> "live"
+            lower.contains("/movie/") -> "movie"
+            lower.contains("/series/") -> "series"
+            // Group-based detection
+            groupLower.contains("vod") || groupLower.contains("movie") ||
+            groupLower.contains("film") -> "movie"
+            groupLower.contains("series") || groupLower.contains("episode") ||
+            groupLower.contains("season") -> "series"
+            // Extension-based detection
+            lower.endsWith(".ts") || lower.endsWith(".m3u8") -> "live"
+            lower.endsWith(".mp4") || lower.endsWith(".mkv") || lower.endsWith(".avi") -> "movie"
+            // Default to live for IPTV
+            else -> "live"
+        }
     }
 
-    /** Series episode stream URL. */
-    private fun epUrl(id: Int, ext: String): String {
-        val c = cfg() ?: return ""
-        return "${c.server}/series/${c.user}/${c.pass}/$id.${ext.trimStart('.')}"
-    }
-
-    /** Guess quality from stream name (e.g. "Channel HD", "Movie 4K"). */
+    /** Guess quality from name/group. */
     private fun guessQuality(name: String?): Int {
         if (name == null) return Qualities.Unknown.value
         val n = name.uppercase()
         return when {
-            n.contains("4K") || n.contains("2160P") -> Qualities.P2160.value
-            n.contains("1080P") || n.contains("FHD") -> Qualities.P1080.value
-            n.contains("720P") || n.contains("HD") && !n.contains("SD") -> Qualities.P720.value
-            n.contains("480P") || n.contains("SD") -> Qualities.P480.value
+            n.contains("4K") || n.contains("2160") -> Qualities.P2160.value
+            n.contains("1080") || n.contains("FHD") -> Qualities.P1080.value
+            n.contains("720") || n.contains("HD") && !n.contains("SD") -> Qualities.P720.value
+            n.contains("480") || n.contains("SD") -> Qualities.P480.value
             else -> Qualities.Unknown.value
         }
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  IN-MEMORY CACHE  (populated on home-page load, reused for search)
+    //  CACHE
     // ═══════════════════════════════════════════════════════════════════
 
-    private var cacheLive: List<XLive>? = null
-    private var cacheVod: List<XVod>? = null
-    private var cacheSeries: List<XSeries>? = null
+    private var cachedM3U: List<M3UEntry>? = null
 
     // ═══════════════════════════════════════════════════════════════════
     //  HOME PAGE
     // ═══════════════════════════════════════════════════════════════════
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        if (cfg() == null) return null
+        val url = mainUrl.trim()
+        if (url.isEmpty() || url == "http://example.com/username/password") return null
+
         val lists = mutableListOf<HomePageList>()
 
-        // -- Live TV --
-        try {
-            val cats = tryParseJson<List<XCat>>(app.get(api("get_live_categories")).text)
-                ?: emptyList()
-            val streams = tryParseJson<List<XLive>>(app.get(api("get_live_streams")).text)
-                ?: emptyList()
-            cacheLive = streams
+        if (isM3UUrl(url)) {
+            // ── M3U MODE ──
+            val entries = loadM3U() ?: return null
+            cachedM3U = entries
 
-            val catNames = cats.associate { it.category_id to (it.category_name ?: "Live TV") }
-            streams.groupBy { it.category_id }.forEach { (catId, items) ->
-                val catName = catNames[catId] ?: "Live TV"
-                val homeItems = items.take(40).map { s ->
-                    newMovieSearchResponse(
-                        s.name,
-                        ItemRef("l", s.stream_id, s.name).toJson(),
-                        TvType.Live
-                    ) {
-                        posterUrl = s.stream_icon
+            // Group by category
+            entries.groupBy { it.group }.forEach { (group, items) ->
+                val homeItems = items.take(40).map { entry ->
+                    val ref = EntryRef(entry.streamUrl, entry.type, entry.name, entry.group, entry.logo)
+                    when (entry.type) {
+                        "movie" -> newMovieSearchResponse(
+                            entry.name, ref.toJson(), TvType.Movie
+                        ) { posterUrl = entry.logo }
+                        "series" -> newTvSeriesSearchResponse(
+                            entry.name, ref.toJson(), TvType.TvSeries
+                        ) { posterUrl = entry.logo }
+                        else -> newMovieSearchResponse(
+                            entry.name, ref.toJson(), TvType.Live
+                        ) { posterUrl = entry.logo }
                     }
                 }
                 if (homeItems.isNotEmpty()) {
-                    lists.add(HomePageList("\uD83D\uDCFA $catName", homeItems))
-                }
-            }
-        } catch (_: Exception) { }
-
-        // -- Movies / VOD --
-        try {
-            val cats = tryParseJson<List<XCat>>(app.get(api("get_vod_categories")).text)
-                ?: emptyList()
-            val streams = tryParseJson<List<XVod>>(app.get(api("get_vod_streams")).text)
-                ?: emptyList()
-            cacheVod = streams
-
-            val catNames = cats.associate { it.category_id to (it.category_name ?: "Movies") }
-            streams.groupBy { it.category_id }.forEach { (catId, items) ->
-                val catName = catNames[catId] ?: "Movies"
-                val homeItems = items.take(40).map { s ->
-                    newMovieSearchResponse(
-                        s.name,
-                        ItemRef("m", s.stream_id, s.name, s.container_extension ?: "mp4").toJson(),
-                        TvType.Movie
-                    ) {
-                        posterUrl = s.stream_icon
+                    val prefix = when (items.firstOrNull()?.type) {
+                        "movie" -> "\uD83C\uDFAC"
+                        "series" -> "\uD83C\uDFB6"
+                        else -> "\uD83D\uDCFA"
                     }
-                }
-                if (homeItems.isNotEmpty()) {
-                    lists.add(HomePageList("\uD83C\uDFAC $catName", homeItems))
+                    lists.add(HomePageList("$prefix $group", homeItems))
                 }
             }
-        } catch (_: Exception) { }
+        } else {
+            // ── XTREAM API MODE ──
+            val c = parseXtream() ?: return null
 
-        // -- Series --
-        try {
-            val cats = tryParseJson<List<XCat>>(app.get(api("get_series_categories")).text)
-                ?: emptyList()
-            val series = tryParseJson<List<XSeries>>(app.get(api("get_series")).text)
-                ?: emptyList()
-            cacheSeries = series
-
-            val catNames = cats.associate { it.category_id to (it.category_name ?: "Series") }
-            series.groupBy { it.category_id }.forEach { (catId, items) ->
-                val catName = catNames[catId] ?: "Series"
-                val homeItems = items.take(40).map { s ->
-                    newTvSeriesSearchResponse(
-                        s.name,
-                        ItemRef("s", s.series_id, s.name).toJson(),
-                        TvType.TvSeries
-                    ) {
-                        posterUrl = s.cover
+            // Live
+            try {
+                val cats = tryParseJson<List<XCat>>(app.get(xtreamApi("get_live_categories")).text) ?: emptyList()
+                val streams = tryParseJson<List<XLive>>(app.get(xtreamApi("get_live_streams")).text) ?: emptyList()
+                val catNames = cats.associate { it.category_id to (it.category_name ?: "Live TV") }
+                streams.groupBy { it.category_id }.forEach { (catId, items) ->
+                    val catName = catNames[catId] ?: "Live TV"
+                    val homeItems = items.take(40).map { s ->
+                        val ref = EntryRef(
+                            "${c.server}/live/${c.user}/${c.pass}/${s.stream_id}.m3u8",
+                            "live", s.name, catName, s.stream_icon
+                        )
+                        newMovieSearchResponse(s.name, ref.toJson(), TvType.Live) { posterUrl = s.stream_icon }
                     }
+                    if (homeItems.isNotEmpty()) lists.add(HomePageList("\uD83D\uDCFA $catName", homeItems))
                 }
-                if (homeItems.isNotEmpty()) {
-                    lists.add(HomePageList("\uD83C\uDFB6 $catName", homeItems))
+            } catch (_: Exception) {}
+
+            // Movies
+            try {
+                val cats = tryParseJson<List<XCat>>(app.get(xtreamApi("get_vod_categories")).text) ?: emptyList()
+                val streams = tryParseJson<List<XVod>>(app.get(xtreamApi("get_vod_streams")).text) ?: emptyList()
+                val catNames = cats.associate { it.category_id to (it.category_name ?: "Movies") }
+                streams.groupBy { it.category_id }.forEach { (catId, items) ->
+                    val catName = catNames[catId] ?: "Movies"
+                    val homeItems = items.take(40).map { s ->
+                        val ext = s.container_extension ?: "mp4"
+                        val ref = EntryRef(
+                            "${c.server}/movie/${c.user}/${c.pass}/${s.stream_id}.$ext",
+                            "movie", s.name, catName, s.stream_icon
+                        )
+                        newMovieSearchResponse(s.name, ref.toJson(), TvType.Movie) { posterUrl = s.stream_icon }
+                    }
+                    if (homeItems.isNotEmpty()) lists.add(HomePageList("\uD83C\uDFAC $catName", homeItems))
                 }
-            }
-        } catch (_: Exception) { }
+            } catch (_: Exception) {}
+
+            // Series
+            try {
+                val cats = tryParseJson<List<XCat>>(app.get(xtreamApi("get_series_categories")).text) ?: emptyList()
+                val series = tryParseJson<List<XSeries>>(app.get(xtreamApi("get_series")).text) ?: emptyList()
+                val catNames = cats.associate { it.category_id to (it.category_name ?: "Series") }
+                series.groupBy { it.category_id }.forEach { (catId, items) ->
+                    val catName = catNames[catId] ?: "Series"
+                    val homeItems = items.take(40).map { s ->
+                        val ref = EntryRef("", "series_api", s.name, catName, s.cover)
+                        ref.copy(url = "${s.series_id}").let { r ->
+                            newTvSeriesSearchResponse(s.name, r.toJson(), TvType.TvSeries) { posterUrl = s.cover }
+                        }
+                    }
+                    if (homeItems.isNotEmpty()) lists.add(HomePageList("\uD83C\uDFB6 $catName", homeItems))
+                }
+            } catch (_: Exception) {}
+        }
 
         return if (lists.isEmpty()) null else newHomePageResponse(lists, false)
+    }
+
+    /** Fetch and parse the M3U playlist. */
+    private suspend fun loadM3U(): List<M3UEntry>? {
+        return try {
+            val response = app.get(mainUrl.trim()).text
+            parseM3U(response)
+        } catch (e: Exception) {
+            null
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -355,69 +370,29 @@ class XtreamIPTVProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════
 
     override suspend fun search(query: String): List<SearchResponse>? {
-        if (cfg() == null) return null
+        val url = mainUrl.trim()
+        if (url.isEmpty() || url == "http://example.com/username/password") return null
         val q = query.lowercase()
         val results = mutableListOf<SearchResponse>()
 
-        // Populate cache lazily
-        if (cacheLive == null) {
-            try {
-                cacheLive = tryParseJson<List<XLive>>(
-                    app.get(api("get_live_streams")).text
-                ) ?: emptyList()
-            } catch (_: Exception) { cacheLive = emptyList() }
-        }
-        if (cacheVod == null) {
-            try {
-                cacheVod = tryParseJson<List<XVod>>(
-                    app.get(api("get_vod_streams")).text
-                ) ?: emptyList()
-            } catch (_: Exception) { cacheVod = emptyList() }
-        }
-        if (cacheSeries == null) {
-            try {
-                cacheSeries = tryParseJson<List<XSeries>>(
-                    app.get(api("get_series")).text
-                ) ?: emptyList()
-            } catch (_: Exception) { cacheSeries = emptyList() }
-        }
-
-        // Search live channels
-        cacheLive!!
-            .filter { it.name.lowercase().contains(q) }
-            .take(20)
-            .forEach { s ->
-                results.add(newMovieSearchResponse(
-                    s.name,
-                    ItemRef("l", s.stream_id, s.name).toJson(),
-                    TvType.Live
-                ) { posterUrl = s.stream_icon })
-            }
-
-        // Search movies
-        cacheVod!!
-            .filter { it.name.lowercase().contains(q) }
-            .take(20)
-            .forEach { s ->
-                results.add(newMovieSearchResponse(
-                    s.name,
-                    ItemRef("m", s.stream_id, s.name, s.container_extension ?: "mp4").toJson(),
-                    TvType.Movie
-                ) {
-                    posterUrl = s.stream_icon
-                })
-            }
-
-        // Search series
-        cacheSeries!!
-            .filter { it.name.lowercase().contains(q) }
-            .take(20)
-            .forEach { s ->
-                results.add(newTvSeriesSearchResponse(
-                    s.name,
-                    ItemRef("s", s.series_id, s.name).toJson(),
-                    TvType.TvSeries
-                ) { posterUrl = s.cover })
+        // M3U mode search
+        val entries = cachedM3U ?: loadM3U() ?: return null
+        entries
+            .filter { it.name.lowercase().contains(q) || it.group.lowercase().contains(q) }
+            .take(30)
+            .forEach { entry ->
+                val ref = EntryRef(entry.streamUrl, entry.type, entry.name, entry.group, entry.logo)
+                when (entry.type) {
+                    "movie" -> results.add(newMovieSearchResponse(
+                        entry.name, ref.toJson(), TvType.Movie
+                    ) { posterUrl = entry.logo })
+                    "series" -> results.add(newTvSeriesSearchResponse(
+                        entry.name, ref.toJson(), TvType.TvSeries
+                    ) { posterUrl = entry.logo })
+                    else -> results.add(newMovieSearchResponse(
+                        entry.name, ref.toJson(), TvType.Live
+                    ) { posterUrl = entry.logo })
+                }
             }
 
         return results
@@ -428,122 +403,56 @@ class XtreamIPTVProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════
 
     override suspend fun load(url: String): LoadResponse? {
-        val ref = tryParseJson<ItemRef>(url) ?: return null
-        if (cfg() == null) return null
+        val ref = tryParseJson<EntryRef>(url) ?: return null
 
-        return when (ref.t) {
-
-            // -- Live Channel --
-            "l" -> {
-                val stream = cacheLive?.find { it.stream_id == ref.id }
-                newMovieLoadResponse(
-                    ref.n,
-                    url,
-                    TvType.Live,
-                    LinkData("l", ref.id).toJson()
-                ) {
-                    posterUrl = stream?.stream_icon
+        return when (ref.type) {
+            "live" -> {
+                newMovieLoadResponse(ref.name, url, TvType.Live, url) {
+                    posterUrl = ref.logo
                 }
             }
-
-            // -- Movie --
-            "m" -> {
-                // Try to fetch rich info from the API
-                val info = try {
-                    tryParseJson<XVodInfo>(
-                        app.get(api("get_vod_info", "vod_id" to ref.id.toString())).text
-                    )
-                } catch (_: Exception) { null }
-
-                val detail = info?.info
-                val streamInfo = info?.movie_data
-                val ext = streamInfo?.container_extension
-                    ?: ref.e
-                    ?: "mp4"
-                val streamId = streamInfo?.stream_id ?: ref.id
-
-                newMovieLoadResponse(
-                    detail?.name ?: ref.n,
-                    url,
-                    TvType.Movie,
-                    LinkData("m", streamId, ext).toJson()
-                ) {
-                    posterUrl = detail?.movie_image
-                        ?: detail?.cover
-                        ?: cacheVod?.find { it.stream_id == ref.id }?.stream_icon
-                    plot = detail?.plot
-                    score = Score.from10(detail?.rating)
-                    duration = detail?.duration?.toIntOrNull()
-                    tags = detail?.genre
-                        ?.split(",")
-                        ?.map { it.trim() }
-                        ?.filter { it.isNotEmpty() }
+            "movie" -> {
+                newMovieLoadResponse(ref.name, url, TvType.Movie, url) {
+                    posterUrl = ref.logo
                 }
             }
+            "series" -> {
+                // M3U series: group episodes by this series' group
+                val allEntries = cachedM3U ?: loadM3U() ?: return null
+                val groupEntries = allEntries.filter { it.group == ref.group && it.type == "series" }
 
-            // -- Series --
-            "s" -> {
-                // Must fetch series info to get episodes
-                val info = try {
-                    tryParseJson<XSeriesInfo>(
-                        app.get(api("get_series_info", "series_id" to ref.id.toString())).text
-                    )
-                } catch (_: Exception) { null }
-
-                val detail = info?.info
-                val epMap = info?.episodes
-
-                if (epMap.isNullOrEmpty()) {
-                    // No episodes found -- treat as a single item
-                    newMovieLoadResponse(
-                        detail?.name ?: ref.n,
-                        url,
-                        TvType.Movie,
-                        LinkData("s", ref.id, "mp4").toJson()
-                    ) {
-                        posterUrl = detail?.cover
-                            ?: cacheSeries?.find { it.series_id == ref.id }?.cover
-                        plot = detail?.plot
+                if (groupEntries.isEmpty()) {
+                    // Single entry fallback
+                    newMovieLoadResponse(ref.name, url, TvType.Movie, url) {
+                        posterUrl = ref.logo
                     }
                 } else {
-                    val episodes = mutableListOf<Episode>()
-                    epMap.toSortedMap(compareBy { it.toIntOrNull() ?: 0 })
-                        .forEach { (seasonKey, eps) ->
-                            eps.sortedBy { it.episode_num }.forEach { ep ->
-                                val ext = ep.container_extension ?: "mp4"
-                                episodes.add(newEpisode(
-                                    LinkData("e", ep.id, ext).toJson()
-                                ) {
-                                    name = ep.title?.ifBlank { "S${ep.season_num} E${ep.episode_num}" }
-                                        ?: "S${ep.season_num} E${ep.episode_num}"
-                                    season = ep.season_num
-                                    episode = ep.episode_num
-                                    posterUrl = ep.info?.image
-                                    description = ep.info?.plot
-                                })
-                            }
+                    val episodes = groupEntries.mapIndexed { idx, entry ->
+                        val epRef = EntryRef(entry.streamUrl, "series", entry.name, entry.group, entry.logo)
+                        val (sNum, eNum) = parseSeasonEpisode(entry.name)
+                        newEpisode(epRef.toJson()) {
+                            name = entry.name
+                            season = sNum
+                            episode = eNum
+                            posterUrl = entry.logo
                         }
-
-                    newTvSeriesLoadResponse(
-                        detail?.name ?: ref.n,
-                        url,
-                        TvType.TvSeries,
-                        episodes
-                    ) {
-                        posterUrl = detail?.cover
-                            ?: cacheSeries?.find { it.series_id == ref.id }?.cover
-                        plot = detail?.plot
-                        score = Score.from10(detail?.rating)
-                        tags = detail?.genre
-                            ?.split(",")
-                            ?.map { it.trim() }
-                            ?.filter { it.isNotEmpty() }
+                    }
+                    newTvSeriesLoadResponse(ref.name, url, TvType.TvSeries, episodes) {
+                        posterUrl = ref.logo
                     }
                 }
             }
-
-            else -> null
+            else -> newMovieLoadResponse(ref.name, url, TvType.Movie, url) { posterUrl = ref.logo }
         }
+    }
+
+    /** Try to extract season and episode numbers from a title like "S01 E03" or "S1E3". */
+    private fun parseSeasonEpisode(name: String): Pair<Int, Int> {
+        val sPattern = """[Ss]\s*(\d+)""".toRegex()
+        val ePattern = """[Ee]\s*(\d+)""".toRegex()
+        val season = sPattern.find(name)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
+        val episode = ePattern.find(name)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+        return season to episode
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -556,78 +465,57 @@ class XtreamIPTVProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val ld = tryParseJson<LinkData>(data) ?: return false
-        if (cfg() == null) return false
+        // data could be a JSON EntryRef or a direct stream URL (for load() pass-through)
+        val ref = tryParseJson<EntryRef>(data)
+        val streamUrl = ref?.url ?: data
+        val entryType = ref?.type ?: "live"
 
-        when (ld.t) {
+        if (streamUrl.isEmpty()) return false
 
-            // -- Live Channel: provide both HLS and MPEG-TS --
-            "l" -> {
-                val base = liveBase(ld.id)
-                if (base.isNotEmpty()) {
+        val lower = streamUrl.lowercase()
+        val isHls = lower.endsWith(".m3u8") || lower.contains(".m3u8?") || lower.contains("/live/")
+        val isMpegTs = lower.endsWith(".ts") || lower.contains(".ts?")
+
+        when {
+            // Live channels: provide both HLS and MPEG-TS if it's a live URL
+            entryType == "live" && (lower.contains("/live/") || isHls || isMpegTs) -> {
+                // Try HLS version
+                if (lower.contains("/live/")) {
+                    val base = streamUrl.substringBeforeLast(".")
                     callback.invoke(
-                        newExtractorLink(
-                            name,
-                            "HLS (.m3u8)",
-                            "$base.m3u8",
-                        ) {
+                        newExtractorLink(name, "HLS (.m3u8)", "$base.m3u8") {
                             referer = ""
-                            quality = guessQuality(cacheLive?.find { it.stream_id == ld.id }?.name)
+                            quality = guessQuality(ref?.name)
                             type = ExtractorLinkType.M3U8
                         }
                     )
                     callback.invoke(
-                        newExtractorLink(
-                            name,
-                            "MPEG-TS (.ts)",
-                            "$base.ts",
-                        ) {
+                        newExtractorLink(name, "MPEG-TS (.ts)", "$base.ts") {
                             referer = ""
-                            quality = guessQuality(cacheLive?.find { it.stream_id == ld.id }?.name)
+                            quality = guessQuality(ref?.name)
                             type = ExtractorLinkType.VIDEO
                         }
                     )
-                }
-            }
-
-            // -- Movie --
-            "m" -> {
-                val ext = ld.e ?: "mp4"
-                val url = movieUrl(ld.id, ext)
-                if (url.isNotEmpty()) {
-                    val isM3u8 = ext == "m3u8" || ext == "m3u"
+                } else {
+                    // Direct stream URL
                     callback.invoke(
-                        newExtractorLink(
-                            name,
-                            "Movie",
-                            url,
-                        ) {
+                        newExtractorLink(name, "Live Stream", streamUrl) {
                             referer = ""
-                            quality = Qualities.Unknown.value
-                            type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            quality = guessQuality(ref?.name)
+                            type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                         }
                     )
                 }
             }
-
-            // -- Series Episode --
-            "e" -> {
-                val ext = ld.e ?: "mp4"
-                val url = epUrl(ld.id, ext)
-                if (url.isNotEmpty()) {
-                    val isM3u8 = ext == "m3u8" || ext == "m3u"
-                    callback.invoke(
-                        newExtractorLink(
-                            name,
-                            "Episode",
-                            url,
-                        ) {
-                            referer = ""
-                            quality = Qualities.Unknown.value
-                            type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                        }
-                    )
-                }
+            // Everything else: play directly
+            else -> {
+                callback.invoke(
+                    newExtractorLink(name, "Play", streamUrl) {
+                        referer = ""
+                        quality = Qualities.Unknown.value
+                        type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    }
+                )
             }
         }
 
