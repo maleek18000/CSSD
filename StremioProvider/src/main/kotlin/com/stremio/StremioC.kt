@@ -67,15 +67,16 @@ class StremioC(
     override suspend fun load(url: String): LoadResponse? {
         val entry = tryParseJson<CatalogEntry>(url) ?: return null
 
-        // CRITICAL: Original overrides mainUrl to cinemeta for standard movie/series entries
-        // This matches the original decompiled code line 432
-        if ((entry.type == "movie" || entry.type == "series") && isImdborTmdb(entry.id)) {
-            mainUrl = "https://v3-cinemeta.strem.io"
+        // Use a LOCAL variable for the metadata URL.
+        // For standard IMDB movie/series entries, cinemeta provides richer metadata.
+        // We do NOT change mainUrl because loadLinks() needs the ADDON URL for streams.
+        val metaBaseUrl = if ((entry.type == "movie" || entry.type == "series") && isImdborTmdb(entry.id)) {
+            "https://v3-cinemeta.strem.io"
         } else {
-            mainUrl = fixSourceUrl(mainUrl)
+            fixSourceUrl(mainUrl)
         }
 
-        val metaUrl = "$mainUrl/meta/${entry.type}/${entry.id}.json"
+        val metaUrl = "$metaBaseUrl/meta/${entry.type}/${entry.id}.json"
         val metaResponse = tryParseJson<CatalogResponse>(app.get(metaUrl, timeout = 15).text)
         val detailedEntry = metaResponse?.meta ?: entry
 
@@ -84,7 +85,7 @@ class StremioC(
         return if (detailedEntry.videos.isNullOrEmpty()) {
             newMovieLoadResponse(
                 detailedEntry.name,
-                "$mainUrl/meta/${detailedEntry.type}/${detailedEntry.id}.json",
+                "$metaBaseUrl/meta/${detailedEntry.type}/${detailedEntry.id}.json",
                 TvType.Movie,
                 LoadData(detailedEntry.type, detailedEntry.id, imdbId = imdbId).toJson()
             ) {
@@ -101,7 +102,7 @@ class StremioC(
             val episodes = detailedEntry.videos.map { it.toEpisode(this, detailedEntry.type, imdbId) }
             newTvSeriesLoadResponse(
                 detailedEntry.name,
-                "$mainUrl/meta/${detailedEntry.type}/${detailedEntry.id}.json",
+                "$metaBaseUrl/meta/${detailedEntry.type}/${detailedEntry.id}.json",
                 TvType.TvSeries,
                 episodes
             ) {
@@ -125,6 +126,8 @@ class StremioC(
     ): Boolean {
         Log.d("StremioC", "=== loadLinks START ===")
 
+        // Ensure mainUrl is clean (remove /manifest.json, fix stremio:// protocol)
+        // This should already be the ADDON URL since load() no longer overrides it to cinemeta
         mainUrl = fixSourceUrl(mainUrl)
 
         // Parse LoadData
