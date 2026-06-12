@@ -495,7 +495,7 @@ class XtreamIPTVProvider : MainAPI() {
             "m" -> {
                 val apiBase = "${c.server}/player_api.php?username=${c.user}&password=${c.pass}"
                 val infoText = RawHttp.get("$apiBase&action=get_vod_info&vod_id=${ref.id}")
-                val info = if (infoText != null) tryParseJson<XVodInfo>(infoText) else null
+                val info = if (!infoText.isNullOrEmpty()) tryParseJson<XVodInfo>(infoText) else null
                 val detail = info?.info
                 val ext = info?.movie_data?.container_extension ?: ref.e ?: "mp4"
                 val streamId = info?.movie_data?.stream_id ?: ref.id
@@ -507,11 +507,16 @@ class XtreamIPTVProvider : MainAPI() {
             }
             "s" -> {
                 val apiBase = "${c.server}/player_api.php?username=${c.user}&password=${c.pass}"
-                val info = try { tryParseJson<XSeriesInfo>(RawHttp.get("$apiBase&action=get_series_info&series_id=${ref.id}") ?: "") } catch (_: Exception) { null }
+                val infoText = RawHttp.get("$apiBase&action=get_series_info&series_id=${ref.id}")
+                val info = if (!infoText.isNullOrEmpty()) tryParseJson<XSeriesInfo>(infoText) else null
                 val detail = info?.info
                 val epMap = info?.episodes
                 if (epMap.isNullOrEmpty()) {
-                    newMovieLoadResponse(detail?.name ?: ref.n, ref.toJson(), TvType.Movie, LinkData("s", ref.id, "mp4").toJson()) { posterUrl = detail?.cover; plot = detail?.plot }
+                    // Series info API failed - treat as movie with direct stream
+                    newMovieLoadResponse(detail?.name ?: ref.n, ref.toJson(), TvType.Movie, LinkData("m", ref.id, "mp4").toJson()) {
+                        posterUrl = detail?.cover ?: ref.n.let { null }
+                        plot = detail?.plot
+                    }
                 } else {
                     val episodes = mutableListOf<Episode>()
                     epMap.toSortedMap(compareBy { it.toIntOrNull() ?: 0 }).forEach { (_, eps) ->
@@ -569,20 +574,21 @@ class XtreamIPTVProvider : MainAPI() {
         val url = ref.url
         if (url.isEmpty()) return false
         val lower = url.lowercase()
+        val streamHeaders = mapOf("User-Agent" to "okhttp/4.12.0")
 
         if (ref.type == "live" && lower.contains("/live/")) {
             val base = url.substringBeforeLast(".")
             callback(newExtractorLink(name, "HLS (.m3u8)", "$base.m3u8") {
-                referer = ""; quality = guessQuality(ref.name); type = ExtractorLinkType.M3U8
+                referer = ""; quality = guessQuality(ref.name); type = ExtractorLinkType.M3U8; headers = streamHeaders
             })
             callback(newExtractorLink(name, "MPEG-TS (.ts)", "$base.ts") {
-                referer = ""; quality = guessQuality(ref.name); type = ExtractorLinkType.VIDEO
+                referer = ""; quality = guessQuality(ref.name); type = ExtractorLinkType.VIDEO; headers = streamHeaders
             })
         } else {
             val isHls = lower.endsWith(".m3u8")
             callback(newExtractorLink(name, "Play", url) {
                 referer = ""; quality = Qualities.Unknown.value
-                type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO; headers = streamHeaders
             })
         }
         return true
@@ -590,21 +596,32 @@ class XtreamIPTVProvider : MainAPI() {
 
     private suspend fun loadXtreamLinks(ld: LinkData, callback: (ExtractorLink) -> Unit): Boolean {
         val c = cfg() ?: return false
+        // IPTV headers so the server doesn't block stream requests
+        val streamHeaders = mapOf("User-Agent" to "okhttp/4.12.0")
+
         when (ld.t) {
             "l" -> {
                 val base = "${c.server}/live/${c.user}/${c.pass}/${ld.id}"
-                callback(newExtractorLink(name, "HLS (.m3u8)", "$base.m3u8") { referer = ""; quality = Qualities.Unknown.value; type = ExtractorLinkType.M3U8 })
-                callback(newExtractorLink(name, "MPEG-TS (.ts)", "$base.ts") { referer = ""; quality = Qualities.Unknown.value; type = ExtractorLinkType.VIDEO })
+                callback(newExtractorLink(name, "HLS (.m3u8)", "$base.m3u8") {
+                    referer = ""; quality = Qualities.Unknown.value; type = ExtractorLinkType.M3U8; headers = streamHeaders
+                })
+                callback(newExtractorLink(name, "MPEG-TS (.ts)", "$base.ts") {
+                    referer = ""; quality = Qualities.Unknown.value; type = ExtractorLinkType.VIDEO; headers = streamHeaders
+                })
             }
             "m" -> {
                 val ext = ld.e ?: "mp4"
                 val isHls = ext == "m3u8"
-                callback(newExtractorLink(name, "Movie", "${c.server}/movie/${c.user}/${c.pass}/${ld.id}.$ext") { referer = ""; quality = Qualities.Unknown.value; type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO })
+                callback(newExtractorLink(name, "Movie", "${c.server}/movie/${c.user}/${c.pass}/${ld.id}.$ext") {
+                    referer = ""; quality = Qualities.Unknown.value; type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO; headers = streamHeaders
+                })
             }
             "e" -> {
                 val ext = ld.e ?: "mp4"
                 val isHls = ext == "m3u8"
-                callback(newExtractorLink(name, "Episode", "${c.server}/series/${c.user}/${c.pass}/${ld.id}.$ext") { referer = ""; quality = Qualities.Unknown.value; type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO })
+                callback(newExtractorLink(name, "Episode", "${c.server}/series/${c.user}/${c.pass}/${ld.id}.$ext") {
+                    referer = ""; quality = Qualities.Unknown.value; type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO; headers = streamHeaders
+                })
             }
         }
         return true
