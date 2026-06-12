@@ -907,5 +907,20 @@
     "description": "Allows you to use Stremio addons. Supports both Catalog (StremioC) and TMDb-based (StremioX) providers. Requires setup.",
     "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/StremioProvider.cs3",
     "name": "StremioProvider"
+  },
+  {
+  "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/thumb/4/4e/IPTV_logo.svg/512px-IPTV_logo.svg.png",
+  "apiVersion": 1,
+  "repositoryUrl": "https://github.com/maleek18000/CSSD",
+  "fileSize": 25000,
+  "status": 1,
+  "language": "en",
+  "authors": ["maleek18000"],
+  "tvTypes": ["Live", "Movie", "TvSeries"],
+  "version": 1,
+  "internalName": "XtreamIPTV",
+  "description": "Xtream Codes IPTV - Live TV, Movies & Series",
+  "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/XtreamIPTV.cs3",
+  "name": "Xtream IPTV"
   }
 ]
