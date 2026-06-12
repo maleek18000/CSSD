@@ -137,9 +137,6 @@ class XtreamIPTVProvider : MainAPI() {
     override val hasMainPage = true
     override val hasQuickSearch = false
 
-    /** Max category cards per row on the home screen. Keeps it clean. */
-    private val MAX_CATS_PER_ROW = 8
-
     // ═══════════════════════════════════════════════════════════════════
     //  URL HELPERS  (strip category filter ~ for HTTP requests)
     // ═══════════════════════════════════════════════════════════════════
@@ -453,7 +450,7 @@ class XtreamIPTVProvider : MainAPI() {
                     if (homeItems.isNotEmpty()) lists.add(HomePageList("\uD83D\uDCFA Live TV", homeItems))
                 }
 
-                // Movie categories (limited, sorted by stream count)
+                // Movie categories (sorted by stream count)
                 val vodCatsText = RawHttp.get("$apiBase&action=get_vod_categories", 10000)
                 if (vodCatsText != null && vodStreamsText != null) {
                     val cats = tryParseJson<List<XCat>>(vodCatsText) ?: emptyList()
@@ -465,7 +462,6 @@ class XtreamIPTVProvider : MainAPI() {
                             catName to items.size
                         }
                         .sortedByDescending { it.second }
-                        .take(MAX_CATS_PER_ROW)
                         .map { (catName, count) ->
                             val catId = catNames.entries.firstOrNull { it.value == catName }?.key ?: ""
                             val ref = EntryRef("", "xtream_movie_cat", catName, catId)
@@ -474,7 +470,7 @@ class XtreamIPTVProvider : MainAPI() {
                     if (catCards.isNotEmpty()) lists.add(HomePageList("\uD83D\uDCC2 Movie Categories", catCards))
                 }
 
-                // Series categories (limited, sorted by series count)
+                // Series categories (sorted by series count)
                 val seriesCatsText = RawHttp.get("$apiBase&action=get_series_categories", 10000)
                 if (seriesCatsText != null && seriesText != null) {
                     val cats = tryParseJson<List<XCat>>(seriesCatsText) ?: emptyList()
@@ -486,7 +482,6 @@ class XtreamIPTVProvider : MainAPI() {
                             catName to items.size
                         }
                         .sortedByDescending { it.second }
-                        .take(MAX_CATS_PER_ROW)
                         .map { (catName, count) ->
                             val catId = catNames.entries.firstOrNull { it.value == catName }?.key ?: ""
                             val ref = EntryRef("", "xtream_series_cat", catName, catId)
@@ -495,7 +490,7 @@ class XtreamIPTVProvider : MainAPI() {
                     if (catCards.isNotEmpty()) lists.add(HomePageList("\uD83D\uDCC2 Series Categories", catCards))
                 }
 
-                // Live TV categories (limited, sorted by stream count)
+                // Live TV categories (sorted by stream count)
                 val liveCatsText = RawHttp.get("$apiBase&action=get_live_categories", 10000)
                 if (liveCatsText != null && liveStreamsText != null) {
                     val cats = tryParseJson<List<XCat>>(liveCatsText) ?: emptyList()
@@ -507,7 +502,6 @@ class XtreamIPTVProvider : MainAPI() {
                             catName to items.size
                         }
                         .sortedByDescending { it.second }
-                        .take(MAX_CATS_PER_ROW)
                         .map { (catName, count) ->
                             val catId = catNames.entries.firstOrNull { it.value == catName }?.key ?: ""
                             val ref = EntryRef("", "xtream_live_cat", catName, catId)
@@ -528,12 +522,11 @@ class XtreamIPTVProvider : MainAPI() {
      *   1. 🎬 Featured Movies   — 20 movies across all categories
      *   2. 🎞️ Featured Series   — 20 series across all categories
      *   3. 📺 Live TV           — 20 live channels across all categories
-     *   4. 📂 Movie Categories  — top category cards (sorted by size, limited)
-     *   5. 📂 Series Categories — top category cards (sorted by size, limited)
-     *   6. 📂 Live TV Categories— top category cards (sorted by size, limited)
+     *   4. 📂 Movie Categories  — category cards (sorted by size)
+     *   5. 📂 Series Categories — category cards (sorted by size)
+     *   6. 📂 Live TV Categories— category cards (sorted by size)
      *
-     * Category rows are sorted by content count (largest first) and
-     * limited to MAX_CATS_PER_ROW to keep the home screen clean.
+     * Category rows are sorted by content count (largest first).
      * Clicking a category card shows its content directly.
      *
      * If the user added a category filter (~Cat1~Cat2...) in the URL,
@@ -597,15 +590,14 @@ class XtreamIPTVProvider : MainAPI() {
         }
 
         // ══════════════════════════════════════════════════════════════
-        //  CATEGORY ROWS — limited, sorted by content count (largest first)
+        //  CATEGORY ROWS — sorted by content count (largest first)
         //  Clicking a category card directly shows its content
         // ══════════════════════════════════════════════════════════════
 
-        // Movie categories (sorted by size, limited)
+        // Movie categories (sorted by size)
         if (filteredMovieGroups.isNotEmpty()) {
             val catCards = filteredMovieGroups.entries
                 .sortedByDescending { it.value.size }
-                .take(MAX_CATS_PER_ROW)
                 .map { (group, items) ->
                     val ref = EntryRef("", "movie_cat", group, group)
                     newMovieSearchResponse("$group (${items.size})", ref.toJson(), TvType.Movie) {}
@@ -615,11 +607,10 @@ class XtreamIPTVProvider : MainAPI() {
             }
         }
 
-        // Series categories (sorted by size, limited)
+        // Series categories (sorted by size)
         if (filteredSeriesGroups.isNotEmpty()) {
             val catCards = filteredSeriesGroups.entries
                 .sortedByDescending { it.value.size }
-                .take(MAX_CATS_PER_ROW)
                 .map { (group, items) ->
                     val uniqueSeries = items.map { it.seriesName.ifBlank { extractSeriesName(it.name) } }.distinct().size
                     val ref = EntryRef("", "series_cat", group, group)
@@ -630,11 +621,10 @@ class XtreamIPTVProvider : MainAPI() {
             }
         }
 
-        // Live TV categories (sorted by size, limited)
+        // Live TV categories (sorted by size)
         if (filteredLiveGroups.isNotEmpty()) {
             val catCards = filteredLiveGroups.entries
                 .sortedByDescending { it.value.size }
-                .take(MAX_CATS_PER_ROW)
                 .map { (group, items) ->
                     val ref = EntryRef("", "live_cat", group, group)
                     newMovieSearchResponse("$group (${items.size})", ref.toJson(), TvType.Live) {}
@@ -722,13 +712,14 @@ class XtreamIPTVProvider : MainAPI() {
                 val catEntries = allEntries.filter { it.group == ref.group && it.type == "movie" }
                 if (catEntries.isEmpty()) return null
 
-                // Show movies in this category as "episodes" of a TvSeries
+                // Show each movie as its own season with 1 episode, so they're
+                // listed as separate cards rather than numbered episodes
                 val episodes = catEntries.mapIndexed { idx, entry ->
                     val epRef = EntryRef(entry.streamUrl, "movie", entry.name, entry.group, entry.logo)
                     newEpisode(epRef.toJson()) {
                         name = entry.name
-                        season = 1
-                        episode = idx + 1
+                        season = idx + 1
+                        episode = 1
                         posterUrl = entry.logo
                     }
                 }
@@ -742,15 +733,17 @@ class XtreamIPTVProvider : MainAPI() {
                 val catEntries = allEntries.filter { it.group == ref.group && it.type == "series" }
                 if (catEntries.isEmpty()) return null
 
-                // Group by series name, show each series as an "episode"
+                // Group by series name, show each series as its own "season"
+                // This way each show appears as a separate season tab,
+                // and clicking it opens the show's detail page with real seasons/episodes
                 val uniqueSeries = catEntries.groupBy { it.seriesName.ifBlank { extractSeriesName(it.name) } }
                 val episodes = uniqueSeries.entries.mapIndexed { idx, (seriesName, sEpisodes) ->
                     val first = sEpisodes.first()
                     val epRef = EntryRef(first.streamUrl, "series", seriesName, ref.group, first.logo, seriesName)
                     newEpisode(epRef.toJson()) {
                         name = seriesName
-                        season = 1
-                        episode = idx + 1
+                        season = idx + 1
+                        episode = 1
                         posterUrl = first.logo
                     }
                 }
@@ -768,8 +761,8 @@ class XtreamIPTVProvider : MainAPI() {
                     val epRef = EntryRef(entry.streamUrl, "live", entry.name, entry.group, entry.logo)
                     newEpisode(epRef.toJson()) {
                         name = entry.name
-                        season = 1
-                        episode = idx + 1
+                        season = idx + 1
+                        episode = 1
                         posterUrl = entry.logo
                     }
                 }
@@ -787,11 +780,12 @@ class XtreamIPTVProvider : MainAPI() {
                 val streams = tryParseJson<List<XVod>>(streamsText) ?: return null
                 if (streams.isEmpty()) return null
 
+                // Each movie as its own season
                 val episodes = streams.mapIndexed { idx, s ->
                     newEpisode(ItemRef("m", s.stream_id, s.name, s.container_extension ?: "mp4").toJson()) {
                         name = s.name
-                        season = 1
-                        episode = idx + 1
+                        season = idx + 1
+                        episode = 1
                         posterUrl = s.stream_icon
                     }
                 }
@@ -809,11 +803,12 @@ class XtreamIPTVProvider : MainAPI() {
                 val series = tryParseJson<List<XSeries>>(seriesText) ?: return null
                 if (series.isEmpty()) return null
 
+                // Each series as its own season, clicking opens show detail
                 val episodes = series.mapIndexed { idx, s ->
                     newEpisode(ItemRef("s", s.series_id, s.name).toJson()) {
                         name = s.name
-                        season = 1
-                        episode = idx + 1
+                        season = idx + 1
+                        episode = 1
                         posterUrl = s.cover
                     }
                 }
@@ -831,11 +826,12 @@ class XtreamIPTVProvider : MainAPI() {
                 val streams = tryParseJson<List<XLive>>(streamsText) ?: return null
                 if (streams.isEmpty()) return null
 
+                // Each channel as its own season
                 val episodes = streams.mapIndexed { idx, s ->
                     newEpisode(ItemRef("l", s.stream_id, s.name).toJson()) {
                         name = s.name
-                        season = 1
-                        episode = idx + 1
+                        season = idx + 1
+                        episode = 1
                         posterUrl = s.stream_icon
                     }
                 }
