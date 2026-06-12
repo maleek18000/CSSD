@@ -46,15 +46,22 @@ class StremioC(
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         mainUrl = fixSourceUrl(mainUrl)
-        val manifest = tryParseJson<Manifest>(app.get("$mainUrl/manifest.json").text)
+        val manifest = tryParseJson<Manifest>(app.get("$mainUrl/manifest.json", timeout = 15).text)
         val catalogs = manifest?.catalogs ?: return newHomePageResponse(emptyList())
-        val homePageLists = catalogs.mapNotNull { it.toHomePageList(this) }
-        return newHomePageResponse(homePageLists)
+        // Fetch all catalogs in parallel (matching original which uses amap)
+        val homePageLists = coroutineScope {
+            catalogs.map { catalog ->
+                async(Dispatchers.IO) {
+                    catalog.toHomePageList(this@StremioC)
+                }
+            }.awaitAll().filterNotNull()
+        }
+        return newHomePageResponse(homePageLists, true)
     }
 
     override suspend fun search(query: String): List<SearchResponse>? {
         mainUrl = fixSourceUrl(mainUrl)
-        val manifest = tryParseJson<Manifest>(app.get("$mainUrl/manifest.json").text)
+        val manifest = tryParseJson<Manifest>(app.get("$mainUrl/manifest.json", timeout = 15).text)
         val catalogs = manifest?.catalogs ?: return null
         return catalogs.flatMap { it.search(query, this) }
     }
@@ -225,7 +232,7 @@ class StremioC(
                 val fixedName = fixSourceName(stream.name, stream.title, stream.description)
                 val qualityTitle = buildExtractedTitle(extractSpecs(fixedName))
 
-                // Get headers from proxyHeaders.request first, then fallback to behaviorHints.headers
+                // Get headers from proxyHeaders or behaviorHints.headers
                 val headers = stream.behaviorHints?.proxyHeaders?.request
                     ?: stream.behaviorHints?.headers
                     ?: emptyMap()
@@ -329,7 +336,7 @@ class StremioC(
                             val fixedName = fixSourceName(streamName, streamTitle, streamDesc)
                             val qualityTitle = buildExtractedTitle(extractSpecs(fixedName))
 
-                            // Get headers from proxyHeaders or behaviorHints.headers (as Map<String, String>)
+                            // Get headers from proxyHeaders or behaviorHints.headers
                             val headers = try {
                                 streamNode.get("behaviorHints")
                                     ?.get("proxyHeaders")?.get("request")
@@ -466,16 +473,18 @@ class StremioC(
             val entries = mutableListOf<SearchResponse>()
             types.forEach { type ->
                 try {
+                    // Fetch first 2 pages of search results max
                     var skip = 0
+                    var pagesFetched = 0
                     var hasMore = true
-                    while (hasMore) {
+                    while (hasMore && pagesFetched < 2) {
                         val url = if (skip == 0) {
                             "${provider.mainUrl}/catalog/$type/${id}/search=${query.encodeUri()}.json"
                         } else {
                             "${provider.mainUrl}/catalog/$type/${id}/search=${query.encodeUri()}/skip=$skip.json"
                         }
                         val res = tryParseJson<CatalogResponse>(
-                            app.get(url, timeout = 120).text
+                            app.get(url, timeout = 30).text
                         ) ?: break
                         if (res.metas.isNullOrEmpty()) {
                             hasMore = false
@@ -484,6 +493,7 @@ class StremioC(
                                 entries.add(entry.toSearchResponse(provider))
                             }
                             skip += res.metas.size
+                            pagesFetched++
                         }
                     }
                 } catch (e: Exception) {
@@ -497,24 +507,14 @@ class StremioC(
             val entries = mutableListOf<SearchResponse>()
             types.forEach { type ->
                 try {
-                    var skip = 0
-                    var hasMore = true
-                    while (hasMore) {
-                        val url = if (skip == 0) {
-                            "${provider.mainUrl}/catalog/$type/${id.encodeUri()}.json"
-                        } else {
-                            "${provider.mainUrl}/catalog/$type/${id.encodeUri()}/skip=$skip.json"
-                        }
-                        val res = tryParseJson<CatalogResponse>(
-                            app.get(url, timeout = 120).text
-                        ) ?: break
-                        if (res.metas.isNullOrEmpty()) {
-                            hasMore = false
-                        } else {
-                            res.metas.forEach { entry ->
-                                entries.add(entry.toSearchResponse(provider))
-                            }
-                            skip += res.metas.size
+                    // Only fetch the FIRST page for home screen (no pagination)
+                    val url = "${provider.mainUrl}/catalog/$type/${id.encodeUri()}.json"
+                    val res = tryParseJson<CatalogResponse>(
+                        app.get(url, timeout = 30).text
+                    )
+                    if (res?.metas != null) {
+                        res.metas.forEach { entry ->
+                            entries.add(entry.toSearchResponse(provider))
                         }
                     }
                 } catch (e: Exception) {
