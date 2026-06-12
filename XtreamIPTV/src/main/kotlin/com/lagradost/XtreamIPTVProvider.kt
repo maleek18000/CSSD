@@ -388,10 +388,35 @@ class XtreamIPTVProvider : MainAPI() {
             if (lists.isNotEmpty()) return newHomePageResponse(lists, false)
         }
 
+        // ── Build HLS-preferred M3U URL ──
+        // Most IPTV servers support output=hls which gives .m3u8 URLs
+        // instead of .ts URLs that ExoPlayer can't parse directly
+        val hlsUrl = url.replace("output=ts", "output=hls")
+            .replace("output=mpegts", "output=hls")
+
         // ── Try M3U download with 80s overall timeout ──
-        val m3uText = withTimeoutOrNull(80000L) {
-            RawHttp.get(url, readTimeout = 60000)
+        // Try HLS URL first, then fall back to original URL
+        var m3uText: String? = null
+        var usedUrl = url
+
+        if (hlsUrl != url) {
+            m3uText = withTimeoutOrNull(80000L) {
+                RawHttp.get(hlsUrl, readTimeout = 60000)
+            }
+            if (m3uText != null && (m3uText.startsWith("#EXTM3U") || m3uText.startsWith("#EXTINF"))) {
+                usedUrl = hlsUrl
+            } else {
+                m3uText = null
+            }
         }
+
+        if (m3uText == null) {
+            m3uText = withTimeoutOrNull(80000L) {
+                RawHttp.get(url, readTimeout = 60000)
+            }
+            usedUrl = url
+        }
+
         if (m3uText != null && (m3uText.startsWith("#EXTM3U") || m3uText.startsWith("#EXTINF"))) {
             val entries = parseM3U(m3uText)
             if (entries.isNotEmpty()) {
@@ -709,53 +734,98 @@ class XtreamIPTVProvider : MainAPI() {
 
         val lower = url.lowercase()
         val streamHeaders = mapOf("User-Agent" to "okhttp/4.12.0")
+        val qual = guessQuality(ref.name)
 
         when {
-            // Live stream with /live/ path: offer both .m3u8 and .ts
+            // ── Live stream with /live/ path: prefer HLS ──
             ref.type == "live" && lower.contains("/live/") -> {
                 val base = url.substringBeforeLast(".")
+                // HLS is always preferred - ExoPlayer handles it natively
                 callback(
                     newExtractorLink(name, "HLS", "$base.m3u8") {
-                        quality = guessQuality(ref.name)
+                        quality = qual
                         type = ExtractorLinkType.M3U8
                         headers = streamHeaders
                     }
                 )
                 callback(
                     newExtractorLink(name, "MPEG-TS", "$base.ts") {
-                        quality = guessQuality(ref.name)
+                        quality = qual
                         type = ExtractorLinkType.VIDEO
                         headers = streamHeaders
                     }
                 )
             }
-            // Any stream ending in .m3u8
+
+            // ── Stream already in .m3u8 format (HLS) ──
             lower.endsWith(".m3u8") -> {
                 callback(
                     newExtractorLink(name, "HLS", url) {
-                        quality = guessQuality(ref.name)
+                        quality = qual
                         type = ExtractorLinkType.M3U8
                         headers = streamHeaders
                     }
                 )
             }
-            // Everything else (movie files, series episodes, etc.)
-            else -> {
-                val isHls = lower.endsWith(".m3u8")
+
+            // ── Xtream-style /series/ or /movie/ URLs ──
+            lower.contains("/series/") || lower.contains("/movie/") -> {
+                val base = url.substringBeforeLast(".")
+                val ext = url.substringAfterLast(".", "mp4")
+
+                // Always provide HLS variant - most IPTV servers support it
                 callback(
-                    newExtractorLink(name, "Play", url) {
-                        quality = guessQuality(ref.name)
-                        type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    newExtractorLink(name, "HLS", "$base.m3u8") {
+                        quality = qual
+                        type = ExtractorLinkType.M3U8
                         headers = streamHeaders
                     }
                 )
-                // For /series/ and /movie/ paths, also try .m3u8 variant
-                if (lower.contains("/series/") || lower.contains("/movie/")) {
+                // Also provide original format as fallback
+                // ExoPlayer handles .mp4 natively; .mkv/.avi/.ts may fail
+                val exoSupported = ext in listOf("mp4", "m3u8", "m4a", "webm")
+                if (exoSupported) {
+                    callback(
+                        newExtractorLink(name, ext.uppercase(), url) {
+                            quality = qual
+                            type = if (ext == "m3u8") ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            headers = streamHeaders
+                        }
+                    )
+                }
+            }
+
+            // ── Generic URL (direct stream link) ──
+            else -> {
+                val ext = url.substringAfterLast(".", "")
+                val exoSupported = ext in listOf("mp4", "m3u8", "m4a", "webm")
+
+                if (exoSupported || ext.isEmpty()) {
+                    callback(
+                        newExtractorLink(name, "Play", url) {
+                            quality = qual
+                            type = if (ext == "m3u8") ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            headers = streamHeaders
+                        }
+                    )
+                }
+
+                // For unsupported formats (.mkv, .avi, .ts, .flv, etc.)
+                // try to construct an HLS variant URL
+                if (!exoSupported && ext.isNotEmpty()) {
                     val base = url.substringBeforeLast(".")
                     callback(
-                        newExtractorLink(name, "HLS Alt", "$base.m3u8") {
-                            quality = guessQuality(ref.name)
+                        newExtractorLink(name, "HLS", "$base.m3u8") {
+                            quality = qual
                             type = ExtractorLinkType.M3U8
+                            headers = streamHeaders
+                        }
+                    )
+                    // Also offer original as a last resort (user can try with external player)
+                    callback(
+                        newExtractorLink(name, "$ext (original)", url) {
+                            quality = qual
+                            type = ExtractorLinkType.VIDEO
                             headers = streamHeaders
                         }
                     )
@@ -772,6 +842,7 @@ class XtreamIPTVProvider : MainAPI() {
         when (ld.t) {
             "l" -> {
                 val base = "${c.server}/live/${c.user}/${c.pass}/${ld.id}"
+                // HLS is always preferred for live streams
                 callback(
                     newExtractorLink(name, "HLS", "$base.m3u8") {
                         quality = Qualities.Unknown.value
@@ -789,25 +860,49 @@ class XtreamIPTVProvider : MainAPI() {
             }
             "m" -> {
                 val ext = ld.e ?: "mp4"
-                val isHls = ext == "m3u8"
+                val base = "${c.server}/movie/${c.user}/${c.pass}/${ld.id}"
+                // Always provide HLS variant
                 callback(
-                    newExtractorLink(name, "Movie", "${c.server}/movie/${c.user}/${c.pass}/${ld.id}.$ext") {
+                    newExtractorLink(name, "HLS", "$base.m3u8") {
                         quality = Qualities.Unknown.value
-                        type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        type = ExtractorLinkType.M3U8
                         headers = streamHeaders
                     }
                 )
+                // Also provide original format if ExoPlayer supports it
+                val exoSupported = ext in listOf("mp4", "m4a", "webm", "m3u8")
+                if (exoSupported) {
+                    callback(
+                        newExtractorLink(name, ext.uppercase(), "$base.$ext") {
+                            quality = Qualities.Unknown.value
+                            type = if (ext == "m3u8") ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            headers = streamHeaders
+                        }
+                    )
+                }
             }
             "e" -> {
                 val ext = ld.e ?: "mp4"
-                val isHls = ext == "m3u8"
+                val base = "${c.server}/series/${c.user}/${c.pass}/${ld.id}"
+                // Always provide HLS variant
                 callback(
-                    newExtractorLink(name, "Episode", "${c.server}/series/${c.user}/${c.pass}/${ld.id}.$ext") {
+                    newExtractorLink(name, "HLS", "$base.m3u8") {
                         quality = Qualities.Unknown.value
-                        type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        type = ExtractorLinkType.M3U8
                         headers = streamHeaders
                     }
                 )
+                // Also provide original format if ExoPlayer supports it
+                val exoSupported = ext in listOf("mp4", "m4a", "webm", "m3u8")
+                if (exoSupported) {
+                    callback(
+                        newExtractorLink(name, ext.uppercase(), "$base.$ext") {
+                            quality = Qualities.Unknown.value
+                            type = if (ext == "m3u8") ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            headers = streamHeaders
+                        }
+                    )
+                }
             }
         }
         return true
