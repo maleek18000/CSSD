@@ -705,7 +705,6 @@ class XtreamIPTVProvider : MainAPI() {
                 val catEntries = allEntries.filter { it.group == ref.group && it.type == "live" }
                 if (catEntries.isEmpty()) return null
 
-                // Show live channels in this category as "episodes"
                 val episodes = catEntries.mapIndexed { idx, entry ->
                     val epRef = EntryRef(entry.streamUrl, "live", entry.name, entry.group, entry.logo)
                     newEpisode(epRef.toJson()) {
@@ -717,6 +716,72 @@ class XtreamIPTVProvider : MainAPI() {
                 }
                 newTvSeriesLoadResponse(ref.group, ref.toJson(), TvType.TvSeries, episodes) {
                     plot = "${catEntries.size} channels in this category"
+                }
+            }
+            // ── Xtream API: Movie category card clicked ──
+            "xtream_movie_cat" -> {
+                val c = cfg() ?: return null
+                val encUser = URLEncoder.encode(c.user, "UTF-8")
+                val encPass = URLEncoder.encode(c.pass, "UTF-8")
+                val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
+                val streamsText = RawHttp.get("$apiBase&action=get_vod_streams&category_id=${ref.group}", 15000) ?: return null
+                val streams = tryParseJson<List<XVod>>(streamsText) ?: return null
+                if (streams.isEmpty()) return null
+
+                val episodes = streams.mapIndexed { idx, s ->
+                    newEpisode(ItemRef("m", s.stream_id, s.name, s.container_extension ?: "mp4").toJson()) {
+                        name = s.name
+                        season = 1
+                        episode = idx + 1
+                        posterUrl = s.stream_icon
+                    }
+                }
+                newTvSeriesLoadResponse(ref.name, ref.toJson(), TvType.TvSeries, episodes) {
+                    plot = "${streams.size} movies"
+                }
+            }
+            // ── Xtream API: Series category card clicked ──
+            "xtream_series_cat" -> {
+                val c = cfg() ?: return null
+                val encUser = URLEncoder.encode(c.user, "UTF-8")
+                val encPass = URLEncoder.encode(c.pass, "UTF-8")
+                val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
+                val seriesText = RawHttp.get("$apiBase&action=get_series&category_id=${ref.group}", 15000) ?: return null
+                val series = tryParseJson<List<XSeries>>(seriesText) ?: return null
+                if (series.isEmpty()) return null
+
+                val episodes = series.mapIndexed { idx, s ->
+                    newEpisode(ItemRef("s", s.series_id, s.name).toJson()) {
+                        name = s.name
+                        season = 1
+                        episode = idx + 1
+                        posterUrl = s.cover
+                    }
+                }
+                newTvSeriesLoadResponse(ref.name, ref.toJson(), TvType.TvSeries, episodes) {
+                    plot = "${series.size} series"
+                }
+            }
+            // ── Xtream API: Live TV category card clicked ──
+            "xtream_live_cat" -> {
+                val c = cfg() ?: return null
+                val encUser = URLEncoder.encode(c.user, "UTF-8")
+                val encPass = URLEncoder.encode(c.pass, "UTF-8")
+                val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
+                val streamsText = RawHttp.get("$apiBase&action=get_live_streams&category_id=${ref.group}", 15000) ?: return null
+                val streams = tryParseJson<List<XLive>>(streamsText) ?: return null
+                if (streams.isEmpty()) return null
+
+                val episodes = streams.mapIndexed { idx, s ->
+                    newEpisode(ItemRef("l", s.stream_id, s.name).toJson()) {
+                        name = s.name
+                        season = 1
+                        episode = idx + 1
+                        posterUrl = s.stream_icon
+                    }
+                }
+                newTvSeriesLoadResponse(ref.name, ref.toJson(), TvType.TvSeries, episodes) {
+                    plot = "${streams.size} channels"
                 }
             }
             "series" -> {
