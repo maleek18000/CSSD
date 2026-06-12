@@ -1,6 +1,7 @@
 package com.stremio
 
 import android.util.Log
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.cloudstream3.AcraApplication
 import com.lagradost.cloudstream3.CloudStreamApp
 import com.lagradost.cloudstream3.MainAPI
@@ -20,6 +21,8 @@ import java.net.URLEncoder
 import java.util.Locale
 
 private const val TRACKER_LIST_URL = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
+
+private val utilMapper = jacksonObjectMapper()
 
 val SPEC_OPTIONS = mapOf(
     "quality" to listOf(
@@ -82,124 +85,263 @@ suspend fun invokeMainSource(
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit
 ) {
+    if (imdbId.isBlank()) {
+        Log.w("StremioUtil", "invokeMainSource: imdbId is blank, skipping")
+        return
+    }
+
     val fixedUrl = fixSourceUrl(baseUrl)
 
-    // Construct proper Stremio stream URL
-    // Movies: /stream/movie/{id}.json
-    // Series: /stream/series/{id}:{season}:{episode}.json
-    val streamUrl = if (season != null && episode != null) {
-        "$fixedUrl/stream/series/$imdbId:$season:$episode.json"
+    // Construct stream URLs - try multiple formats
+    val streamUrls = mutableListOf<String>()
+
+    // Format 1: Standard Stremio protocol
+    if (season != null && episode != null) {
+        streamUrls.add("$fixedUrl/stream/series/$imdbId:$season:$episode.json")
     } else if (season != null) {
-        "$fixedUrl/stream/series/$imdbId:$season:1.json"
+        streamUrls.add("$fixedUrl/stream/series/$imdbId:$season:1.json")
     } else {
-        "$fixedUrl/stream/movie/$imdbId.json"
+        streamUrls.add("$fixedUrl/stream/movie/$imdbId.json")
     }
 
-    Log.d("StremioUtil", "invokeMainSource: $streamUrl")
-
-    val response = try {
-        app.get(streamUrl, timeout = 30)
-    } catch (e: Exception) {
-        Log.e("StremioUtil", "Stream request failed: ${e.message}")
-        return
+    // Format 2: If ID already has colons, try it directly
+    if (imdbId.contains(":")) {
+        val type = if (season != null) "series" else "movie"
+        streamUrls.add("$fixedUrl/stream/$type/$imdbId.json")
     }
 
-    if (!response.isSuccessful) {
-        Log.e("StremioUtil", "Stream response not successful: ${response.code}")
-        return
+    // Format 3: Try with just the base ID (strip :season:episode if present)
+    val baseId = imdbId.split(":").firstOrNull() ?: imdbId
+    if (baseId != imdbId && season != null && episode != null) {
+        streamUrls.add("$fixedUrl/stream/series/$baseId:$season:$episode.json")
     }
 
-    val streamsResponse = tryParseJson<StreamsResponse>(response.text) ?: return
-    val streams = streamsResponse.streams
-
-    if (streams.isNullOrEmpty()) {
-        Log.w("StremioUtil", "No streams found from $fixedUrl")
-        return
-    }
-
-    Log.d("StremioUtil", "Found ${streams.size} streams from $fixedUrl")
-
-    for (stream in streams) {
-        val streamName = stream.name ?: ""
-        val streamTitle = stream.title ?: stream.name ?: ""
-
+    for (streamUrl in streamUrls.distinct()) {
         try {
-            when {
-                stream.url != null -> {
-                    var referer: String? = null
+            Log.d("StremioUtil", "Trying: $streamUrl")
+            val response = app.get(streamUrl, timeout = 15)
+            Log.d("StremioUtil", "Response: code=${response.code}, length=${response.text.length}")
+
+            if (!response.isSuccessful || response.text.isEmpty()) continue
+
+            // Try standard parsing first
+            val streamsResponse = tryParseJson<StreamsResponse>(response.text)
+            val streams = streamsResponse?.streams
+
+            if (!streams.isNullOrEmpty()) {
+                Log.d("StremioUtil", "Found ${streams.size} streams via tryParseJson")
+                for (stream in streams) {
                     try {
-                        val headers = stream.behaviorHints?.proxyHeaders?.request
-                        referer = headers?.get("referer") ?: headers?.get("origin")
-                    } catch (e: Exception) {}
-
-                    val isM3u8 = stream.url.endsWith(".m3u8")
-                    val linkType = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    callback.invoke(
-                        newExtractorLink(
-                            source = streamName,
-                            name = streamTitle,
-                            url = stream.url,
-                            type = linkType
-                        ) {
-                            this.referer = referer ?: ""
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                }
-
-                stream.ytId != null -> {
-                    loadExtractor("https://www.youtube.com/watch?v=${stream.ytId}", subtitleCallback, callback)
-                }
-
-                stream.externalUrl != null -> {
-                    loadExtractor(stream.externalUrl, subtitleCallback, callback)
-                }
-
-                stream.infoHash != null -> {
-                    val magnet = generateMagnetLink(stream.infoHash)
-                    val displayName = stream.title ?: stream.name ?: ""
-                    val extractedTitle = buildExtractedTitle(extractSpecs(displayName))
-                    val fullTitle = "$extractedTitle$displayName"
-
-                    val sizeInfo = when {
-                        fullTitle.contains("\uD83D\uDCBE") && fullTitle.contains("\uD83D\uDC64") -> {
-                            val sizeIdx = fullTitle.indexOf("\uD83D\uDCBE")
-                            val userIdx = fullTitle.indexOf("\uD83D\uDC64")
-                            if (sizeIdx >= userIdx) fullTitle.substringAfter("\uD83D\uDC64")
-                            else fullTitle.substringAfter("\uD83D\uDCBE")
-                        }
-                        fullTitle.contains("\uD83D\uDCBE") -> fullTitle.substringAfter("\uD83D\uDCBE")
-                        fullTitle.contains("\uD83D\uDC64") -> fullTitle.substringAfter("\uD83D\uDC64")
-                        fullTitle.contains("Name: ") -> fullTitle.substringBefore("Size")
-                        else -> extractedTitle
+                        processStreamUtil(stream, providerName, subtitleCallback, callback)
+                    } catch (e: Exception) {
+                        Log.e("StremioUtil", "Error processing stream: ${e.message}")
                     }
-
-                    callback.invoke(
-                        newExtractorLink(
-                            source = providerName,
-                            name = sizeInfo.ifBlank { extractedTitle },
-                            url = magnet,
-                            type = ExtractorLinkType.MAGNET
-                        ) {
-                            this.quality = getQuality(listOf(displayName))
-                        }
-                    )
                 }
-
-                else -> {
-                    Log.w("StremioUtil", "Stream has no recognizable URL/ytId/externalUrl/infoHash: $streamTitle")
-                }
+                return // Success, don't try more URLs
             }
+
+            // tryParseJson failed or returned empty - try manual JSON parsing
+            Log.d("StremioUtil", "tryParseJson returned no streams, trying manual parse")
+            val found = tryManualStreamParse(response.text, providerName, subtitleCallback, callback)
+            if (found) {
+                Log.d("StremioUtil", "Found streams via manual parse")
+                return
+            }
+
+            Log.d("StremioUtil", "Response preview: ${response.text.take(200)}")
+
         } catch (e: Exception) {
-            Log.e("StremioUtil", "Error processing stream '$streamTitle': ${e.message}")
+            Log.e("StremioUtil", "URL failed: $streamUrl - ${e.message}")
+        }
+    }
+}
+
+/**
+ * Process a single Stream object into extractor links
+ */
+private suspend fun processStreamUtil(
+    stream: Stream,
+    providerName: String,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit
+) {
+    val streamName = stream.name ?: ""
+    val streamTitle = stream.title ?: stream.name ?: ""
+
+    when {
+        stream.url != null -> {
+            var referer: String? = null
+            try {
+                val headers = stream.behaviorHints?.proxyHeaders?.request
+                referer = headers?.get("referer") ?: headers?.get("origin")
+            } catch (_: Exception) {}
+
+            val isM3u8 = stream.url.endsWith(".m3u8")
+            val linkType = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            callback.invoke(
+                newExtractorLink(
+                    source = streamName,
+                    name = streamTitle,
+                    url = stream.url,
+                    type = linkType
+                ) {
+                    this.referer = referer ?: ""
+                    this.quality = Qualities.Unknown.value
+                }
+            )
         }
 
-        // Handle subtitles in streams
-        stream.subtitles?.forEach { sub ->
-            if (sub.url != null && sub.lang != null) {
+        stream.ytId != null -> {
+            loadExtractor("https://www.youtube.com/watch?v=${stream.ytId}", subtitleCallback, callback)
+        }
+
+        stream.externalUrl != null -> {
+            loadExtractor(stream.externalUrl, subtitleCallback, callback)
+        }
+
+        stream.infoHash != null -> {
+            val magnet = generateMagnetLink(stream.infoHash)
+            val displayName = stream.title ?: stream.name ?: ""
+            val extractedTitle = buildExtractedTitle(extractSpecs(displayName))
+            val fullTitle = "$extractedTitle$displayName"
+
+            val sizeInfo = when {
+                fullTitle.contains("\uD83D\uDCBE") && fullTitle.contains("\uD83D\uDC64") -> {
+                    val sizeIdx = fullTitle.indexOf("\uD83D\uDCBE")
+                    val userIdx = fullTitle.indexOf("\uD83D\uDC64")
+                    if (sizeIdx >= userIdx) fullTitle.substringAfter("\uD83D\uDC64")
+                    else fullTitle.substringAfter("\uD83D\uDCBE")
+                }
+                fullTitle.contains("\uD83D\uDCBE") -> fullTitle.substringAfter("\uD83D\uDCBE")
+                fullTitle.contains("\uD83D\uDC64") -> fullTitle.substringAfter("\uD83D\uDC64")
+                fullTitle.contains("Name: ") -> fullTitle.substringBefore("Size")
+                else -> extractedTitle
+            }
+
+            callback.invoke(
+                newExtractorLink(
+                    source = providerName,
+                    name = sizeInfo.ifBlank { extractedTitle },
+                    url = magnet,
+                    type = ExtractorLinkType.MAGNET
+                ) {
+                    this.quality = getQuality(listOf(displayName))
+                }
+            )
+        }
+
+        else -> {
+            Log.w("StremioUtil", "Stream has no url/ytId/externalUrl/infoHash: $streamTitle")
+        }
+    }
+
+    // Handle subtitles in streams
+    stream.subtitles?.forEach { sub ->
+        if (sub.url != null && sub.lang != null) {
+            try {
                 subtitleCallback.invoke(SubtitleFile(sub.lang, sub.url))
+            } catch (e: Exception) {
+                Log.e("StremioUtil", "SubtitleFile failed: ${e.message}")
             }
         }
+    }
+}
+
+/**
+ * Manual JSON parsing fallback - uses Jackson's JsonNode tree model
+ * which is much more forgiving than data class binding.
+ */
+private suspend fun tryManualStreamParse(
+    responseText: String,
+    providerName: String,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit
+): Boolean {
+    try {
+        val jsonObj = utilMapper.readTree(responseText)
+        val streamsNode = jsonObj?.get("streams") ?: return false
+        if (!streamsNode.isArray || streamsNode.size() == 0) return false
+
+        var found = false
+        for (streamNode in streamsNode) {
+            try {
+                val url = streamNode.get("url")?.asText()
+                val ytId = streamNode.get("ytId")?.asText()
+                val externalUrl = streamNode.get("externalUrl")?.asText()
+                val infoHash = streamNode.get("infoHash")?.asText()
+                val streamTitle = streamNode.get("title")?.asText() ?: streamNode.get("name")?.asText() ?: ""
+                val streamName = streamNode.get("name")?.asText() ?: ""
+
+                when {
+                    url != null -> {
+                        val isM3u8 = url.endsWith(".m3u8")
+                        val linkType = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        var referer = ""
+                        try {
+                            val headers = streamNode.get("behaviorHints")
+                                ?.get("proxyHeaders")?.get("request")
+                            referer = headers?.get("referer")?.asText()
+                                ?: headers?.get("origin")?.asText() ?: ""
+                        } catch (_: Exception) {}
+
+                        callback.invoke(
+                            newExtractorLink(
+                                source = streamName.ifBlank { streamTitle },
+                                name = streamTitle.ifBlank { streamName },
+                                url = url,
+                                type = linkType
+                            ) {
+                                this.referer = referer
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                        found = true
+                    }
+                    ytId != null -> {
+                        loadExtractor("https://www.youtube.com/watch?v=$ytId", subtitleCallback, callback)
+                        found = true
+                    }
+                    externalUrl != null -> {
+                        loadExtractor(externalUrl, subtitleCallback, callback)
+                        found = true
+                    }
+                    infoHash != null -> {
+                        val magnet = generateMagnetLink(infoHash)
+                        callback.invoke(
+                            newExtractorLink(
+                                source = providerName,
+                                name = streamTitle.ifBlank { streamName },
+                                url = magnet,
+                                type = ExtractorLinkType.MAGNET
+                            ) {
+                                this.quality = getQualityFromName(streamTitle)
+                            }
+                        )
+                        found = true
+                    }
+                }
+
+                // Handle subtitles
+                val subtitlesNode = streamNode.get("subtitles")
+                if (subtitlesNode != null && subtitlesNode.isArray) {
+                    for (subNode in subtitlesNode) {
+                        val subUrl = subNode.get("url")?.asText()
+                        val subLang = subNode.get("lang")?.asText()
+                        if (subUrl != null && subLang != null) {
+                            try {
+                                subtitleCallback.invoke(SubtitleFile(subLang, subUrl))
+                            } catch (_: Exception) {}
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("StremioUtil", "Manual parse failed for one stream: ${e.message}")
+            }
+        }
+        return found
+    } catch (e: Exception) {
+        Log.e("StremioUtil", "Manual JSON parse completely failed: ${e.message}")
+        return false
     }
 }
 
@@ -215,7 +357,6 @@ fun extractSpecs(title: String): Map<String, List<String>> {
         result[key] = matches
     }
 
-    // Extract size
     val sizeMatch = Regex("(\\d+(?:\\.\\d+)?\\s?(?:MB|GB))", RegexOption.IGNORE_CASE)
         .find(title)
     if (sizeMatch != null) {
