@@ -357,11 +357,35 @@ class XtreamIPTVProvider : MainAPI() {
 
     /** Fetch and parse the M3U playlist. */
     private suspend fun loadM3U(): List<M3UEntry>? {
+        val url = mainUrl.trim()
+        if (url.isEmpty()) return null
+
+        // Try with IPTV player user-agent (some servers block browser UAs)
+        val iptvHeaders = mapOf(
+            "User-Agent" to "IPTV/1.0 (Linux;Android) ExoPlayer/2.19.1"
+        )
+
         return try {
-            val response = app.get(mainUrl.trim()).text
-            parseM3U(response)
-        } catch (e: Exception) {
-            null
+            val response = app.get(url, headers = iptvHeaders, timeout = 30000L).text
+            if (response.startsWith("#EXTM3U") || response.startsWith("#EXTINF")) {
+                parseM3U(response)
+            } else if (response.trim().startsWith("<") || response.contains("521") || response.contains("error")) {
+                // Server returned an error page, try without custom UA
+                try {
+                    val resp2 = app.get(url, timeout = 30000L).text
+                    if (resp2.startsWith("#EXTM3U") || resp2.startsWith("#EXTINF")) {
+                        parseM3U(resp2)
+                    } else null
+                } catch (_: Exception) { null }
+            } else {
+                parseM3U(response)
+            }
+        } catch (_: Exception) {
+            // Fallback: try default headers
+            try {
+                val response = app.get(url, timeout = 30000L).text
+                parseM3U(response)
+            } catch (_: Exception) { null }
         }
     }
 
