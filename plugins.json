@@ -907,6 +907,18 @@
     "description": "Allows you to use Stremio addons. Supports both Catalog (StremioC) and TMDb-based (StremioX) providers. Requires setup.",
     "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/StremioProvider.cs3",
     "name": "StremioProvider"
+  },
+  {
+    "name": "Xtream IPTV",
+    "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/XtreamIPTV.cs3",
+    "tvTypes": ["Live", "Movie", "TvSeries"],
+    "language": "en",
+    "authors": ["XtreamIPTV"],
+    "description": "Watch Live TV, Movies & Series from your Xtream Codes IPTV provider directly in CloudStream. Supports Live channels (HLS/MPEG-TS), VOD movies, and full series with episodes.",
+    "version": 1,
+    "iconUrl": "",
+    "requiresResources": false
   }
 ]
+
 
