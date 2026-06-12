@@ -148,72 +148,68 @@ private suspend fun processStreamUtil(
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit
 ) {
-    when {
-        stream.url != null -> {
-            val fixedName = fixSourceName(stream.name, stream.title, stream.description)
-            val qualityTitle = buildExtractedTitle(extractSpecs(fixedName))
+    // Use if-statements (not when) to process ALL matching types, matching original
+    if (stream.url != null) {
+        val fixedName = fixSourceName(stream.name, stream.title, stream.description)
+        val qualityTitle = buildExtractedTitle(extractSpecs(fixedName))
 
-            // Get headers from proxyHeaders.request first, then fallback to behaviorHints.headers
-            val headers = stream.behaviorHints?.proxyHeaders?.request
-                ?: stream.behaviorHints?.headers
-                ?: emptyMap()
+        // Get headers from proxyHeaders.request first, then fallback to behaviorHints.headers
+        val headers = stream.behaviorHints?.proxyHeaders?.request
+            ?: stream.behaviorHints?.headers
+            ?: emptyMap()
 
-            callback.invoke(
-                newExtractorLink(
-                    source = stream.name ?: "",
-                    name = qualityTitle,
-                    url = stream.url,
-                    type = if (stream.url.endsWith(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                ) {
-                    this.referer = ""
-                    this.quality = getQuality(listOf(stream.description, stream.title, stream.name))
-                    this.headers = headers
-                }
-            )
-        }
-
-        stream.ytId != null -> {
-            loadExtractor("https://www.youtube.com/watch?v=${stream.ytId}", subtitleCallback, callback)
-        }
-
-        stream.externalUrl != null -> {
-            loadExtractor(stream.externalUrl, subtitleCallback, callback)
-        }
-
-        stream.infoHash != null -> {
-            val magnet = generateMagnetLink(stream.infoHash)
-            val displayName = stream.title ?: stream.name ?: ""
-            val extractedTitle = buildExtractedTitle(extractSpecs(displayName))
-            val fullTitle = "$extractedTitle$displayName"
-
-            val sizeInfo = when {
-                fullTitle.contains("\uD83D\uDCBE") && fullTitle.contains("\uD83D\uDC64") -> {
-                    val sizeIdx = fullTitle.indexOf("\uD83D\uDCBE")
-                    val userIdx = fullTitle.indexOf("\uD83D\uDC64")
-                    if (sizeIdx >= userIdx) fullTitle.substringAfter("\uD83D\uDC64")
-                    else fullTitle.substringAfter("\uD83D\uDCBE")
-                }
-                fullTitle.contains("\uD83D\uDCBE") -> fullTitle.substringAfter("\uD83D\uDCBE")
-                fullTitle.contains("\uD83D\uDC64") -> fullTitle.substringAfter("\uD83D\uDC64")
-                fullTitle.contains("Name: ") -> fullTitle.substringBefore("Size")
-                else -> extractedTitle
+        callback.invoke(
+            newExtractorLink(
+                source = stream.name ?: "",
+                name = qualityTitle,
+                url = stream.url,
+                type = null  // null = auto-detect (INFER_TYPE), matching original
+            ) {
+                this.referer = ""
+                this.quality = getQuality(listOf(stream.description, stream.title, stream.name))
+                this.headers = headers
             }
+        )
+    }
 
-            callback.invoke(
-                newExtractorLink(
-                    source = providerName,
-                    name = sizeInfo.ifBlank { extractedTitle },
-                    url = magnet,
-                    type = ExtractorLinkType.MAGNET
-                ) {
-                    this.quality = getQuality(listOf(displayName))
-                }
-            )
+    if (stream.ytId != null) {
+        loadExtractor("https://www.youtube.com/watch?v=${stream.ytId}", subtitleCallback, callback)
+    }
+
+    if (stream.externalUrl != null) {
+        loadExtractor(stream.externalUrl, subtitleCallback, callback)
+    }
+
+    if (stream.infoHash != null) {
+        val magnet = generateMagnetLink(stream.infoHash)
+        val displayName = stream.title ?: stream.name ?: ""
+        val extractedTitle = buildExtractedTitle(extractSpecs(displayName))
+        val fullTitle = "$extractedTitle$displayName"
+
+        val sizeInfo = when {
+            fullTitle.contains("\uD83D\uDCBE") && fullTitle.contains("\uD83D\uDC64") -> {
+                val sizeIdx = fullTitle.indexOf("\uD83D\uDCBE")
+                val userIdx = fullTitle.indexOf("\uD83D\uDC64")
+                if (sizeIdx >= userIdx) fullTitle.substringAfter("\uD83D\uDC64")
+                else fullTitle.substringAfter("\uD83D\uDCBE")
+            }
+            fullTitle.contains("\uD83D\uDCBE") -> fullTitle.substringAfter("\uD83D\uDCBE")
+            fullTitle.contains("\uD83D\uDC64") -> fullTitle.substringAfter("\uD83D\uDC64")
+            fullTitle.contains("Name: ") -> fullTitle.substringBefore("Size")
+            else -> extractedTitle
         }
 
-        else -> {
-            Log.w("StremioUtil", "Stream has no url/ytId/externalUrl/infoHash: ${stream.title}")
-        }
+        callback.invoke(
+            newExtractorLink(
+                source = providerName,
+                name = sizeInfo.ifBlank { extractedTitle },
+                url = magnet,
+                type = ExtractorLinkType.TORRENT  // Original uses TORRENT, not MAGNET
+            ) {
+                this.referer = ""
+                this.quality = getQuality(listOf(stream.description, stream.title, stream.name))
+            }
+        )
     }
 
     // Handle subtitles in streams
@@ -254,62 +250,62 @@ private suspend fun tryManualStreamParseUtil(
                 val streamName = streamNode.get("name")?.asText() ?: ""
                 val streamDesc = streamNode.get("description")?.asText() ?: ""
 
-                when {
-                    url != null -> {
-                        val fixedName = fixSourceName(streamName, streamTitle, streamDesc)
-                        val qualityTitle = buildExtractedTitle(extractSpecs(fixedName))
+                // Use if-statements (not when) to process ALL matching types, matching original
+                if (url != null) {
+                    val fixedName = fixSourceName(streamName, streamTitle, streamDesc)
+                    val qualityTitle = buildExtractedTitle(extractSpecs(fixedName))
 
-                        // Get headers from proxyHeaders or behaviorHints.headers (as Map<String, String>)
-                        val headers = try {
-                            streamNode.get("behaviorHints")
-                                ?.get("proxyHeaders")?.get("request")
-                                ?.fields()?.asSequence()
-                                ?.associate { it.key to it.value.asText() }
-                                ?: streamNode.get("behaviorHints")
-                                    ?.get("headers")
-                                    ?.fields()?.asSequence()
-                                    ?.associate { it.key to it.value.asText() }
-                                ?: emptyMap()
-                        } catch (_: Exception) {
-                            emptyMap()
+                    // Get headers from proxyHeaders or behaviorHints.headers (as Map<String, String>)
+                    val headers = try {
+                        streamNode.get("behaviorHints")
+                            ?.get("proxyHeaders")?.get("request")
+                            ?.fields()?.asSequence()
+                            ?.associate { it.key to it.value.asText() }
+                        ?: streamNode.get("behaviorHints")
+                            ?.get("headers")
+                            ?.fields()?.asSequence()
+                            ?.associate { it.key to it.value.asText() }
+                        ?: emptyMap()
+                    } catch (_: Exception) {
+                        emptyMap()
+                    }
+
+                    callback.invoke(
+                        newExtractorLink(
+                            source = streamName.ifBlank { streamTitle },
+                            name = qualityTitle.ifBlank { streamTitle },
+                            url = url,
+                            type = null  // null = auto-detect, matching original
+                        ) {
+                            this.referer = ""
+                            this.quality = getQuality(listOf(streamDesc, streamTitle, streamName))
+                            this.headers = headers
                         }
-
-                        callback.invoke(
-                            newExtractorLink(
-                                source = streamName.ifBlank { streamTitle },
-                                name = qualityTitle.ifBlank { streamTitle },
-                                url = url,
-                                type = if (url.endsWith(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                            ) {
-                                this.referer = ""
-                                this.quality = getQuality(listOf(streamDesc, streamTitle, streamName))
-                                this.headers = headers
-                            }
-                        )
-                        found = true
-                    }
-                    ytId != null -> {
-                        loadExtractor("https://www.youtube.com/watch?v=$ytId", subtitleCallback, callback)
-                        found = true
-                    }
-                    externalUrl != null -> {
-                        loadExtractor(externalUrl, subtitleCallback, callback)
-                        found = true
-                    }
-                    infoHash != null -> {
-                        val magnet = generateMagnetLink(infoHash)
-                        callback.invoke(
-                            newExtractorLink(
-                                source = providerName,
-                                name = streamTitle.ifBlank { streamName },
-                                url = magnet,
-                                type = ExtractorLinkType.MAGNET
-                            ) {
-                                this.quality = getQualityFromName(streamTitle)
-                            }
-                        )
-                        found = true
-                    }
+                    )
+                    found = true
+                }
+                if (ytId != null) {
+                    loadExtractor("https://www.youtube.com/watch?v=$ytId", subtitleCallback, callback)
+                    found = true
+                }
+                if (externalUrl != null) {
+                    loadExtractor(externalUrl, subtitleCallback, callback)
+                    found = true
+                }
+                if (infoHash != null) {
+                    val magnet = generateMagnetLink(infoHash)
+                    callback.invoke(
+                        newExtractorLink(
+                            source = providerName,
+                            name = streamTitle.ifBlank { streamName },
+                            url = magnet,
+                            type = ExtractorLinkType.TORRENT  // Original uses TORRENT
+                        ) {
+                            this.referer = ""
+                            this.quality = getQualityFromName(streamTitle)
+                        }
+                    )
+                    found = true
                 }
 
                 // Handle subtitles
