@@ -6,7 +6,6 @@ import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -276,8 +275,6 @@ class StremioX(
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         Log.d("StremioX", "=== loadLinks START ===")
-        Log.d("StremioX", "mainUrl=$mainUrl")
-        Log.d("StremioX", "raw data=$data")
 
         val linkData = try {
             mapper.readValue(data, LinkData::class.java)
@@ -286,7 +283,7 @@ class StremioX(
             return false
         }
 
-        Log.d("StremioX", "Parsed LinkData: imdbId=${linkData.imdbId}, id=${linkData.id}, season=${linkData.season}, episode=${linkData.episode}")
+        Log.d("StremioX", "LinkData: imdbId=${linkData.imdbId}, season=${linkData.season}, episode=${linkData.episode}")
 
         // Set subtitle auto-select language
         try {

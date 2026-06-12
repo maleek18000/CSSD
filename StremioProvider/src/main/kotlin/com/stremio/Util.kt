@@ -16,7 +16,6 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import java.net.URI
 import java.net.URLEncoder
 import java.util.Locale
 
@@ -76,6 +75,11 @@ suspend fun generateMagnetLink(infoHash: String): String {
     return magnet.toString()
 }
 
+/**
+ * Fetch streams from a Stremio addon and create extractor links.
+ * Used by StremioX for its primary and fallback sources.
+ * Uses Jackson tree model for robust parsing (never fails on unknown JSON fields).
+ */
 suspend fun invokeMainSource(
     baseUrl: String,
     providerName: String,
@@ -92,12 +96,9 @@ suspend fun invokeMainSource(
 
     val fixedUrl = fixSourceUrl(baseUrl)
 
-    // Construct stream URL - matching original: $baseUrl/stream/$type/$id.json
-    // For series with season/episode, the ID should be: imdbId:season:episode
-    val streamUrl = if (season != null && episode != null) {
-        "$fixedUrl/stream/series/$imdbId:$season:$episode.json"
-    } else if (season != null) {
-        "$fixedUrl/stream/series/$imdbId:$season:1.json"
+    // Use correct path: /stream/series/ for series, /stream/movie/ for movies
+    val streamUrl = if (season != null) {
+        "$fixedUrl/stream/series/$imdbId:$season:${episode ?: 1}.json"
     } else {
         "$fixedUrl/stream/movie/$imdbId.json"
     }
@@ -105,193 +106,70 @@ suspend fun invokeMainSource(
     Log.d("StremioUtil", "invokeMainSource URL: $streamUrl")
 
     try {
-        val response = app.get(streamUrl, timeout = 15)
-        Log.d("StremioUtil", "Response: code=${response.code}, length=${response.text.length}")
-
+        val response = app.get(streamUrl, timeout = 30)
         if (!response.isSuccessful || response.text.isEmpty()) return
 
-        // Try standard parsing first
-        val streamsResponse = tryParseJson<StreamsResponse>(response.text)
-        val streams = streamsResponse?.streams
-
-        if (!streams.isNullOrEmpty()) {
-            Log.d("StremioUtil", "Found ${streams.size} streams via tryParseJson")
-            for (stream in streams) {
-                try {
-                    processStreamUtil(stream, providerName, subtitleCallback, callback)
-                } catch (e: Exception) {
-                    Log.e("StremioUtil", "Error processing stream: ${e.message}")
-                }
-            }
-            return
-        }
-
-        // tryParseJson failed or returned empty - try manual JSON parsing
-        Log.d("StremioUtil", "tryParseJson returned no streams, trying manual parse")
-        val found = tryManualStreamParseUtil(response.text, providerName, subtitleCallback, callback)
-        if (found) {
-            Log.d("StremioUtil", "Found streams via manual parse")
-        }
-
+        // Use tree model for robust parsing
+        parseStreamsFromJsonUtil(response.text, providerName, subtitleCallback, callback)
     } catch (e: Exception) {
-        Log.e("StremioUtil", "URL failed: $streamUrl - ${e.message}")
+        Log.e("StremioUtil", "invokeMainSource failed: $streamUrl - ${e.message}")
     }
 }
 
 /**
- * Process a single Stream object into extractor links.
- * Matches the original working implementation's logic.
+ * Parse streams from JSON using Jackson tree model.
+ * NEVER fails on unknown fields like cacheMaxAge, fileIdx, bingeGroup, etc.
  */
-private suspend fun processStreamUtil(
-    stream: Stream,
+private suspend fun parseStreamsFromJsonUtil(
+    jsonText: String,
     providerName: String,
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit
 ) {
-    // Use if-statements (not when) to process ALL matching types, matching original
-    if (stream.url != null) {
-        val fixedName = fixSourceName(stream.name, stream.title, stream.description)
-        val qualityTitle = buildExtractedTitle(extractSpecs(fixedName))
-
-        // Get headers from proxyHeaders.request first, then fallback to behaviorHints.headers
-        val headers = stream.behaviorHints?.proxyHeaders?.request
-            ?: stream.behaviorHints?.headers
-            ?: emptyMap()
-
-        callback.invoke(
-            newExtractorLink(
-                source = stream.name ?: "",
-                name = qualityTitle,
-                url = stream.url,
-                type = null  // null = auto-detect (INFER_TYPE), matching original
-            ) {
-                this.referer = ""
-                this.quality = getQuality(listOf(stream.description, stream.title, stream.name))
-                this.headers = headers
-            }
-        )
-    }
-
-    if (stream.ytId != null) {
-        loadExtractor("https://www.youtube.com/watch?v=${stream.ytId}", subtitleCallback, callback)
-    }
-
-    if (stream.externalUrl != null) {
-        loadExtractor(stream.externalUrl, subtitleCallback, callback)
-    }
-
-    if (stream.infoHash != null) {
-        val magnet = generateMagnetLink(stream.infoHash)
-        val displayName = stream.title ?: stream.name ?: ""
-        val extractedTitle = buildExtractedTitle(extractSpecs(displayName))
-        val fullTitle = "$extractedTitle$displayName"
-
-        val sizeInfo = when {
-            fullTitle.contains("\uD83D\uDCBE") && fullTitle.contains("\uD83D\uDC64") -> {
-                val sizeIdx = fullTitle.indexOf("\uD83D\uDCBE")
-                val userIdx = fullTitle.indexOf("\uD83D\uDC64")
-                if (sizeIdx >= userIdx) fullTitle.substringAfter("\uD83D\uDC64")
-                else fullTitle.substringAfter("\uD83D\uDCBE")
-            }
-            fullTitle.contains("\uD83D\uDCBE") -> fullTitle.substringAfter("\uD83D\uDCBE")
-            fullTitle.contains("\uD83D\uDC64") -> fullTitle.substringAfter("\uD83D\uDC64")
-            fullTitle.contains("Name: ") -> fullTitle.substringBefore("Size")
-            else -> extractedTitle
-        }
-
-        callback.invoke(
-            newExtractorLink(
-                source = providerName,
-                name = sizeInfo.ifBlank { extractedTitle },
-                url = magnet,
-                type = ExtractorLinkType.TORRENT  // Original uses TORRENT, not MAGNET
-            ) {
-                this.referer = ""
-                this.quality = getQuality(listOf(stream.description, stream.title, stream.name))
-            }
-        )
-    }
-
-    // Handle subtitles in streams
-    stream.subtitles?.forEach { sub ->
-        if (sub.url != null && sub.lang != null) {
-            try {
-                subtitleCallback.invoke(SubtitleFile(sub.lang, sub.url))
-            } catch (e: Exception) {
-                Log.e("StremioUtil", "SubtitleFile failed: ${e.message}")
-            }
-        }
-    }
-}
-
-/**
- * Manual JSON parsing fallback - uses Jackson's JsonNode tree model
- * which is much more forgiving than data class binding.
- */
-private suspend fun tryManualStreamParseUtil(
-    responseText: String,
-    providerName: String,
-    subtitleCallback: (SubtitleFile) -> Unit,
-    callback: (ExtractorLink) -> Unit
-): Boolean {
     try {
-        val jsonObj = utilMapper.readTree(responseText)
-        val streamsNode = jsonObj?.get("streams") ?: return false
-        if (!streamsNode.isArray || streamsNode.size() == 0) return false
+        val rootNode = utilMapper.readTree(jsonText)
+        val streamsNode = rootNode?.get("streams") ?: return
+        if (!streamsNode.isArray || streamsNode.size() == 0) return
 
-        var found = false
         for (streamNode in streamsNode) {
             try {
                 val url = streamNode.get("url")?.asText()
                 val ytId = streamNode.get("ytId")?.asText()
                 val externalUrl = streamNode.get("externalUrl")?.asText()
                 val infoHash = streamNode.get("infoHash")?.asText()
-                val streamTitle = streamNode.get("title")?.asText() ?: streamNode.get("name")?.asText() ?: ""
                 val streamName = streamNode.get("name")?.asText() ?: ""
+                val streamTitle = streamNode.get("title")?.asText() ?: ""
                 val streamDesc = streamNode.get("description")?.asText() ?: ""
 
-                // Use if-statements (not when) to process ALL matching types, matching original
+                // Process URL streams
                 if (url != null) {
                     val fixedName = fixSourceName(streamName, streamTitle, streamDesc)
                     val qualityTitle = buildExtractedTitle(extractSpecs(fixedName))
 
-                    // Get headers from proxyHeaders or behaviorHints.headers (as Map<String, String>)
-                    val headers = try {
-                        streamNode.get("behaviorHints")
-                            ?.get("proxyHeaders")?.get("request")
-                            ?.fields()?.asSequence()
-                            ?.associate { it.key to it.value.asText() }
-                        ?: streamNode.get("behaviorHints")
-                            ?.get("headers")
-                            ?.fields()?.asSequence()
-                            ?.associate { it.key to it.value.asText() }
-                        ?: emptyMap()
-                    } catch (_: Exception) {
-                        emptyMap()
-                    }
+                    val headers = extractHeadersFromNodeUtil(streamNode)
 
                     callback.invoke(
                         newExtractorLink(
                             source = streamName.ifBlank { streamTitle },
                             name = qualityTitle.ifBlank { streamTitle },
                             url = url,
-                            type = null  // null = auto-detect, matching original
+                            type = null
                         ) {
                             this.referer = ""
                             this.quality = getQuality(listOf(streamDesc, streamTitle, streamName))
                             this.headers = headers
                         }
                     )
-                    found = true
                 }
+
                 if (ytId != null) {
                     loadExtractor("https://www.youtube.com/watch?v=$ytId", subtitleCallback, callback)
-                    found = true
                 }
+
                 if (externalUrl != null) {
                     loadExtractor(externalUrl, subtitleCallback, callback)
-                    found = true
                 }
+
                 if (infoHash != null) {
                     val magnet = generateMagnetLink(infoHash)
                     callback.invoke(
@@ -299,16 +177,15 @@ private suspend fun tryManualStreamParseUtil(
                             source = providerName,
                             name = streamTitle.ifBlank { streamName },
                             url = magnet,
-                            type = ExtractorLinkType.TORRENT  // Original uses TORRENT
+                            type = ExtractorLinkType.TORRENT
                         ) {
                             this.referer = ""
                             this.quality = getQualityFromName(streamTitle)
                         }
                     )
-                    found = true
                 }
 
-                // Handle subtitles
+                // Process subtitles
                 val subtitlesNode = streamNode.get("subtitles")
                 if (subtitlesNode != null && subtitlesNode.isArray) {
                     for (subNode in subtitlesNode) {
@@ -322,14 +199,53 @@ private suspend fun tryManualStreamParseUtil(
                     }
                 }
             } catch (e: Exception) {
-                Log.e("StremioUtil", "Manual parse failed for one stream: ${e.message}")
+                Log.e("StremioUtil", "Failed to process one stream: ${e.message}")
             }
         }
-        return found
     } catch (e: Exception) {
-        Log.e("StremioUtil", "Manual JSON parse completely failed: ${e.message}")
-        return false
+        Log.e("StremioUtil", "Failed to parse streams JSON: ${e.message}")
     }
+}
+
+/**
+ * Extract headers from behaviorHints in a stream JsonNode.
+ * Handles both string and array values for headers.
+ */
+private fun extractHeadersFromNodeUtil(streamNode: com.fasterxml.jackson.databind.JsonNode): Map<String, String> {
+    try {
+        val bh = streamNode.get("behaviorHints") ?: return emptyMap()
+
+        // Try proxyHeaders.request first
+        val proxyReq = bh.get("proxyHeaders")?.get("request")
+        if (proxyReq != null && proxyReq.isObject) {
+            val headers = mutableMapOf<String, String>()
+            proxyReq.fields().forEach { entry ->
+                val value = entry.value
+                headers[entry.key] = if (value.isArray) {
+                    value.firstOrNull()?.asText() ?: ""
+                } else {
+                    value.asText()
+                }
+            }
+            return headers
+        }
+
+        // Fallback to behaviorHints.headers
+        val headersNode = bh.get("headers")
+        if (headersNode != null && headersNode.isObject) {
+            val headers = mutableMapOf<String, String>()
+            headersNode.fields().forEach { entry ->
+                val value = entry.value
+                headers[entry.key] = if (value.isArray) {
+                    value.firstOrNull()?.asText() ?: ""
+                } else {
+                    value.asText()
+                }
+            }
+            return headers
+        }
+    } catch (_: Exception) {}
+    return emptyMap()
 }
 
 fun extractSpecs(title: String): Map<String, List<String>> {
@@ -492,42 +408,6 @@ fun createSlug(input: String?): String? {
     return Regex("\\s+").replace(trimmed, "-")
 }
 
-// Data classes used by invokeMainSource
-data class Stream(
-    val name: String? = null,
-    val title: String? = null,
-    val url: String? = null,
-    val description: String? = null,
-    val ytId: String? = null,
-    val externalUrl: String? = null,
-    val behaviorHints: BehaviorHints? = null,
-    val infoHash: String? = null,
-    val sources: List<String> = emptyList(),
-    val subtitles: List<Subtitle>? = emptyList()
-)
-
-data class StreamsResponse(
-    val streams: List<Stream>? = null
-)
-
-data class BehaviorHints(
-    val proxyHeaders: ProxyHeaders? = null,
-    val headers: Map<String, String>? = null
-)
-
-data class ProxyHeaders(
-    val request: Map<String, String>? = null
-)
-
-data class Subtitle(
-    val url: String? = null,
-    val lang: String? = null,
-    val id: String? = null
-)
-
-/**
- * Fix title by removing common Stremio prefixes/suffixes
- */
 fun fixTitle(title: String): String {
     return title
         .replace(Regex("^\\[.*?]\\s*"), "")
