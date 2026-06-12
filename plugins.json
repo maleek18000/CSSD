@@ -909,16 +909,24 @@
     "name": "StremioProvider"
   },
   {
-    "name": "Xtream IPTV",
-    "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/XtreamIPTV.cs3",
-    "tvTypes": ["Live", "Movie", "TvSeries"],
+    "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/thumb/4/4e/IPTV_logo.svg/512px-IPTV_logo.svg.png",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/maleek18000/CSSD",
+    "fileSize": 25000,
+    "status": 1,
     "language": "en",
-    "authors": ["XtreamIPTV"],
-    "description": "Watch Live TV, Movies & Series from your Xtream Codes IPTV provider directly in CloudStream. Supports Live channels (HLS/MPEG-TS), VOD movies, and full series with episodes.",
+    "authors": [
+      "maleek18000"
+    ],
+    "tvTypes": [
+      "Live",
+      "Movie",
+      "TvSeries"
+    ],
     "version": 1,
-    "iconUrl": "",
-    "requiresResources": false
+    "internalName": "XtreamIPTV",
+    "description": "Watch Live TV, Movies & Series from your Xtream Codes IPTV provider. Go to Settings → Clone site → Xtream IPTV → enter http://server:port/username/password",
+    "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/XtreamIPTV.cs3",
+    "name": "Xtream IPTV"
   }
 ]
-
-
