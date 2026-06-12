@@ -126,15 +126,29 @@ class StremioC(
     ): Boolean {
         Log.d("StremioC", "=== loadLinks START ===")
 
-        // Ensure mainUrl is clean (remove /manifest.json, fix stremio:// protocol)
-        // This should already be the ADDON URL since load() no longer overrides it to cinemeta
+        // Ensure mainUrl is clean
         mainUrl = fixSourceUrl(mainUrl)
 
-        // Parse LoadData
-        val loadData = try {
-            mapper.readValue(data, LoadData::class.java)
-        } catch (e: Exception) {
-            Log.e("StremioC", "Failed to parse LoadData: ${e.message}")
+        // Parse LoadData — try data class first, fall back to tree model
+        val loadData = tryParseJson<LoadData>(data)
+            ?: try {
+                // Tree model fallback: parse just the fields we need
+                val node = mapper.readTree(data)
+                LoadData(
+                    type = node?.get("type")?.asText(),
+                    id = node?.get("id")?.asText(),
+                    season = node?.get("season")?.asInt(),
+                    episode = node?.get("episode")?.asInt(),
+                    title = node?.get("title")?.asText(),
+                    imdbId = node?.get("imdbId")?.asText()
+                )
+            } catch (e: Exception) {
+                Log.e("StremioC", "Failed to parse LoadData: ${e.message}")
+                null
+            }
+
+        if (loadData == null) {
+            Log.e("StremioC", "Failed to parse LoadData from: ${data.take(200)}")
             return false
         }
 
@@ -150,210 +164,63 @@ class StremioC(
             }
         } catch (_: Exception) {}
 
-        // Construct stream URL — EXACTLY matching original
-        // Original uses: $mainUrl/stream/${type}/${id}.json
-        // where id comes from Video.id (already contains :season:episode for series)
+        // Extract clean IMDB ID (strip :season:episode suffix from loadData.id)
+        val cleanImdbId = loadData.imdbId
+            ?: loadData.id?.substringBefore(":")?.takeIf { it.startsWith("tt") }
+
+        // Construct the IPTV stream URL from the addon
         val streamType = loadData.type ?: "movie"
         val streamId = loadData.id ?: ""
         val streamUrl = "$mainUrl/stream/$streamType/$streamId.json"
+        Log.d("StremioC", "IPTV stream URL: $streamUrl")
 
-        Log.d("StremioC", "Stream URL: $streamUrl")
+        // === Fetch IPTV streams using tree model (most robust, never fails on unknown fields) ===
+        var linksFound = false
 
-        var linksFound = 0
-
-        // Fetch streams — use tryParseJson<StreamsResponse> like the original
         try {
-            val response = app.get(streamUrl, timeout = 15)
+            val response = app.get(streamUrl, timeout = 30)
             Log.d("StremioC", "Response: code=${response.code}, length=${response.text.length}")
 
             if (response.isSuccessful && response.text.isNotEmpty()) {
-                val streamsResponse = tryParseJson<StreamsResponse>(response.text)
-                val streams = streamsResponse?.streams
-
-                if (streams != null) {
-                    Log.d("StremioC", "Found ${streams.size} streams")
-                    for (stream in streams) {
-                        try {
-                            processStream(stream, subtitleCallback, callback)
-                            linksFound++
-                        } catch (e: Exception) {
-                            Log.e("StremioC", "Failed to process stream: ${e.message}")
-                        }
-                    }
-                } else {
-                    Log.w("StremioC", "No streams array in response")
-                    // Fallback to tree model if tryParseJson fails (unknown fields issue)
-                    val treeCount = parseStreamsFromTree(response.text, subtitleCallback, callback)
-                    linksFound += treeCount
-                    Log.d("StremioC", "Tree model fallback found $treeCount links")
-                }
+                val count = parseStreamsFromTree(response.text, subtitleCallback, callback)
+                if (count > 0) linksFound = true
+                Log.d("StremioC", "Parsed $count IPTV streams")
             } else {
-                Log.w("StremioC", "Stream URL failed: HTTP ${response.code}")
+                Log.w("StremioC", "Stream URL returned HTTP ${response.code}")
             }
         } catch (e: Exception) {
-            Log.e("StremioC", "Stream fetch exception: ${e.message}")
+            Log.e("StremioC", "IPTV stream fetch failed: ${e.message}")
         }
 
-        // Torrentio fallback
-        val imdbForFallback = loadData.imdbId ?: if (streamId.startsWith("tt")) streamId else null
-        if (imdbForFallback != null) {
+        // Also try Torrentio as extra source (parallel, non-blocking)
+        if (cleanImdbId != null) {
             try {
-                val fallbackUrl = if (loadData.season != null) {
-                    "https://torrentio.strem.fun/stream/series/$imdbForFallback:${loadData.season}:${loadData.episode ?: 1}.json"
-                } else {
-                    "https://torrentio.strem.fun/stream/movie/$imdbForFallback.json"
-                }
-                Log.d("StremioC", "Torrentio URL: $fallbackUrl")
-                val fallbackResponse = app.get(fallbackUrl, timeout = 10)
-                if (fallbackResponse.isSuccessful && fallbackResponse.text.isNotEmpty()) {
-                    val fallbackStreams = tryParseJson<StreamsResponse>(fallbackResponse.text)?.streams
-                    if (fallbackStreams != null) {
-                        for (stream in fallbackStreams) {
-                            try {
-                                processStream(stream, subtitleCallback, callback)
-                                linksFound++
-                            } catch (_: Exception) {}
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e("StremioC", "Torrentio fallback failed: ${e.message}")
-            }
+                invokeMainSource(
+                    "https://torrentio.strem.fun",
+                    name,
+                    cleanImdbId,
+                    loadData.season,
+                    loadData.episode,
+                    subtitleCallback,
+                    callback
+                )
+                linksFound = true
+            } catch (_: Exception) {}
         }
 
-        // Subtitles
+        // Load subtitles
         try {
-            loadSubtitles(loadData.imdbId, loadData.season, loadData.episode, loadData.title, subtitleCallback)
-        } catch (e: Exception) {
-            Log.e("StremioC", "Subtitle loading failed: ${e.message}")
-        }
+            loadSubtitles(cleanImdbId, loadData.season, loadData.episode, loadData.title, subtitleCallback)
+        } catch (_: Exception) {}
 
         Log.d("StremioC", "=== loadLinks END: linksFound=$linksFound ===")
-        return linksFound > 0
+        return linksFound
     }
 
     /**
-     * Process a single Stream object — matches original logic.
-     * Handles url, ytId, externalUrl, infoHash, and embedded subtitles.
-     */
-    private suspend fun processStream(
-        stream: Stream,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        val url = stream.url
-        val ytId = stream.ytId
-        val externalUrl = stream.externalUrl
-        val infoHash = stream.infoHash
-        val streamName = stream.name ?: ""
-        val streamTitle = stream.title ?: ""
-        val streamDesc = stream.description ?: ""
-
-        // Process URL streams
-        if (url != null) {
-            val fixedName = fixSourceName(streamName, streamTitle, streamDesc)
-            val qualityTitle = buildExtractedTitle(extractSpecs(fixedName))
-
-            // Extract headers from behaviorHints
-            val headers = extractHeadersFromStream(stream)
-
-            callback.invoke(
-                newExtractorLink(
-                    source = streamName.ifBlank { qualityTitle },
-                    name = qualityTitle.ifBlank { streamTitle },
-                    url = url,
-                    type = null  // auto-detect
-                ) {
-                    this.referer = ""
-                    this.quality = getQuality(listOf(streamDesc, streamTitle, streamName))
-                    this.headers = headers
-                }
-            )
-        }
-
-        // Process YouTube streams
-        if (ytId != null) {
-            loadExtractor("https://www.youtube.com/watch?v=$ytId", subtitleCallback, callback)
-        }
-
-        // Process external URL streams
-        if (externalUrl != null) {
-            loadExtractor(externalUrl, subtitleCallback, callback)
-        }
-
-        // Process torrent/infoHash streams
-        if (infoHash != null) {
-            val magnet = generateMagnetLink(infoHash)
-            val displayName = streamTitle.ifBlank { streamName }
-            val extractedTitle = buildExtractedTitle(extractSpecs(displayName))
-            val fullTitle = "$extractedTitle$displayName"
-
-            val sizeInfo = when {
-                fullTitle.contains("\uD83D\uDCBE") && fullTitle.contains("\uD83D\uDC64") -> {
-                    val sizeIdx = fullTitle.indexOf("\uD83D\uDCBE")
-                    val userIdx = fullTitle.indexOf("\uD83D\uDC64")
-                    if (sizeIdx >= userIdx) fullTitle.substringAfter("\uD83D\uDC64")
-                    else fullTitle.substringAfter("\uD83D\uDCBE")
-                }
-                fullTitle.contains("\uD83D\uDCBE") -> fullTitle.substringAfter("\uD83D\uDCBE")
-                fullTitle.contains("\uD83D\uDC64") -> fullTitle.substringAfter("\uD83D\uDC64")
-                fullTitle.contains("Name: ") -> fullTitle.substringBefore("Size")
-                else -> extractedTitle
-            }
-
-            callback.invoke(
-                newExtractorLink(
-                    source = name,
-                    name = sizeInfo.ifBlank { extractedTitle },
-                    url = magnet,
-                    type = ExtractorLinkType.TORRENT
-                ) {
-                    this.referer = ""
-                    this.quality = getQuality(listOf(streamDesc, streamTitle, streamName))
-                }
-            )
-        }
-
-        // Process embedded subtitles
-        val subtitles = stream.subtitles
-        if (subtitles != null) {
-            for (sub in subtitles) {
-                if (sub.url != null && sub.lang != null) {
-                    try {
-                        subtitleCallback.invoke(SubtitleFile(sub.lang, sub.url))
-                    } catch (_: Exception) {}
-                }
-            }
-        }
-    }
-
-    /**
-     * Extract headers from Stream.behaviorHints — matches original.
-     */
-    private fun extractHeadersFromStream(stream: Stream): Map<String, String> {
-        val bh = stream.behaviorHints ?: return emptyMap()
-        try {
-            // Try proxyHeaders.request first
-            val proxyReq = bh.proxyHeaders?.request
-            if (proxyReq != null && proxyReq.isNotEmpty()) {
-                return proxyReq.mapValues { (_, v) ->
-                    if (v is List<*>) v.firstOrNull()?.toString() ?: "" else v.toString()
-                }
-            }
-            // Fallback to behaviorHints.headers
-            val headers = bh.headers
-            if (headers != null && headers.isNotEmpty()) {
-                return headers.mapValues { (_, v) ->
-                    if (v is List<*>) v.firstOrNull()?.toString() ?: "" else v.toString()
-                }
-            }
-        } catch (_: Exception) {}
-        return emptyMap()
-    }
-
-    /**
-     * Fallback: Parse streams using Jackson tree model.
-     * Used when tryParseJson<StreamsResponse> fails (e.g., unknown JSON fields).
+     * Parse IPTV streams from JSON using Jackson tree model.
+     * This is the PRIMARY parsing method — it never fails on unknown JSON fields.
+     * Direct stream URLs (IPTV), YouTube, external URLs, and subtitles are all handled.
      */
     private suspend fun parseStreamsFromTree(
         jsonText: String,
@@ -363,30 +230,38 @@ class StremioC(
         var count = 0
         try {
             val rootNode = mapper.readTree(jsonText)
-            val streamsNode = rootNode?.get("streams") ?: return 0
-            if (!streamsNode.isArray) return 0
+            val streamsNode = rootNode?.get("streams")
+            if (streamsNode == null || !streamsNode.isArray) {
+                Log.w("StremioC", "No 'streams' array in JSON response. Keys: ${rootNode?.fieldNames()?.asSequence()?.take(10)?.joinToString()}")
+                return 0
+            }
+
+            val totalStreams = streamsNode.size()
+            Log.d("StremioC", "Parsing $totalStreams streams from response")
 
             for (streamNode in streamsNode) {
                 try {
                     val url = streamNode.get("url")?.asText()
                     val ytId = streamNode.get("ytId")?.asText()
                     val externalUrl = streamNode.get("externalUrl")?.asText()
-                    val infoHash = streamNode.get("infoHash")?.asText()
                     val streamName = streamNode.get("name")?.asText() ?: ""
                     val streamTitle = streamNode.get("title")?.asText() ?: ""
                     val streamDesc = streamNode.get("description")?.asText() ?: ""
 
+                    // IPTV direct URL — this is the main stream type
                     if (url != null) {
                         val fixedName = fixSourceName(streamName, streamTitle, streamDesc)
                         val qualityTitle = buildExtractedTitle(extractSpecs(fixedName))
                         val headers = extractHeadersFromNode(streamNode)
+
+                        Log.d("StremioC", "Found IPTV URL: name=$streamName, title=$streamTitle, url=${url.take(80)}...")
 
                         callback.invoke(
                             newExtractorLink(
                                 source = streamName.ifBlank { qualityTitle },
                                 name = qualityTitle.ifBlank { streamTitle },
                                 url = url,
-                                type = null
+                                type = null  // auto-detect M3U8 vs VIDEO
                             ) {
                                 this.referer = ""
                                 this.quality = getQuality(listOf(streamDesc, streamTitle, streamName))
@@ -396,35 +271,19 @@ class StremioC(
                         count++
                     }
 
+                    // YouTube stream
                     if (ytId != null) {
                         loadExtractor("https://www.youtube.com/watch?v=$ytId", subtitleCallback, callback)
                         count++
                     }
 
+                    // External URL (e.g. web player)
                     if (externalUrl != null) {
                         loadExtractor(externalUrl, subtitleCallback, callback)
                         count++
                     }
 
-                    if (infoHash != null) {
-                        val magnet = generateMagnetLink(infoHash)
-                        val displayName = streamTitle.ifBlank { streamName }
-                        val extractedTitle = buildExtractedTitle(extractSpecs(displayName))
-
-                        callback.invoke(
-                            newExtractorLink(
-                                source = name,
-                                name = extractedTitle.ifBlank { displayName },
-                                url = magnet,
-                                type = ExtractorLinkType.TORRENT
-                            ) {
-                                this.referer = ""
-                                this.quality = getQuality(listOf(streamDesc, streamTitle, streamName))
-                            }
-                        )
-                        count++
-                    }
-
+                    // Embedded subtitles
                     val subtitlesNode = streamNode.get("subtitles")
                     if (subtitlesNode != null && subtitlesNode.isArray) {
                         for (subNode in subtitlesNode) {
