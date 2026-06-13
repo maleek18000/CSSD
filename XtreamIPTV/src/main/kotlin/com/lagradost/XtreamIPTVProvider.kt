@@ -68,8 +68,6 @@ data class XEpInfo(val plot: String? = null, val image: String? = null)
 data class ItemRef(val t: String, val id: Int, val n: String, val e: String? = null)
 data class LinkData(val t: String, val id: Int, val e: String? = null)
 
-// Series categories use recommendations — clicking a series goes through load()
-
 // ═══════════════════════════════════════════════════════════════════
 //  RAW HTTP CLIENT  (bypasses CloudStream's app.get to avoid 403)
 // ═══════════════════════════════════════════════════════════════════
@@ -858,30 +856,31 @@ class XtreamIPTVProvider : MainAPI() {
                     plot = "${catEntries.size} movies in this category"
                 }
             }
-            // ── Category browser: Series category card clicked ──
-            // Uses RECOMMENDATIONS instead of fake episodes.
-            // Each series appears as a clickable card in the recommendations section.
-            // Clicking a series card calls load() with type "series", which already
-            // works correctly — shows proper seasons & episodes with playable links.
-            // This avoids the cachedM3U lookup in loadLinks() that caused "no links found".
+            // ── Category browser: Series category card clicked (fallback) ──
+            // NOTE: M3U mode now shows each category as its own home page row
+            // with series cards directly. This handler remains for Xtream API
+            // category cards and any cached/old URLs.
+            // Each series is shown as an episode. When clicked, loadLinks()
+            // returns all episodes of that series as separate links.
             "series_cat" -> {
                 val allEntries = cachedM3U ?: return null
                 val catEntries = allEntries.filter { it.group == ref.group && it.type == "series" }
                 if (catEntries.isEmpty()) return null
 
                 val uniqueSeries = catEntries.groupBy { it.seriesName.ifBlank { extractSeriesName(it.name) } }
-                val recs = uniqueSeries.entries.map { (seriesName, episodes) ->
-                    val first = episodes.first()
-                    val seriesRef = EntryRef(first.streamUrl, "series", seriesName, first.group, first.logo, seriesName)
-                    newTvSeriesSearchResponse(seriesName, seriesRef.toJson(), TvType.TvSeries) {
-                        posterUrl = first.logo
+                val episodes = uniqueSeries.entries.mapIndexed { idx, (seriesName, sEpisodes) ->
+                    // Use "series_browse" type so loadLinks knows to expand
+                    // all episodes of this series instead of playing one stream
+                    val epRef = EntryRef("", "series_browse", seriesName, ref.group, null, seriesName)
+                    newEpisode(epRef.toJson()) {
+                        name = seriesName
+                        season = 1
+                        episode = idx + 1
+                        posterUrl = sEpisodes.first().logo
                     }
                 }
-
-                newMovieLoadResponse(ref.group, ref.toJson(), TvType.Movie, ref.toJson()) {
-                    plot = "${uniqueSeries.size} series in this category — scroll down to browse"
-                    posterUrl = uniqueSeries.values.firstOrNull()?.firstOrNull()?.logo
-                    recommendations = recs
+                newTvSeriesLoadResponse(ref.group, ref.toJson(), TvType.TvSeries, episodes) {
+                    plot = "${uniqueSeries.size} series in this category"
                 }
             }
             // ── Category browser: Live TV category card clicked ──
@@ -926,9 +925,6 @@ class XtreamIPTVProvider : MainAPI() {
                 }
             }
             // ── Xtream API: Series category card clicked ──
-            // Uses RECOMMENDATIONS instead of fake episodes.
-            // Each series appears as a clickable card. Clicking calls load() with
-            // type "s", which fetches full series info + episodes via API.
             "xtream_series_cat" -> {
                 val c = cfg() ?: return null
                 val encUser = URLEncoder.encode(c.user, "UTF-8")
@@ -938,15 +934,17 @@ class XtreamIPTVProvider : MainAPI() {
                 val series = tryParseJson<List<XSeries>>(seriesText) ?: return null
                 if (series.isEmpty()) return null
 
-                val recs = series.map { s ->
-                    newTvSeriesSearchResponse(s.name, ItemRef("s", s.series_id, s.name).toJson(), TvType.TvSeries) {
+                // Each series as a clickable entry — clicking opens show detail
+                val episodes = series.mapIndexed { idx, s ->
+                    newEpisode(ItemRef("s", s.series_id, s.name).toJson()) {
+                        name = s.name
+                        season = 1
+                        episode = idx + 1
                         posterUrl = s.cover
                     }
                 }
-
-                newMovieLoadResponse(ref.name, ref.toJson(), TvType.Movie, ref.toJson()) {
-                    plot = "${series.size} series — scroll down to browse"
-                    recommendations = recs
+                newTvSeriesLoadResponse(ref.name, ref.toJson(), TvType.TvSeries, episodes) {
+                    plot = "${series.size} series"
                 }
             }
             // ── Xtream API: Live TV category card clicked ──
@@ -1093,6 +1091,54 @@ class XtreamIPTVProvider : MainAPI() {
     private suspend fun loadM3ULinks(ref: EntryRef, callback: (ExtractorLink) -> Unit): Boolean {
         val streamHeaders = mapOf("User-Agent" to "okhttp/4.12.0")
 
+        // ── Series browse: clicked a series from category page ──
+        // Return all episodes of this series as separate links
+        if (ref.type == "series_browse") {
+            val allEntries = cachedM3U ?: return false
+            val seriesName = ref.seriesName.ifBlank { extractSeriesName(ref.name) }
+            val episodes = allEntries.filter {
+                (it.seriesName.ifBlank { extractSeriesName(it.name) }) == seriesName && it.type == "series"
+            }
+            if (episodes.isEmpty()) return false
+
+            episodes.forEach { entry ->
+                val url = entry.streamUrl
+                val lower = url.lowercase()
+                val (sNum, eNum) = parseSeasonEpisode(entry.name)
+                val epLabel = "S${sNum}E${eNum} - ${entry.name}"
+
+                if (lower.endsWith(".m3u8")) {
+                    callback(
+                        newExtractorLink(name, epLabel, url) {
+                            quality = guessQuality(entry.name)
+                            type = ExtractorLinkType.M3U8
+                            headers = streamHeaders
+                        }
+                    )
+                } else {
+                    callback(
+                        newExtractorLink(name, epLabel, url) {
+                            quality = guessQuality(entry.name)
+                            type = ExtractorLinkType.VIDEO
+                            headers = streamHeaders
+                        }
+                    )
+                    // Also try .m3u8 variant for /series/ paths
+                    if (lower.contains("/series/")) {
+                        val base = url.substringBeforeLast(".")
+                        callback(
+                            newExtractorLink(name, "$epLabel (HLS)", "$base.m3u8") {
+                                quality = guessQuality(entry.name)
+                                type = ExtractorLinkType.M3U8
+                                headers = streamHeaders
+                            }
+                        )
+                    }
+                }
+            }
+            return true
+        }
+
         val url = ref.url
         if (url.isEmpty()) return false
 
@@ -1196,29 +1242,6 @@ class XtreamIPTVProvider : MainAPI() {
                         headers = streamHeaders
                     }
                 )
-            }
-            // Series from Xtream category page — fetch all episodes via API
-            "s" -> {
-                val apiBase = "${c.server}/player_api.php?username=${c.user}&password=${c.pass}"
-                val infoText = RawHttp.get("$apiBase&action=get_series_info&series_id=${ld.id}", 15000)
-                val info = tryParseJson<XSeriesInfo>(infoText ?: "")
-                val epMap = info?.episodes
-                if (epMap.isNullOrEmpty()) return false
-
-                epMap.toSortedMap(compareBy { it.toIntOrNull() ?: 0 }).forEach { (_, eps) ->
-                    eps.sortedBy { it.episode_num }.forEach { ep ->
-                        val ext = ep.container_extension ?: "mp4"
-                        val isHls = ext == "m3u8"
-                        val label = "S${ep.season_num}E${ep.episode_num}"
-                        callback(
-                            newExtractorLink(name, label, "${c.server}/series/${c.user}/${c.pass}/${ep.id}.$ext") {
-                                quality = Qualities.Unknown.value
-                                type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                                headers = streamHeaders
-                            }
-                        )
-                    }
-                }
             }
         }
         return true
