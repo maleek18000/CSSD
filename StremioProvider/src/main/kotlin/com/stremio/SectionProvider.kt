@@ -71,9 +71,6 @@ class SectionProvider(
         private const val TMDB_API = "https://api.themoviedb.org/3"
         private const val API_KEY = BuildConfig.TMDB_API3
 
-        // Safety cap to prevent infinite loops when eagerly loading catalogs
-        private const val MAX_ITEMS_PER_CATALOG = 5000
-
         fun getType(t: String?): TvType = when (t) {
             "movie" -> TvType.Movie
             else -> TvType.TvSeries
@@ -92,6 +89,7 @@ class SectionProvider(
 
     private val catalogUrl: String? get() = config.catalogUrl?.let { it.fixSourceUrl().ifEmpty { null } }
     private var cachedCatalogs: List<Catalog>? = null
+    private val seenIdsPerRow = mutableMapOf<String, MutableSet<String>>()
 
     private suspend fun getCatalogs(catUrl: String): List<Catalog> {
         cachedCatalogs?.let { return it }
@@ -166,79 +164,58 @@ class SectionProvider(
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val loadData = parseJson<LoadData>(data)
-
-        // For IPTV content (xt_ IDs), skip subtitle providers — they will never
-        // find results for Xtream Codes IDs and only add latency.
-        val isIptv = loadData.id?.startsWith("xt_") == true
-
-        if (isIptv) {
-            runAllAsync(
-                {
-                    if (catalogUrl != null) {
-                        invokeCatalogStream(catalogUrl!!, loadData, subtitleCallback, callback)
-                    }
-                },
-                {
-                    config.streamAddons.amap { addon ->
-                        invokeStreamAddon(addon, loadData, subtitleCallback, callback)
-                    }
+        runAllAsync(
+            {
+                if (catalogUrl != null) {
+                    invokeCatalogStream(catalogUrl!!, loadData, subtitleCallback, callback)
                 }
-            )
-        } else {
-            runAllAsync(
-                {
-                    if (catalogUrl != null) {
-                        invokeCatalogStream(catalogUrl!!, loadData, subtitleCallback, callback)
-                    }
-                },
-                {
-                    config.streamAddons.amap { addon ->
-                        invokeStreamAddon(addon, loadData, subtitleCallback, callback)
-                    }
-                },
-                {
-                    SubsExtractors.invokeWatchsomuch(imdbIdFromLoad(loadData), loadData.season, loadData.episode, subtitleCallback)
-                },
-                {
-                    SubsExtractors.invokeOpenSubs(imdbIdFromLoad(loadData), loadData.season, loadData.episode, subtitleCallback)
+            },
+            {
+                config.streamAddons.amap { addon ->
+                    invokeStreamAddon(addon, loadData, subtitleCallback, callback)
                 }
-            )
-        }
+            },
+            {
+                SubsExtractors.invokeWatchsomuch(imdbIdFromLoad(loadData), loadData.season, loadData.episode, subtitleCallback)
+            },
+            {
+                SubsExtractors.invokeOpenSubs(imdbIdFromLoad(loadData), loadData.season, loadData.episode, subtitleCallback)
+            }
+        )
         return true
     }
 
     // ── private helpers ──
 
     /**
-     * FIX-1: Eagerly fetch ALL items from every catalog on page 1.
+     * FIX: Eagerly fetch ALL items from every catalog.
      *
-     * The original code fetched only 100 items per catalog per page call.
-     * CloudStream's horizontal rows only show what's in the returned HomePageList,
-     * and pagination via `page` adds new rows at the bottom — it does NOT append
-     * items to existing rows. So each category was visually capped at 100 items.
+     * Original code only fetched 100 items per catalog row. CloudStream's horizontal
+     * rows only display what's in the HomePageList, and pagination via `page` adds
+     * new rows at the bottom — it does NOT append to existing rows. So each category
+     * was visually capped at 100 items.
      *
-     * Now we paginate WITHIN each catalog (skip=0, 100, 200, …) until the
-     * addon returns fewer than 100 items, and return everything on page 1.
-     * Catalogs are fetched in parallel for speed.
+     * Now we paginate WITHIN each catalog (skip=0, 100, 200, …) until the addon
+     * returns fewer than 100 items. Catalogs are processed sequentially (like the
+     * original) to stay as close to the original behavior as possible.
      */
     private suspend fun getCatalogMainPage(catUrl: String, page: Int, request: MainPageRequest): HomePageResponse {
         val catalogs = getCatalogs(catUrl)
         if (catalogs.isEmpty()) return newHomePageResponse(emptyList<HomePageList>(), false)
+        if (page == 1) seenIdsPerRow.clear()
+        val lists = mutableListOf<HomePageList>()
+        var anyHasMore = false
 
-        // Only load on page 1 — we eagerly fetch everything, so no further pages needed
-        if (page > 1) return newHomePageResponse(emptyList<HomePageList>(), false)
-
-        // Fetch all catalogs in parallel
-        val lists = catalogs.amap { catalog ->
+        catalogs.forEach { catalog ->
             val rowName = catalog.name ?: catalog.id
+            val seenIds = seenIdsPerRow.getOrPut(rowName) { mutableSetOf() }
             val entries = mutableListOf<SearchResponse>()
-            val seenIds = mutableSetOf<String>()
 
             catalog.types.forEach { type ->
+                // FIX: Keep fetching pages within this catalog until all items are loaded
                 var skip = 0
                 var hasMore = true
-
-                while (hasMore && entries.size < MAX_ITEMS_PER_CATALOG) {
+                while (hasMore) {
                     val url = if (skip == 0) {
                         "$catUrl/catalog/${type}/${catalog.id}.json"
                     } else {
@@ -252,8 +229,9 @@ class SectionProvider(
                                     entries.add(entry.toSearchResponse(this))
                                 }
                             }
+                            // If less than 100 items returned, this is the last page
                             if (res.metas!!.size < 100) {
-                                hasMore = false // Less than 100 means last page
+                                hasMore = false
                             } else {
                                 skip += 100
                             }
@@ -265,15 +243,16 @@ class SectionProvider(
                     }
                 }
             }
-
-            if (entries.isNotEmpty()) rowName to entries else null
-        }.filterNotNull().map { (name, entries) -> HomePageList(name, entries) }
-
-        // hasNextPage = false because we already loaded everything eagerly
+            if (entries.isNotEmpty()) lists.add(HomePageList(rowName, entries))
+        }
+        val allEntriesCount = lists.sumOf { it.list.size }
+        if (allEntriesCount == 0 && page > 1) {
+            return newHomePageResponse(emptyList<HomePageList>(), false)
+        }
+        // No more pages since we loaded everything eagerly
         return newHomePageResponse(lists, false)
     }
 
-    // loadFromCatalog — ORIGINAL, untouched. This was working fine before.
     private suspend fun loadFromCatalog(catUrl: String, url: String): LoadResponse {
         val res: CatalogEntry = if (url.startsWith("{")) {
             parseJson(url)
@@ -294,8 +273,6 @@ class SectionProvider(
         return entry.toLoadResponse(this, res.id)
     }
 
-    // invokeCatalogStream — ORIGINAL timeout (120L). DO NOT reduce this,
-    // the Xtream worker needs time to respond.
     private suspend fun invokeCatalogStream(
         catUrl: String, loadData: LoadData,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
