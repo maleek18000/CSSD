@@ -281,10 +281,17 @@ class SectionProvider(
 
     /**
      * [FIX-2] Optimized loadFromCatalog:
-     * - If the CatalogEntry already has videos (from the serialized search data),
-     *   use it directly and skip the redundant meta fetch.
-     * - For IPTV content (xt_ IDs) that has no videos, also skip the meta fetch
-     *   since the catalog entry already has enough info for a movie/channel response.
+     *
+     * Two code paths exist depending on how the URL arrives:
+     *
+     * 1. url.startsWith("{") → CatalogEntry was serialized from search results.
+     *    Search results typically do NOT contain the `videos` array, so we MUST
+     *    fetch /meta/ to get the episode list for series. For movies (no videos
+     *    needed), we can skip the meta fetch.
+     *
+     * 2. !url.startsWith("{") → It's a direct /meta/ URL that we already fetched.
+     *    The parsed entry already has the full data including videos, so we can
+     *    use it directly without a redundant re-fetch.
      */
     private suspend fun loadFromCatalog(catUrl: String, url: String): LoadResponse {
         val res: CatalogEntry = if (url.startsWith("{")) {
@@ -295,15 +302,25 @@ class SectionProvider(
             parseJson(metaJson)
         }
 
-        // [FIX-2] If the entry already has videos, we can build the LoadResponse
-        // directly without fetching the meta endpoint again. This saves one full
-        // HTTP round-trip for series that include episode lists in catalog data.
-        // Also skip for IPTV channels/movies (no videos needed).
-        if (res.videos != null || isIptvContent(res.id)) {
+        // If the entry already has videos populated, we have all the data we need.
+        // This happens when the URL was a direct /meta/ URL (path 2 above).
+        // Safe to skip the meta fetch.
+        if (res.videos != null) {
             return res.toLoadResponse(this, res.id)
         }
 
-        // Fallback: fetch full meta from the addon (or Cinemeta for IMDB/TMDB IDs)
+        // For entries from search results (path 1), we need to fetch meta:
+        // - Series: meta provides the `videos` (episode) list — REQUIRED
+        // - Movies: meta might provide extra info but isn't strictly required,
+        //   so for IPTV movies we can skip it to save a round-trip
+        // Note: at this point res.videos is guaranteed null (line 308 returned if not null),
+        // so we only need to check the type.
+        if (res.type == "movie") {
+            return res.toLoadResponse(this, res.id)
+        }
+
+        // Fetch full meta from the addon (or Cinemeta for IMDB/TMDB IDs).
+        // This is required for series to get the episode list.
         val catUrlFixed = if ((res.type == "movie" || res.type == "series") && isImdborTmdb(res.id))
             CINEMETA_URL else catUrl
         val encodedId = URLEncoder.encode(res.id, "UTF-8")
