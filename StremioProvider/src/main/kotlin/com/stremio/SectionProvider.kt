@@ -71,11 +71,7 @@ class SectionProvider(
         private const val TMDB_API = "https://api.themoviedb.org/3"
         private const val API_KEY = BuildConfig.TMDB_API3
 
-        // [FIX-2] Reduced timeouts — 120s was way too long, especially for IPTV streams
-        private const val STREAM_TIMEOUT = 15L   // was 120L
-        private const val CATALOG_TIMEOUT = 30L   // was 120L
-
-        // [FIX-1] Safety cap to prevent infinite loops when eagerly loading catalogs
+        // Safety cap to prevent infinite loops when eagerly loading catalogs
         private const val MAX_ITEMS_PER_CATALOG = 5000
 
         fun getType(t: String?): TvType = when (t) {
@@ -92,9 +88,6 @@ class SectionProvider(
             if (link == null) return null
             return if (link.startsWith("/")) "https://image.tmdb.org/t/p/original/$link" else link
         }
-
-        /** [FIX-2] Detect IPTV / Xtream Codes content by the "xt_" ID prefix */
-        fun isIptvContent(id: String?): Boolean = id?.startsWith("xt_") == true
     }
 
     private val catalogUrl: String? get() = config.catalogUrl?.let { it.fixSourceUrl().ifEmpty { null } }
@@ -174,9 +167,11 @@ class SectionProvider(
     ): Boolean {
         val loadData = parseJson<LoadData>(data)
 
-        // [FIX-2] For IPTV content (xt_ IDs), skip subtitle providers entirely.
-        // They will never find results for Xtream Codes IDs and only add latency.
-        if (isIptvContent(loadData.id)) {
+        // For IPTV content (xt_ IDs), skip subtitle providers — they will never
+        // find results for Xtream Codes IDs and only add latency.
+        val isIptv = loadData.id?.startsWith("xt_") == true
+
+        if (isIptv) {
             runAllAsync(
                 {
                     if (catalogUrl != null) {
@@ -190,7 +185,6 @@ class SectionProvider(
                 }
             )
         } else {
-            // Original behavior for non-IPTV content (IMDB/TMDB IDs)
             runAllAsync(
                 {
                     if (catalogUrl != null) {
@@ -216,9 +210,9 @@ class SectionProvider(
     // ── private helpers ──
 
     /**
-     * [FIX-1] Eagerly fetch ALL items from every catalog on page 1.
+     * FIX-1: Eagerly fetch ALL items from every catalog on page 1.
      *
-     * Previously this method fetched only 100 items per catalog per page call.
+     * The original code fetched only 100 items per catalog per page call.
      * CloudStream's horizontal rows only show what's in the returned HomePageList,
      * and pagination via `page` adds new rows at the bottom — it does NOT append
      * items to existing rows. So each category was visually capped at 100 items.
@@ -251,7 +245,7 @@ class SectionProvider(
                         "$catUrl/catalog/${type}/${catalog.id}/skip=$skip.json"
                     }
                     try {
-                        val res = app.get(url, timeout = CATALOG_TIMEOUT).parsedSafe<CatalogResponse>()
+                        val res = app.get(url, timeout = 120L).parsedSafe<CatalogResponse>()
                         if (!res?.metas.isNullOrEmpty()) {
                             res!!.metas!!.forEach { entry ->
                                 if (seenIds.add(entry.id)) {
@@ -279,20 +273,7 @@ class SectionProvider(
         return newHomePageResponse(lists, false)
     }
 
-    /**
-     * [FIX-2] Optimized loadFromCatalog:
-     *
-     * Two code paths exist depending on how the URL arrives:
-     *
-     * 1. url.startsWith("{") → CatalogEntry was serialized from search results.
-     *    Search results typically do NOT contain the `videos` array, so we MUST
-     *    fetch /meta/ to get the episode list for series. For movies (no videos
-     *    needed), we can skip the meta fetch.
-     *
-     * 2. !url.startsWith("{") → It's a direct /meta/ URL that we already fetched.
-     *    The parsed entry already has the full data including videos, so we can
-     *    use it directly without a redundant re-fetch.
-     */
+    // loadFromCatalog — ORIGINAL, untouched. This was working fine before.
     private suspend fun loadFromCatalog(catUrl: String, url: String): LoadResponse {
         val res: CatalogEntry = if (url.startsWith("{")) {
             parseJson(url)
@@ -301,26 +282,6 @@ class SectionProvider(
             val metaJson = JSONObject(json).getJSONObject("meta").toString()
             parseJson(metaJson)
         }
-
-        // If the entry already has videos populated, we have all the data we need.
-        // This happens when the URL was a direct /meta/ URL (path 2 above).
-        // Safe to skip the meta fetch.
-        if (res.videos != null) {
-            return res.toLoadResponse(this, res.id)
-        }
-
-        // For entries from search results (path 1), we need to fetch meta:
-        // - Series: meta provides the `videos` (episode) list — REQUIRED
-        // - Movies: meta might provide extra info but isn't strictly required,
-        //   so for IPTV movies we can skip it to save a round-trip
-        // Note: at this point res.videos is guaranteed null (line 308 returned if not null),
-        // so we only need to check the type.
-        if (res.type == "movie") {
-            return res.toLoadResponse(this, res.id)
-        }
-
-        // Fetch full meta from the addon (or Cinemeta for IMDB/TMDB IDs).
-        // This is required for series to get the episode list.
         val catUrlFixed = if ((res.type == "movie" || res.type == "series") && isImdborTmdb(res.id))
             CINEMETA_URL else catUrl
         val encodedId = URLEncoder.encode(res.id, "UTF-8")
@@ -333,17 +294,14 @@ class SectionProvider(
         return entry.toLoadResponse(this, res.id)
     }
 
-    /**
-     * [FIX-2] Reduced timeout from 120s to 15s.
-     * IPTV streams should resolve quickly — 120s just meant the user stared
-     * at a loading spinner for up to 2 minutes on failure.
-     */
+    // invokeCatalogStream — ORIGINAL timeout (120L). DO NOT reduce this,
+    // the Xtream worker needs time to respond.
     private suspend fun invokeCatalogStream(
         catUrl: String, loadData: LoadData,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
         val encodedId = URLEncoder.encode(loadData.id, "UTF-8")
-        val request = app.get("$catUrl/stream/${loadData.type}/$encodedId.json", timeout = STREAM_TIMEOUT)
+        val request = app.get("$catUrl/stream/${loadData.type}/$encodedId.json", timeout = 120L)
         if (request.isSuccessful) {
             val res = request.parsedSafe<StreamsResponse>()
             res?.streams?.forEach { stream ->
@@ -365,7 +323,7 @@ class SectionProvider(
             "$fixUrl/stream/series/$imdbId:${loadData.season}:${loadData.episode}.json"
         }
         try {
-            val res = app.get(url, timeout = STREAM_TIMEOUT).parsedSafe<StreamsResponse>()
+            val res = app.get(url, timeout = 120L).parsedSafe<StreamsResponse>()
             res?.streams?.forEach { stream ->
                 stream.runCallback(TRACKER_LIST_URL, subtitleCallback, callback)
             }
@@ -620,7 +578,7 @@ data class Catalog(
                     "$catUrl/catalog/${type}/$id/search=$encodedQuery/skip=$skip.json"
                 }
                 try {
-                    val res = app.get(url, timeout = 30L).parsedSafe<CatalogResponse>()
+                    val res = app.get(url, timeout = 120L).parsedSafe<CatalogResponse>()
                     if (res?.metas.isNullOrEmpty()) {
                         hasMore = false
                     } else {
