@@ -416,6 +416,7 @@ class XtreamIPTVProvider : MainAPI() {
                 val encUser = URLEncoder.encode(c.user, "UTF-8")
                 val encPass = URLEncoder.encode(c.pass, "UTF-8")
                 val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
+                val catFilter = parseCategoryFilter()
 
                 // Movies - featured row
                 val vodStreamsText = RawHttp.get("$apiBase&action=get_vod_streams", 15000)
@@ -470,6 +471,7 @@ class XtreamIPTVProvider : MainAPI() {
                             val catName = catNames[catId] ?: return@mapNotNull null
                             catName to items
                         }
+                        .filter { (catName, _) -> catFilter == null || catFilter.any { f -> catName.contains(f, ignoreCase = true) } }
                         .sortedByDescending { it.second.size }
                         .forEach { (catName, items) ->
                             val homeItems = items.map { s ->
@@ -494,6 +496,7 @@ class XtreamIPTVProvider : MainAPI() {
                             val catName = catNames[catId] ?: return@mapNotNull null
                             catName to items
                         }
+                        .filter { (catName, _) -> catFilter == null || catFilter.any { f -> catName.contains(f, ignoreCase = true) } }
                         .sortedByDescending { it.second.size }
                         .forEach { (catName, items) ->
                             val homeItems = items.map { s ->
@@ -518,6 +521,7 @@ class XtreamIPTVProvider : MainAPI() {
                             val catName = catNames[catId] ?: return@mapNotNull null
                             catName to items
                         }
+                        .filter { (catName, _) -> catFilter == null || catFilter.any { f -> catName.contains(f, ignoreCase = true) } }
                         .sortedByDescending { it.second.size }
                         .forEach { (catName, items) ->
                             val homeItems = items.map { s ->
