@@ -51,7 +51,7 @@ class SectionProvider(
 
     override val mainPage: List<MainPageData>
         get() = if (catalogUrl != null) {
-            mainPageOf("placeholder://catalog" to name)
+            mainPageOf("catalog://all" to name)
         } else {
             mainPageOf(
                 "$TMDB_API/trending/all/day?api_key=$API_KEY&region=US&language=en" to labelTrending,
@@ -88,6 +88,20 @@ class SectionProvider(
     }
 
     private val catalogUrl: String? get() = config.catalogUrl?.let { it.fixSourceUrl().ifEmpty { null } }
+
+    // Cache the manifest catalogs so we don't re-fetch on every page load
+    private var cachedCatalogs: List<Catalog>? = null
+
+    private suspend fun getCatalogs(catUrl: String): List<Catalog> {
+        cachedCatalogs?.let { return it }
+        val manifest = app.get("$catUrl/manifest.json").parsedSafe<Manifest>()
+        val cats = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
+        cachedCatalogs = cats
+        return cats
+    }
+
+    // Track seen IDs per row to deduplicate when addon doesn't support skip properly
+    private val seenIdsPerRow = mutableMapOf<String, MutableSet<String>>()
 
     // ── CATALOG MODE (catalogUrl != null) ──
 
@@ -155,7 +169,6 @@ class SectionProvider(
     ): Boolean {
         val loadData = parseJson<LoadData>(data)
 
-        // parallel: catalog stream + each configured stream addon + subs
         runAllAsync(
             {
                 if (catalogUrl != null) {
@@ -181,19 +194,70 @@ class SectionProvider(
     // ── private helpers ──
 
     /**
-     * Fetch catalog main page with PAGINATION to remove the 100-item limit.
-     * Stremio catalogs return max 100 items per request. We paginate using skip=N
-     * to fetch ALL available items instead of just the first 100.
+     * UNLIMITED pagination for catalog home page.
+     *
+     * Uses CloudStream's native page-based pagination:
+     * - Each call fetches one "page" of items (100 per type per catalog) using Stremio's skip=N parameter
+     * - Returns hasNextPage=true when more items might be available
+     * - CloudStream will call this method again with page+1, appending items to the same rows
+     * - This effectively makes each row UNLIMITED — the user scrolls right to load more
+     *
+     * Also handles deduplication for addons that don't support skip properly
+     * (they return the same items for every skip value).
      */
     private suspend fun getCatalogMainPage(catUrl: String, page: Int, request: MainPageRequest): HomePageResponse {
-        val manifest = app.get("$catUrl/manifest.json").parsedSafe<Manifest>()
+        val catalogs = getCatalogs(catUrl)
+        if (catalogs.isEmpty()) return newHomePageResponse(emptyList<HomePageList>(), false)
+
+        // Reset dedup tracking on first page
+        if (page == 1) {
+            seenIdsPerRow.clear()
+        }
+
+        val skip = (page - 1) * 100
         val lists = mutableListOf<HomePageList>()
-        manifest?.catalogs?.filter { !it.isSearchRequired() }?.amap { catalog ->
-            catalog.toHomePageList(catUrl, this).let {
-                if (it.list.isNotEmpty()) lists.add(it)
+        var anyHasMore = false
+
+        catalogs.forEach { catalog ->
+            val rowName = catalog.name ?: catalog.id
+            val seenIds = seenIdsPerRow.getOrPut(rowName) { mutableSetOf() }
+            val entries = mutableListOf<SearchResponse>()
+            var totalNewItems = 0
+
+            catalog.types.forEach { type ->
+                val url = if (skip == 0) {
+                    "$catUrl/catalog/${type}/${catalog.id}.json"
+                } else {
+                    "$catUrl/catalog/${type}/${catalog.id}/skip=$skip.json"
+                }
+                try {
+                    val res = app.get(url, timeout = 120L).parsedSafe<CatalogResponse>()
+                    if (!res?.metas.isNullOrEmpty()) {
+                        res!!.metas!!.forEach { entry ->
+                            // Deduplicate: skip items we've already seen for this row
+                            if (seenIds.add(entry.id)) {
+                                entries.add(entry.toSearchResponse(this))
+                                totalNewItems++
+                            }
+                        }
+                        // If a type returned 100 items, there might be more on the next page
+                        if (res.metas!!.size >= 100) anyHasMore = true
+                    }
+                } catch (_: Exception) { }
+            }
+
+            if (entries.isNotEmpty()) {
+                lists.add(HomePageList(rowName, entries))
             }
         }
-        return newHomePageResponse(lists, false)
+
+        // If no new items were found across all catalogs, there's nothing more to load
+        val allEntriesCount = lists.sumOf { it.list.size }
+        if (allEntriesCount == 0 && page > 1) {
+            return newHomePageResponse(emptyList<HomePageList>(), false)
+        }
+
+        return newHomePageResponse(lists, anyHasMore)
     }
 
     private suspend fun loadFromCatalog(catUrl: String, url: String): LoadResponse {
@@ -502,11 +566,17 @@ data class Catalog(
         return hasSearchInExtra || hasSearchInExtraSupported
     }
 
+    /**
+     * UNLIMITED search pagination — no artificial caps.
+     * Uses skip=N to paginate through all search results.
+     * Stops only when the addon returns fewer items than a full page.
+     * Deduplicates by entry ID to handle addons that don't support skip.
+     */
     suspend fun search(query: String, catUrl: String, provider: SectionProvider): List<SearchResponse> {
         val entries = mutableListOf<SearchResponse>()
+        val seenIds = mutableSetOf<String>()
         val encodedQuery = URLEncoder.encode(query, "UTF-8")
         types.forEach { type ->
-            // Paginate search results to get more than 100 items
             var skip = 0
             var hasMore = true
             while (hasMore) {
@@ -515,54 +585,30 @@ data class Catalog(
                 } else {
                     "$catUrl/catalog/${type}/$id/search=$encodedQuery/skip=$skip.json"
                 }
-                val res = app.get(url, timeout = 120L)
-                    .parsedSafe<CatalogResponse>()
-                if (res?.metas.isNullOrEmpty()) {
-                    hasMore = false
-                } else {
-                    res?.metas?.forEach { entry ->
-                        entries.add(entry.toSearchResponse(provider))
+                try {
+                    val res = app.get(url, timeout = 120L)
+                        .parsedSafe<CatalogResponse>()
+                    if (res?.metas.isNullOrEmpty()) {
+                        hasMore = false
+                    } else {
+                        var newItems = 0
+                        res?.metas?.forEach { entry ->
+                            if (seenIds.add(entry.id)) {
+                                entries.add(entry.toSearchResponse(provider))
+                                newItems++
+                            }
+                        }
+                        skip += res?.metas?.size ?: 0
+                        // Stop if we got no new unique items (addon doesn't support skip)
+                        // or if we got fewer than a full page (no more results)
+                        if (newItems == 0 || (res?.metas?.size ?: 0) < 100) hasMore = false
                     }
-                    skip += res?.metas?.size ?: 0
-                    // Safety: limit to 500 items per catalog type to avoid infinite loops
-                    if (skip >= 500) hasMore = false
+                } catch (_: Exception) {
+                    hasMore = false
                 }
             }
         }
         return entries
-    }
-
-    /**
-     * Fetch home page list with PAGINATION to remove the 100-item limit.
-     * The Stremio addon API returns max 100 items per request.
-     * We use skip=N pagination to fetch ALL available items.
-     */
-    suspend fun toHomePageList(catUrl: String, provider: SectionProvider): HomePageList {
-        val entries = mutableListOf<SearchResponse>()
-        types.forEach { type ->
-            var skip = 0
-            var hasMore = true
-            while (hasMore) {
-                val url = if (skip == 0) {
-                    "$catUrl/catalog/${type}/$id.json"
-                } else {
-                    "$catUrl/catalog/${type}/$id/skip=$skip.json"
-                }
-                val res = app.get(url, timeout = 120L)
-                    .parsedSafe<CatalogResponse>()
-                if (res?.metas.isNullOrEmpty()) {
-                    hasMore = false
-                } else {
-                    res?.metas?.forEach { entry ->
-                        entries.add(entry.toSearchResponse(provider))
-                    }
-                    skip += res?.metas?.size ?: 0
-                    // Safety: limit to 500 items per catalog type to avoid infinite loops
-                    if (skip >= 500) hasMore = false
-                }
-            }
-        }
-        return HomePageList(name ?: id, entries)
     }
 }
 
