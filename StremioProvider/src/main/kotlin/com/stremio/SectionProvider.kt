@@ -524,8 +524,6 @@ data class Catalog(
                         entries.add(entry.toSearchResponse(provider))
                     }
                     skip += res?.metas?.size ?: 0
-                    // Safety: limit to 500 items per catalog type to avoid infinite loops
-                    if (skip >= 500) hasMore = false
                 }
             }
         }
@@ -557,8 +555,6 @@ data class Catalog(
                         entries.add(entry.toSearchResponse(provider))
                     }
                     skip += res?.metas?.size ?: 0
-                    // Safety: limit to 500 items per catalog type to avoid infinite loops
-                    if (skip >= 500) hasMore = false
                 }
             }
         }
