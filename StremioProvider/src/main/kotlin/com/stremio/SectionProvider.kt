@@ -37,6 +37,8 @@ import com.lagradost.cloudstream3.toNewSearchResponseList
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.stremio.SubsExtractors.invokeOpenSubs
+import com.stremio.SubsExtractors.invokeWatchsomuch
 import org.json.JSONObject
 import java.net.URLEncoder
 
@@ -51,7 +53,7 @@ class SectionProvider(
 
     override val mainPage: List<MainPageData>
         get() = if (catalogUrl != null) {
-            mainPageOf("catalog://all" to name)
+            mainPageOf("placeholder://catalog" to name)
         } else {
             mainPageOf(
                 "$TMDB_API/trending/all/day?api_key=$API_KEY&region=US&language=en" to labelTrending,
@@ -88,16 +90,6 @@ class SectionProvider(
     }
 
     private val catalogUrl: String? get() = config.catalogUrl?.let { it.fixSourceUrl().ifEmpty { null } }
-    private var cachedCatalogs: List<Catalog>? = null
-    private val seenIdsPerRow = mutableMapOf<String, MutableSet<String>>()
-
-    private suspend fun getCatalogs(catUrl: String): List<Catalog> {
-        cachedCatalogs?.let { return it }
-        val manifest = app.get("$catUrl/manifest.json").parsedSafe<Manifest>()
-        val cats = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
-        cachedCatalogs = cats
-        return cats
-    }
 
     // ── CATALOG MODE (catalogUrl != null) ──
 
@@ -164,6 +156,8 @@ class SectionProvider(
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val loadData = parseJson<LoadData>(data)
+
+        // parallel: catalog stream + each configured stream addon + subs
         runAllAsync(
             {
                 if (catalogUrl != null) {
@@ -176,80 +170,32 @@ class SectionProvider(
                 }
             },
             {
-                SubsExtractors.invokeWatchsomuch(imdbIdFromLoad(loadData), loadData.season, loadData.episode, subtitleCallback)
+                invokeWatchsomuch(imdbIdFromLoad(loadData), loadData.season, loadData.episode, subtitleCallback)
             },
             {
-                SubsExtractors.invokeOpenSubs(imdbIdFromLoad(loadData), loadData.season, loadData.episode, subtitleCallback)
+                invokeOpenSubs(imdbIdFromLoad(loadData), loadData.season, loadData.episode, subtitleCallback)
             }
         )
+
         return true
     }
 
     // ── private helpers ──
 
     /**
-     * FIX: Eagerly fetch ALL items from every catalog.
-     *
-     * Original code only fetched 100 items per catalog row. CloudStream's horizontal
-     * rows only display what's in the HomePageList, and pagination via `page` adds
-     * new rows at the bottom — it does NOT append to existing rows. So each category
-     * was visually capped at 100 items.
-     *
-     * Now we paginate WITHIN each catalog (skip=0, 100, 200, …) until the addon
-     * returns fewer than 100 items. Catalogs are processed sequentially (like the
-     * original) to stay as close to the original behavior as possible.
+     * Adapted from the working provider with UNLIMITED catalog fix.
+     * Fetches manifest fresh each time (no caching that can go stale),
+     * fetches catalogs in parallel with amap, and each catalog paginates
+     * internally to load ALL items (not just the first 100).
      */
     private suspend fun getCatalogMainPage(catUrl: String, page: Int, request: MainPageRequest): HomePageResponse {
-        val catalogs = getCatalogs(catUrl)
-        if (catalogs.isEmpty()) return newHomePageResponse(emptyList<HomePageList>(), false)
-        if (page == 1) seenIdsPerRow.clear()
+        val manifest = app.get("$catUrl/manifest.json").parsedSafe<Manifest>()
         val lists = mutableListOf<HomePageList>()
-        var anyHasMore = false
-
-        catalogs.forEach { catalog ->
-            val rowName = catalog.name ?: catalog.id
-            val seenIds = seenIdsPerRow.getOrPut(rowName) { mutableSetOf() }
-            val entries = mutableListOf<SearchResponse>()
-
-            catalog.types.forEach { type ->
-                // FIX: Keep fetching pages within this catalog until all items are loaded
-                var skip = 0
-                var hasMore = true
-                while (hasMore) {
-                    val url = if (skip == 0) {
-                        "$catUrl/catalog/${type}/${catalog.id}.json"
-                    } else {
-                        "$catUrl/catalog/${type}/${catalog.id}/skip=$skip.json"
-                    }
-                    try {
-                        val res = app.get(url, timeout = 120L).parsedSafe<CatalogResponse>()
-                        if (!res?.metas.isNullOrEmpty()) {
-                            res!!.metas!!.forEach { entry ->
-                                if (seenIds.add(entry.id)) {
-                                    entries.add(entry.toSearchResponse(this))
-                                }
-                            }
-                            // If less than 100 items returned, this is the last page
-                            if (res.metas!!.size < 100) {
-                                hasMore = false
-                            } else {
-                                skip += 100
-                            }
-                        } else {
-                            hasMore = false
-                        }
-                    } catch (_: Exception) {
-                        hasMore = false
-                    }
-                }
+        manifest?.catalogs?.filter { !it.isSearchRequired() }?.amap { catalog ->
+            catalog.toHomePageList(catUrl, this).let {
+                if (it.list.isNotEmpty()) lists.add(it)
             }
-            if (entries.isNotEmpty()) lists.add(HomePageList(rowName, entries))
         }
-        val allEntriesCount = lists.sumOf { it.list.size }
-        if (allEntriesCount == 0 && page > 1) {
-            return newHomePageResponse(emptyList<HomePageList>(), false)
-        }
-        // No more pages since we loaded everything eagerly
         return newHomePageResponse(lists, false)
     }
 
@@ -261,24 +207,33 @@ class SectionProvider(
             val metaJson = JSONObject(json).getJSONObject("meta").toString()
             parseJson(metaJson)
         }
+
         val catUrlFixed = if ((res.type == "movie" || res.type == "series") && isImdborTmdb(res.id))
             CINEMETA_URL else catUrl
+
         val encodedId = URLEncoder.encode(res.id, "UTF-8")
         val response = app.get("$catUrlFixed/meta/${res.type}/$encodedId.json")
             .parsedSafe<CatalogResponse>()
             ?: throw RuntimeException("Failed to load meta")
+
         val entry = response.meta ?: response.metas?.firstOrNull { it.id == res.id }
             ?: response.metas?.firstOrNull()
             ?: throw RuntimeException("Meta not found")
+
         return entry.toLoadResponse(this, res.id)
     }
 
     private suspend fun invokeCatalogStream(
-        catUrl: String, loadData: LoadData,
-        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
+        catUrl: String,
+        loadData: LoadData,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
     ) {
         val encodedId = URLEncoder.encode(loadData.id, "UTF-8")
-        val request = app.get("$catUrl/stream/${loadData.type}/$encodedId.json", timeout = 120L)
+        val request = app.get(
+            "$catUrl/stream/${loadData.type}/$encodedId.json",
+            timeout = 120L
+        )
         if (request.isSuccessful) {
             val res = request.parsedSafe<StreamsResponse>()
             res?.streams?.forEach { stream ->
@@ -288,8 +243,10 @@ class SectionProvider(
     }
 
     private suspend fun invokeStreamAddon(
-        addon: StreamAddonConfig, loadData: LoadData,
-        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
+        addon: StreamAddonConfig,
+        loadData: LoadData,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
     ) {
         if (addon.url.isBlank()) return
         val fixUrl = addon.url.fixSourceUrl()
@@ -320,10 +277,12 @@ class SectionProvider(
     private suspend fun getTmdbMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val adultQuery = if (settingsForProvider.enableAdult) "" else "&without_keywords=190370|13059|226161|195669|190370"
         val type = if (request.data.contains("/movie")) "movie" else "tv"
+
         val home = app.get("${request.data}$adultQuery&page=$page")
             .parsedSafe<TmdbResults>()?.results?.mapNotNull { media ->
                 media.toSearchResponse(this, type)
             } ?: throw ErrorLoadingException("Invalid Json response")
+
         return newHomePageResponse(request.name, home)
     }
 
@@ -338,6 +297,7 @@ class SectionProvider(
     private suspend fun loadFromTmdb(url: String): LoadResponse {
         val data = parseJson<TmdbData>(url)
         val type = getType(data.type)
+
         val res = app.get(
             if (type == TvType.Movie) {
                 "$TMDB_API/movie/${data.id}?api_key=$API_KEY&language=en&append_to_response=keywords,credits,external_ids,videos,recommendations"
@@ -355,6 +315,7 @@ class SectionProvider(
         val isAnime = genres?.contains("Animation") == true && (res.original_language == "zh" || res.original_language == "ja")
         val keywords = res.keywords?.results?.mapNotNull { it.name }.orEmpty()
             .ifEmpty { res.keywords?.keywords?.mapNotNull { it.name } }
+
         val actors = res.credits?.cast?.mapNotNull { cast ->
             ActorData(
                 Actor(cast.name ?: cast.originalName ?: return@mapNotNull null, getImageUrl(cast.profilePath)),
@@ -432,7 +393,9 @@ class SectionProvider(
     // ── TMDB data classes ──
 
     data class TmdbData(val id: Int? = null, val type: String? = null)
+
     data class TmdbResults(@JsonProperty("results") val results: ArrayList<TmdbMedia>? = arrayListOf())
+
     data class TmdbMedia(
         @JsonProperty("id") val id: Int? = null,
         @JsonProperty("name") val name: String? = null,
@@ -515,6 +478,7 @@ class SectionProvider(
         @JsonProperty("episode_number") val episode_number: Int? = null,
         @JsonProperty("season_number") val season_number: Int? = null,
     )
+
 }
 
 // ── Catalog data classes ──
@@ -543,36 +507,53 @@ data class Catalog(
 
     suspend fun search(query: String, catUrl: String, provider: SectionProvider): List<SearchResponse> {
         val entries = mutableListOf<SearchResponse>()
-        val seenIds = mutableSetOf<String>()
         val encodedQuery = URLEncoder.encode(query, "UTF-8")
+        types.forEach { type ->
+            val res = app.get("$catUrl/catalog/${type}/$id/search=$encodedQuery.json", timeout = 120L)
+                .parsedSafe<CatalogResponse>()
+            res?.metas?.forEach { entry ->
+                entries.add(entry.toSearchResponse(provider))
+            }
+        }
+        return entries
+    }
+
+    /**
+     * FIX: Unlimited catalog items.
+     * Original only fetched the first 100 items per catalog.
+     * Now we paginate internally (skip=0, 100, 200...) until all items are loaded.
+     */
+    suspend fun toHomePageList(catUrl: String, provider: SectionProvider): HomePageList {
+        val entries = mutableListOf<SearchResponse>()
         types.forEach { type ->
             var skip = 0
             var hasMore = true
             while (hasMore) {
                 val url = if (skip == 0) {
-                    "$catUrl/catalog/${type}/$id/search=$encodedQuery.json"
+                    "$catUrl/catalog/${type}/$id.json"
                 } else {
-                    "$catUrl/catalog/${type}/$id/search=$encodedQuery/skip=$skip.json"
+                    "$catUrl/catalog/${type}/$id/skip=$skip.json"
                 }
                 try {
                     val res = app.get(url, timeout = 120L).parsedSafe<CatalogResponse>()
-                    if (res?.metas.isNullOrEmpty()) {
-                        hasMore = false
-                    } else {
-                        var newItems = 0
-                        res?.metas?.forEach { entry ->
-                            if (seenIds.add(entry.id)) {
-                                entries.add(entry.toSearchResponse(provider))
-                                newItems++
-                            }
+                    if (!res?.metas.isNullOrEmpty()) {
+                        res!!.metas!!.forEach { entry ->
+                            entries.add(entry.toSearchResponse(provider))
                         }
-                        skip += res?.metas?.size ?: 0
-                        if (newItems == 0 || (res?.metas?.size ?: 0) < 100) hasMore = false
+                        if (res.metas!!.size < 100) {
+                            hasMore = false
+                        } else {
+                            skip += 100
+                        }
+                    } else {
+                        hasMore = false
                     }
-                } catch (_: Exception) { hasMore = false }
+                } catch (_: Exception) {
+                    hasMore = false
+                }
             }
         }
-        return entries
+        return HomePageList(name ?: id, entries)
     }
 }
 
