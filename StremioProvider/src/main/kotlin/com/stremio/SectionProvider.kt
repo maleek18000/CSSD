@@ -37,8 +37,6 @@ import com.lagradost.cloudstream3.toNewSearchResponseList
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.stremio.SubsExtractors.invokeOpenSubs
-import com.stremio.SubsExtractors.invokeWatchsomuch
 import org.json.JSONObject
 import java.net.URLEncoder
 
@@ -170,10 +168,10 @@ class SectionProvider(
                 }
             },
             {
-                invokeWatchsomuch(imdbIdFromLoad(loadData), loadData.season, loadData.episode, subtitleCallback)
+                SubsExtractors.invokeWatchsomuch(imdbIdFromLoad(loadData), loadData.season, loadData.episode, subtitleCallback)
             },
             {
-                invokeOpenSubs(imdbIdFromLoad(loadData), loadData.season, loadData.episode, subtitleCallback)
+                SubsExtractors.invokeOpenSubs(imdbIdFromLoad(loadData), loadData.season, loadData.episode, subtitleCallback)
             }
         )
 
@@ -183,10 +181,9 @@ class SectionProvider(
     // ── private helpers ──
 
     /**
-     * Adapted from the working provider with UNLIMITED catalog fix.
-     * Fetches manifest fresh each time (no caching that can go stale),
-     * fetches catalogs in parallel with amap, and each catalog paginates
-     * internally to load ALL items (not just the first 100).
+     * Fetch catalog main page with PAGINATION to remove the 100-item limit.
+     * Stremio catalogs return max 100 items per request. We paginate using skip=N
+     * to fetch ALL available items instead of just the first 100.
      */
     private suspend fun getCatalogMainPage(catUrl: String, page: Int, request: MainPageRequest): HomePageResponse {
         val manifest = app.get("$catUrl/manifest.json").parsedSafe<Manifest>()
@@ -509,19 +506,36 @@ data class Catalog(
         val entries = mutableListOf<SearchResponse>()
         val encodedQuery = URLEncoder.encode(query, "UTF-8")
         types.forEach { type ->
-            val res = app.get("$catUrl/catalog/${type}/$id/search=$encodedQuery.json", timeout = 120L)
-                .parsedSafe<CatalogResponse>()
-            res?.metas?.forEach { entry ->
-                entries.add(entry.toSearchResponse(provider))
+            // Paginate search results to get more than 100 items
+            var skip = 0
+            var hasMore = true
+            while (hasMore) {
+                val url = if (skip == 0) {
+                    "$catUrl/catalog/${type}/$id/search=$encodedQuery.json"
+                } else {
+                    "$catUrl/catalog/${type}/$id/search=$encodedQuery/skip=$skip.json"
+                }
+                val res = app.get(url, timeout = 120L)
+                    .parsedSafe<CatalogResponse>()
+                if (res?.metas.isNullOrEmpty()) {
+                    hasMore = false
+                } else {
+                    res?.metas?.forEach { entry ->
+                        entries.add(entry.toSearchResponse(provider))
+                    }
+                    skip += res?.metas?.size ?: 0
+                    // Safety: limit to 500 items per catalog type to avoid infinite loops
+                    if (skip >= 500) hasMore = false
+                }
             }
         }
         return entries
     }
 
     /**
-     * FIX: Unlimited catalog items.
-     * Original only fetched the first 100 items per catalog.
-     * Now we paginate internally (skip=0, 100, 200...) until all items are loaded.
+     * Fetch home page list with PAGINATION to remove the 100-item limit.
+     * The Stremio addon API returns max 100 items per request.
+     * We use skip=N pagination to fetch ALL available items.
      */
     suspend fun toHomePageList(catUrl: String, provider: SectionProvider): HomePageList {
         val entries = mutableListOf<SearchResponse>()
@@ -534,22 +548,17 @@ data class Catalog(
                 } else {
                     "$catUrl/catalog/${type}/$id/skip=$skip.json"
                 }
-                try {
-                    val res = app.get(url, timeout = 120L).parsedSafe<CatalogResponse>()
-                    if (!res?.metas.isNullOrEmpty()) {
-                        res!!.metas!!.forEach { entry ->
-                            entries.add(entry.toSearchResponse(provider))
-                        }
-                        if (res.metas!!.size < 100) {
-                            hasMore = false
-                        } else {
-                            skip += 100
-                        }
-                    } else {
-                        hasMore = false
-                    }
-                } catch (_: Exception) {
+                val res = app.get(url, timeout = 120L)
+                    .parsedSafe<CatalogResponse>()
+                if (res?.metas.isNullOrEmpty()) {
                     hasMore = false
+                } else {
+                    res?.metas?.forEach { entry ->
+                        entries.add(entry.toSearchResponse(provider))
+                    }
+                    skip += res?.metas?.size ?: 0
+                    // Safety: limit to 500 items per catalog type to avoid infinite loops
+                    if (skip >= 500) hasMore = false
                 }
             }
         }
