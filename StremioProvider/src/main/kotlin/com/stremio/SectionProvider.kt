@@ -524,6 +524,7 @@ data class Catalog(
                         entries.add(entry.toSearchResponse(provider))
                     }
                     skip += res?.metas?.size ?: 0
+                    if (skip >= 10000) hasMore = false
                 }
             }
         }
@@ -555,6 +556,7 @@ data class Catalog(
                         entries.add(entry.toSearchResponse(provider))
                     }
                     skip += res?.metas?.size ?: 0
+                    if (skip >= 10000) hasMore = false
                 }
             }
         }
