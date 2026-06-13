@@ -71,6 +71,13 @@ class SectionProvider(
         private const val TMDB_API = "https://api.themoviedb.org/3"
         private const val API_KEY = BuildConfig.TMDB_API3
 
+        // [FIX-2] Reduced timeouts — 120s was way too long, especially for IPTV streams
+        private const val STREAM_TIMEOUT = 15L   // was 120L
+        private const val CATALOG_TIMEOUT = 30L   // was 120L
+
+        // [FIX-1] Safety cap to prevent infinite loops when eagerly loading catalogs
+        private const val MAX_ITEMS_PER_CATALOG = 5000
+
         fun getType(t: String?): TvType = when (t) {
             "movie" -> TvType.Movie
             else -> TvType.TvSeries
@@ -85,11 +92,12 @@ class SectionProvider(
             if (link == null) return null
             return if (link.startsWith("/")) "https://image.tmdb.org/t/p/original/$link" else link
         }
+
+        /** [FIX-2] Detect IPTV / Xtream Codes content by the "xt_" ID prefix */
+        fun isIptvContent(id: String?): Boolean = id?.startsWith("xt_") == true
     }
 
     private val catalogUrl: String? get() = config.catalogUrl?.let { it.fixSourceUrl().ifEmpty { null } }
-
-    // Cache the manifest catalogs so we don't re-fetch on every page load
     private var cachedCatalogs: List<Catalog>? = null
 
     private suspend fun getCatalogs(catUrl: String): List<Catalog> {
@@ -99,9 +107,6 @@ class SectionProvider(
         cachedCatalogs = cats
         return cats
     }
-
-    // Track seen IDs per row to deduplicate when addon doesn't support skip properly
-    private val seenIdsPerRow = mutableMapOf<String, MutableSet<String>>()
 
     // ── CATALOG MODE (catalogUrl != null) ──
 
@@ -169,97 +174,118 @@ class SectionProvider(
     ): Boolean {
         val loadData = parseJson<LoadData>(data)
 
-        runAllAsync(
-            {
-                if (catalogUrl != null) {
-                    invokeCatalogStream(catalogUrl!!, loadData, subtitleCallback, callback)
+        // [FIX-2] For IPTV content (xt_ IDs), skip subtitle providers entirely.
+        // They will never find results for Xtream Codes IDs and only add latency.
+        if (isIptvContent(loadData.id)) {
+            runAllAsync(
+                {
+                    if (catalogUrl != null) {
+                        invokeCatalogStream(catalogUrl!!, loadData, subtitleCallback, callback)
+                    }
+                },
+                {
+                    config.streamAddons.amap { addon ->
+                        invokeStreamAddon(addon, loadData, subtitleCallback, callback)
+                    }
                 }
-            },
-            {
-                config.streamAddons.amap { addon ->
-                    invokeStreamAddon(addon, loadData, subtitleCallback, callback)
+            )
+        } else {
+            // Original behavior for non-IPTV content (IMDB/TMDB IDs)
+            runAllAsync(
+                {
+                    if (catalogUrl != null) {
+                        invokeCatalogStream(catalogUrl!!, loadData, subtitleCallback, callback)
+                    }
+                },
+                {
+                    config.streamAddons.amap { addon ->
+                        invokeStreamAddon(addon, loadData, subtitleCallback, callback)
+                    }
+                },
+                {
+                    SubsExtractors.invokeWatchsomuch(imdbIdFromLoad(loadData), loadData.season, loadData.episode, subtitleCallback)
+                },
+                {
+                    SubsExtractors.invokeOpenSubs(imdbIdFromLoad(loadData), loadData.season, loadData.episode, subtitleCallback)
                 }
-            },
-            {
-                SubsExtractors.invokeWatchsomuch(imdbIdFromLoad(loadData), loadData.season, loadData.episode, subtitleCallback)
-            },
-            {
-                SubsExtractors.invokeOpenSubs(imdbIdFromLoad(loadData), loadData.season, loadData.episode, subtitleCallback)
-            }
-        )
-
+            )
+        }
         return true
     }
 
     // ── private helpers ──
 
     /**
-     * UNLIMITED pagination for catalog home page.
+     * [FIX-1] Eagerly fetch ALL items from every catalog on page 1.
      *
-     * Uses CloudStream's native page-based pagination:
-     * - Each call fetches one "page" of items (100 per type per catalog) using Stremio's skip=N parameter
-     * - Returns hasNextPage=true when more items might be available
-     * - CloudStream will call this method again with page+1, appending items to the same rows
-     * - This effectively makes each row UNLIMITED — the user scrolls right to load more
+     * Previously this method fetched only 100 items per catalog per page call.
+     * CloudStream's horizontal rows only show what's in the returned HomePageList,
+     * and pagination via `page` adds new rows at the bottom — it does NOT append
+     * items to existing rows. So each category was visually capped at 100 items.
      *
-     * Also handles deduplication for addons that don't support skip properly
-     * (they return the same items for every skip value).
+     * Now we paginate WITHIN each catalog (skip=0, 100, 200, …) until the
+     * addon returns fewer than 100 items, and return everything on page 1.
+     * Catalogs are fetched in parallel for speed.
      */
     private suspend fun getCatalogMainPage(catUrl: String, page: Int, request: MainPageRequest): HomePageResponse {
         val catalogs = getCatalogs(catUrl)
         if (catalogs.isEmpty()) return newHomePageResponse(emptyList<HomePageList>(), false)
 
-        // Reset dedup tracking on first page
-        if (page == 1) {
-            seenIdsPerRow.clear()
-        }
+        // Only load on page 1 — we eagerly fetch everything, so no further pages needed
+        if (page > 1) return newHomePageResponse(emptyList<HomePageList>(), false)
 
-        val skip = (page - 1) * 100
-        val lists = mutableListOf<HomePageList>()
-        var anyHasMore = false
-
-        catalogs.forEach { catalog ->
+        // Fetch all catalogs in parallel
+        val lists = catalogs.amap { catalog ->
             val rowName = catalog.name ?: catalog.id
-            val seenIds = seenIdsPerRow.getOrPut(rowName) { mutableSetOf() }
             val entries = mutableListOf<SearchResponse>()
-            var totalNewItems = 0
+            val seenIds = mutableSetOf<String>()
 
             catalog.types.forEach { type ->
-                val url = if (skip == 0) {
-                    "$catUrl/catalog/${type}/${catalog.id}.json"
-                } else {
-                    "$catUrl/catalog/${type}/${catalog.id}/skip=$skip.json"
-                }
-                try {
-                    val res = app.get(url, timeout = 120L).parsedSafe<CatalogResponse>()
-                    if (!res?.metas.isNullOrEmpty()) {
-                        res!!.metas!!.forEach { entry ->
-                            // Deduplicate: skip items we've already seen for this row
-                            if (seenIds.add(entry.id)) {
-                                entries.add(entry.toSearchResponse(this))
-                                totalNewItems++
-                            }
-                        }
-                        // If a type returned 100 items, there might be more on the next page
-                        if (res.metas!!.size >= 100) anyHasMore = true
+                var skip = 0
+                var hasMore = true
+
+                while (hasMore && entries.size < MAX_ITEMS_PER_CATALOG) {
+                    val url = if (skip == 0) {
+                        "$catUrl/catalog/${type}/${catalog.id}.json"
+                    } else {
+                        "$catUrl/catalog/${type}/${catalog.id}/skip=$skip.json"
                     }
-                } catch (_: Exception) { }
+                    try {
+                        val res = app.get(url, timeout = CATALOG_TIMEOUT).parsedSafe<CatalogResponse>()
+                        if (!res?.metas.isNullOrEmpty()) {
+                            res!!.metas!!.forEach { entry ->
+                                if (seenIds.add(entry.id)) {
+                                    entries.add(entry.toSearchResponse(this))
+                                }
+                            }
+                            if (res.metas!!.size < 100) {
+                                hasMore = false // Less than 100 means last page
+                            } else {
+                                skip += 100
+                            }
+                        } else {
+                            hasMore = false
+                        }
+                    } catch (_: Exception) {
+                        hasMore = false
+                    }
+                }
             }
 
-            if (entries.isNotEmpty()) {
-                lists.add(HomePageList(rowName, entries))
-            }
-        }
+            if (entries.isNotEmpty()) rowName to entries else null
+        }.filterNotNull().map { (name, entries) -> HomePageList(name, entries) }
 
-        // If no new items were found across all catalogs, there's nothing more to load
-        val allEntriesCount = lists.sumOf { it.list.size }
-        if (allEntriesCount == 0 && page > 1) {
-            return newHomePageResponse(emptyList<HomePageList>(), false)
-        }
-
-        return newHomePageResponse(lists, anyHasMore)
+        // hasNextPage = false because we already loaded everything eagerly
+        return newHomePageResponse(lists, false)
     }
 
+    /**
+     * [FIX-2] Optimized loadFromCatalog:
+     * - If the CatalogEntry already has videos (from the serialized search data),
+     *   use it directly and skip the redundant meta fetch.
+     * - For IPTV content (xt_ IDs) that has no videos, also skip the meta fetch
+     *   since the catalog entry already has enough info for a movie/channel response.
+     */
     private suspend fun loadFromCatalog(catUrl: String, url: String): LoadResponse {
         val res: CatalogEntry = if (url.startsWith("{")) {
             parseJson(url)
@@ -269,32 +295,38 @@ class SectionProvider(
             parseJson(metaJson)
         }
 
+        // [FIX-2] If the entry already has videos, we can build the LoadResponse
+        // directly without fetching the meta endpoint again. This saves one full
+        // HTTP round-trip for series that include episode lists in catalog data.
+        // Also skip for IPTV channels/movies (no videos needed).
+        if (res.videos != null || isIptvContent(res.id)) {
+            return res.toLoadResponse(this, res.id)
+        }
+
+        // Fallback: fetch full meta from the addon (or Cinemeta for IMDB/TMDB IDs)
         val catUrlFixed = if ((res.type == "movie" || res.type == "series") && isImdborTmdb(res.id))
             CINEMETA_URL else catUrl
-
         val encodedId = URLEncoder.encode(res.id, "UTF-8")
         val response = app.get("$catUrlFixed/meta/${res.type}/$encodedId.json")
             .parsedSafe<CatalogResponse>()
             ?: throw RuntimeException("Failed to load meta")
-
         val entry = response.meta ?: response.metas?.firstOrNull { it.id == res.id }
             ?: response.metas?.firstOrNull()
             ?: throw RuntimeException("Meta not found")
-
         return entry.toLoadResponse(this, res.id)
     }
 
+    /**
+     * [FIX-2] Reduced timeout from 120s to 15s.
+     * IPTV streams should resolve quickly — 120s just meant the user stared
+     * at a loading spinner for up to 2 minutes on failure.
+     */
     private suspend fun invokeCatalogStream(
-        catUrl: String,
-        loadData: LoadData,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
+        catUrl: String, loadData: LoadData,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
         val encodedId = URLEncoder.encode(loadData.id, "UTF-8")
-        val request = app.get(
-            "$catUrl/stream/${loadData.type}/$encodedId.json",
-            timeout = 120L
-        )
+        val request = app.get("$catUrl/stream/${loadData.type}/$encodedId.json", timeout = STREAM_TIMEOUT)
         if (request.isSuccessful) {
             val res = request.parsedSafe<StreamsResponse>()
             res?.streams?.forEach { stream ->
@@ -304,10 +336,8 @@ class SectionProvider(
     }
 
     private suspend fun invokeStreamAddon(
-        addon: StreamAddonConfig,
-        loadData: LoadData,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
+        addon: StreamAddonConfig, loadData: LoadData,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
         if (addon.url.isBlank()) return
         val fixUrl = addon.url.fixSourceUrl()
@@ -318,7 +348,7 @@ class SectionProvider(
             "$fixUrl/stream/series/$imdbId:${loadData.season}:${loadData.episode}.json"
         }
         try {
-            val res = app.get(url, timeout = 120L).parsedSafe<StreamsResponse>()
+            val res = app.get(url, timeout = STREAM_TIMEOUT).parsedSafe<StreamsResponse>()
             res?.streams?.forEach { stream ->
                 stream.runCallback(TRACKER_LIST_URL, subtitleCallback, callback)
             }
@@ -338,12 +368,10 @@ class SectionProvider(
     private suspend fun getTmdbMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val adultQuery = if (settingsForProvider.enableAdult) "" else "&without_keywords=190370|13059|226161|195669|190370"
         val type = if (request.data.contains("/movie")) "movie" else "tv"
-
         val home = app.get("${request.data}$adultQuery&page=$page")
             .parsedSafe<TmdbResults>()?.results?.mapNotNull { media ->
                 media.toSearchResponse(this, type)
             } ?: throw ErrorLoadingException("Invalid Json response")
-
         return newHomePageResponse(request.name, home)
     }
 
@@ -358,7 +386,6 @@ class SectionProvider(
     private suspend fun loadFromTmdb(url: String): LoadResponse {
         val data = parseJson<TmdbData>(url)
         val type = getType(data.type)
-
         val res = app.get(
             if (type == TvType.Movie) {
                 "$TMDB_API/movie/${data.id}?api_key=$API_KEY&language=en&append_to_response=keywords,credits,external_ids,videos,recommendations"
@@ -376,7 +403,6 @@ class SectionProvider(
         val isAnime = genres?.contains("Animation") == true && (res.original_language == "zh" || res.original_language == "ja")
         val keywords = res.keywords?.results?.mapNotNull { it.name }.orEmpty()
             .ifEmpty { res.keywords?.keywords?.mapNotNull { it.name } }
-
         val actors = res.credits?.cast?.mapNotNull { cast ->
             ActorData(
                 Actor(cast.name ?: cast.originalName ?: return@mapNotNull null, getImageUrl(cast.profilePath)),
@@ -454,9 +480,7 @@ class SectionProvider(
     // ── TMDB data classes ──
 
     data class TmdbData(val id: Int? = null, val type: String? = null)
-
     data class TmdbResults(@JsonProperty("results") val results: ArrayList<TmdbMedia>? = arrayListOf())
-
     data class TmdbMedia(
         @JsonProperty("id") val id: Int? = null,
         @JsonProperty("name") val name: String? = null,
@@ -539,7 +563,6 @@ class SectionProvider(
         @JsonProperty("episode_number") val episode_number: Int? = null,
         @JsonProperty("season_number") val season_number: Int? = null,
     )
-
 }
 
 // ── Catalog data classes ──
@@ -566,12 +589,6 @@ data class Catalog(
         return hasSearchInExtra || hasSearchInExtraSupported
     }
 
-    /**
-     * UNLIMITED search pagination — no artificial caps.
-     * Uses skip=N to paginate through all search results.
-     * Stops only when the addon returns fewer items than a full page.
-     * Deduplicates by entry ID to handle addons that don't support skip.
-     */
     suspend fun search(query: String, catUrl: String, provider: SectionProvider): List<SearchResponse> {
         val entries = mutableListOf<SearchResponse>()
         val seenIds = mutableSetOf<String>()
@@ -586,8 +603,7 @@ data class Catalog(
                     "$catUrl/catalog/${type}/$id/search=$encodedQuery/skip=$skip.json"
                 }
                 try {
-                    val res = app.get(url, timeout = 120L)
-                        .parsedSafe<CatalogResponse>()
+                    val res = app.get(url, timeout = 30L).parsedSafe<CatalogResponse>()
                     if (res?.metas.isNullOrEmpty()) {
                         hasMore = false
                     } else {
@@ -599,13 +615,9 @@ data class Catalog(
                             }
                         }
                         skip += res?.metas?.size ?: 0
-                        // Stop if we got no new unique items (addon doesn't support skip)
-                        // or if we got fewer than a full page (no more results)
                         if (newItems == 0 || (res?.metas?.size ?: 0) < 100) hasMore = false
                     }
-                } catch (_: Exception) {
-                    hasMore = false
-                }
+                } catch (_: Exception) { hasMore = false }
             }
         }
         return entries
