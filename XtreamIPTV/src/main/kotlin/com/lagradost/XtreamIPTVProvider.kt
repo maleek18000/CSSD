@@ -759,6 +759,19 @@ class XtreamIPTVProvider : MainAPI() {
         // Only serve page 1 — we don't paginate
         if (page > 1) return null
 
+        try {
+            return getMainPageInternal(page, request)
+        } catch (_: Throwable) {
+            // OOM or other crash — return null to show empty page instead of black screen
+            return null
+        }
+    }
+
+    private suspend fun getMainPageInternal(page: Int, request: MainPageRequest): HomePageResponse? {
+        val url = cleanUrl()
+        if (url.isEmpty() || url == "http://example.com/username/password") return null
+        if (page > 1) return null
+
         val lists = mutableListOf<HomePageList>()
         val catFilter = parseCategoryFilter()
 
@@ -769,7 +782,6 @@ class XtreamIPTVProvider : MainAPI() {
             if (lists.isNotEmpty()) return newHomePageResponse(lists, false)
         }
         if (hasXtreamCache()) {
-            // Build ONLY category cards from cache — no featured rows (more stable)
             buildCategoryHomePage(cachedXtreamVodCats, cachedXtreamSeriesCats, cachedXtreamLiveCats, catFilter, lists)
             if (lists.isNotEmpty()) return newHomePageResponse(lists, false)
         }
@@ -807,10 +819,8 @@ class XtreamIPTVProvider : MainAPI() {
 
                 if (lists.isNotEmpty()) {
                     val response = newHomePageResponse(lists, false)
-
-                    // Fire-and-forget: preload a few categories' streams for search
-                    preloadCategoriesInBackground(c)
-
+                    // NOTE: Background preload disabled to prevent memory issues.
+                    // Search will use on-demand per-category loading instead.
                     return response
                 }
             }
@@ -1110,17 +1120,43 @@ class XtreamIPTVProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════
 
     override suspend fun load(url: String): LoadResponse? {
-        // Try M3U mode first
-        val ref = tryParseJson<EntryRef>(url)
-        if (ref != null) {
-            return loadM3UEntry(ref)
+        // ═══════════════════════════════════════════════════════════════
+        //  IMPORTANT: Gson false-matching prevention
+        //
+        //  tryParseJson<EntryRef>(itemRefJson) returns a BROKEN EntryRef
+        //  with all null fields (Gson creates the object even though no
+        //  JSON keys match EntryRef fields). The object is non-null, so
+        //  the `!= null` check passes, and we enter the wrong handler.
+        //
+        //  Fix: Check for specific JSON keys BEFORE parsing to determine
+        //  which data class the JSON actually represents.
+        //
+        //  EntryRef JSON keys: "url", "type", "group"  (M3U mode)
+        //  ItemRef  JSON keys: "t", "id", "n"          (Xtream category pages)
+        //  LinkData JSON keys: "t", "id" (no "n")      (Xtream direct play)
+        // ═══════════════════════════════════════════════════════════════
+
+        // EntryRef: has "url" and "group" keys (unique to M3U entries)
+        if (url.contains("\"url\"") && url.contains("\"group\"")) {
+            val ref = tryParseJson<EntryRef>(url)
+            if (ref != null && ref.type != null) {
+                return loadM3UEntry(ref)
+            }
         }
 
-        // Try Xtream API mode
-        val itemRef = tryParseJson<ItemRef>(url)
-        if (itemRef != null) {
-            return loadXtreamEntry(itemRef)
+        // ItemRef: has "t", "id", and "n" keys (from Xtream category pages)
+        if (url.contains("\"t\"") && url.contains("\"id\"") && url.contains("\"n\"")) {
+            val itemRef = tryParseJson<ItemRef>(url)
+            if (itemRef != null) {
+                return loadXtreamEntry(itemRef)
+            }
         }
+
+        // Fallback: try parsing without key detection
+        val ref = tryParseJson<EntryRef>(url)
+        if (ref != null && ref.type != null) return loadM3UEntry(ref)
+        val itemRef = tryParseJson<ItemRef>(url)
+        if (itemRef != null) return loadXtreamEntry(itemRef)
 
         return null
     }
@@ -1385,25 +1421,45 @@ class XtreamIPTVProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Try M3U entry first
-        val m3uRef = tryParseJson<EntryRef>(data)
-        if (m3uRef != null) {
-            return loadM3ULinks(m3uRef, callback)
+        // ═══════════════════════════════════════════════════════════════
+        //  IMPORTANT: Gson false-matching prevention
+        //
+        //  tryParseJson<EntryRef>(itemRefJson) returns a BROKEN EntryRef
+        //  with all null fields — the object is non-null so the `!= null`
+        //  check passes, entering the WRONG handler. This is the root cause
+        //  of "no link found" — loadM3ULinks() receives a broken EntryRef
+        //  with null `type` field, crashes, and CloudStream shows the error.
+        //
+        //  Fix: Use JSON key detection to route to the correct parser.
+        //
+        //  EntryRef: "url" + "group"  (M3U entries)
+        //  ItemRef:  "t" + "id" + "n"  (Xtream category page items)
+        //  LinkData: "t" + "id" (no "n") (Xtream direct play links)
+        // ═══════════════════════════════════════════════════════════════
+
+        // EntryRef: has "url" and "group" keys (M3U mode)
+        if (data.contains("\"url\"") && data.contains("\"group\"")) {
+            val ref = tryParseJson<EntryRef>(data)
+            if (ref != null && ref.type != null) {
+                return loadM3ULinks(ref, callback)
+            }
         }
 
-        // Try Xtream LinkData (direct play links)
-        val xtRef = tryParseJson<LinkData>(data)
-        if (xtRef != null) {
-            return loadXtreamLinks(xtRef, callback)
+        // ItemRef: has "t", "id", AND "n" keys (from category pages)
+        // MUST check BEFORE LinkData because they share "t" and "id"
+        if (data.contains("\"t\"") && data.contains("\"id\"") && data.contains("\"n\"")) {
+            val itemRef = tryParseJson<ItemRef>(data)
+            if (itemRef != null) {
+                return loadItemRefLinks(itemRef, callback)
+            }
         }
 
-        // Try ItemRef (series/movie/live from category page — expand into playable links)
-        // When a user clicks a series in a category page, CloudStream calls loadLinks()
-        // because the series was wrapped as an "episode" in a TvSeriesLoadResponse.
-        // We need to fetch the series info and return all its episode links.
-        val itemRef = tryParseJson<ItemRef>(data)
-        if (itemRef != null) {
-            return loadItemRefLinks(itemRef, callback)
+        // LinkData: has "t" and "id" but NO "n" key (direct play links)
+        if (data.contains("\"t\"") && data.contains("\"id\"")) {
+            val xtRef = tryParseJson<LinkData>(data)
+            if (xtRef != null) {
+                return loadXtreamLinks(xtRef, callback)
+            }
         }
 
         return false
