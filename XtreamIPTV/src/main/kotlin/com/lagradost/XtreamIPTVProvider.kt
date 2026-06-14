@@ -749,6 +749,10 @@ class XtreamIPTVProvider : MainAPI() {
 
     /**
      * Build expanded content rows for categories matching the URL filter (~).
+     * When user adds ~FRENCH~DOCUMENTARY to the URL, this fetches actual stream
+     * cards for categories whose name contains "FRENCH" or "DOCUMENTARY" and
+     * adds them as separate rows on the home page — each matching category
+     * becomes its own row with clickable content cards.
      */
     private suspend fun buildExpandedCategoryRows(
         c: Cfg,
@@ -896,7 +900,7 @@ class XtreamIPTVProvider : MainAPI() {
         if (page > 1) return null
 
         val lists = mutableListOf<HomePageList>()
-        val expandFilter = parseCategoryFilter()
+        val catFilter = parseCategoryFilter()
 
         // ── Return from cache if already loaded (instant, no network) ──
         val cached = cachedM3U
@@ -905,11 +909,11 @@ class XtreamIPTVProvider : MainAPI() {
             if (lists.isNotEmpty()) return newHomePageResponse(lists, false)
         }
         if (hasXtreamCache()) {
-            buildCategoryHomePage(cachedXtreamVodCats, cachedXtreamSeriesCats, cachedXtreamLiveCats, expandFilter, lists)
-            if (expandFilter != null) {
+            buildCategoryHomePage(cachedXtreamVodCats, cachedXtreamSeriesCats, cachedXtreamLiveCats, catFilter, lists)
+            if (catFilter != null) {
                 val c = cfg()
                 if (c != null) {
-                    buildExpandedCategoryRows(c, cachedXtreamVodCats, cachedXtreamSeriesCats, cachedXtreamLiveCats, expandFilter, lists)
+                    buildExpandedCategoryRows(c, cachedXtreamVodCats, cachedXtreamSeriesCats, cachedXtreamLiveCats, catFilter, lists)
                 }
             }
             if (lists.isNotEmpty()) return newHomePageResponse(lists, false)
@@ -944,9 +948,11 @@ class XtreamIPTVProvider : MainAPI() {
                 liveCatsText?.let { cachedXtreamLiveCats = it }
 
                 // Build category cards only — consistent layout every time
-                buildCategoryHomePage(vodCatsText, seriesCatsText, liveCatsText, expandFilter, lists)
-                if (expandFilter != null) {
-                    buildExpandedCategoryRows(c, vodCatsText, seriesCatsText, liveCatsText, expandFilter, lists)
+                buildCategoryHomePage(vodCatsText, seriesCatsText, liveCatsText, catFilter, lists)
+
+                // Build expanded content rows for categories matching the ~ filter
+                if (catFilter != null) {
+                    buildExpandedCategoryRows(c, vodCatsText, seriesCatsText, liveCatsText, catFilter, lists)
                 }
 
                 if (lists.isNotEmpty()) {
