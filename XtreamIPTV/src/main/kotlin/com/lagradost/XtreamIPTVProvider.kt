@@ -79,7 +79,9 @@ data class XtreamFetchResult(
     val vodCatsText: String?,
     val seriesCatsText: String?,
     val liveCatsText: String?
-)
+) {
+    fun hasAnyData(): Boolean = !vodStreams.isNullOrEmpty() || !seriesList.isNullOrEmpty() || !liveStreams.isNullOrEmpty()
+}
 
 // ═══════════════════════════════════════════════════════════════════
 //  RAW HTTP CLIENT  (bypasses CloudStream's app.get to avoid 403)
@@ -464,6 +466,9 @@ class XtreamIPTVProvider : MainAPI() {
     private var cachedXtreamVod: List<XVod>? = null
     private var cachedXtreamSeries: List<XSeries>? = null
     private var cachedXtreamLive: List<XLive>? = null
+    private var cachedXtreamVodCats: String? = null
+    private var cachedXtreamSeriesCats: String? = null
+    private var cachedXtreamLiveCats: String? = null
 
     // ═══════════════════════════════════════════════════════════════════
     //  XTREAM API HELPERS
@@ -501,11 +506,29 @@ class XtreamIPTVProvider : MainAPI() {
         }
     }
 
-    /** Cache Xtream results for search. */
+    /** Cache Xtream results for search and home page reuse. */
     private fun cacheXtreamResult(result: XtreamFetchResult) {
         result.vodStreams?.let { cachedXtreamVod = it }
         result.seriesList?.let { cachedXtreamSeries = it }
         result.liveStreams?.let { cachedXtreamLive = it }
+        result.vodCatsText?.let { cachedXtreamVodCats = it }
+        result.seriesCatsText?.let { cachedXtreamSeriesCats = it }
+        result.liveCatsText?.let { cachedXtreamLiveCats = it }
+    }
+
+    /** Check if Xtream data is already cached — return true if we can rebuild the home page from cache. */
+    private fun hasXtreamCache(): Boolean {
+        return (cachedXtreamVod != null || cachedXtreamSeries != null || cachedXtreamLive != null)
+    }
+
+    /** Build home page from cached Xtream data. */
+    private fun buildXtreamHomePageFromCache(catFilter: List<String>?, lists: MutableList<HomePageList>): Boolean {
+        val result = XtreamFetchResult(
+            cachedXtreamVod, cachedXtreamSeries, cachedXtreamLive,
+            cachedXtreamVodCats, cachedXtreamSeriesCats, cachedXtreamLiveCats
+        )
+        buildXtreamHomePage(result, catFilter, lists)
+        return lists.isNotEmpty()
     }
 
     /** Build home page lists from Xtream API data. */
@@ -625,61 +648,91 @@ class XtreamIPTVProvider : MainAPI() {
         if (url.isEmpty() || url == "http://example.com/username/password") return null
 
         val lists = mutableListOf<HomePageList>()
+        val catFilter = parseCategoryFilter()
 
-        // ── Return from cache if already loaded ──
+        // ── Return from cache if already loaded (instant, no network) ──
         val cached = cachedM3U
         if (cached != null && cached.isNotEmpty()) {
             buildM3UHomePage(cached, lists)
             if (lists.isNotEmpty()) return newHomePageResponse(lists, false)
         }
+        if (hasXtreamCache()) {
+            if (buildXtreamHomePageFromCache(catFilter, lists)) {
+                return newHomePageResponse(lists, false)
+            }
+        }
 
         val c = cfg()
-        val catFilter = parseCategoryFilter()
 
-        // ── Run M3U streaming download and Xtream API in parallel ──
-        // Both start at the same time so Xtream is ready instantly if M3U fails.
-        return coroutineScope {
-            val m3uDeferred = async { downloadAndParseM3U(url) }
-            val xtreamDeferred = if (c != null) async { fetchXtreamData(c) } else null
+        // ═════════════════════════════════════════════════════════════════
+        //  STRATEGY: Xtream API first (fast, seconds) → M3U background
+        //
+        //  Xtream API = 6 small JSON calls (~2-5 seconds total)
+        //  M3U download = one huge file (~30-80 seconds, can OOM)
+        //
+        //  Show catalogs instantly from Xtream API, then silently
+        //  download M3U in background to upgrade the cache for
+        //  next time (M3U has richer data for search/series).
+        // ═════════════════════════════════════════════════════════════════
 
-            // ── Try M3U streaming download first (memory-safe for huge playlists) ──
-            var m3uEntries = m3uDeferred.await()
-
-            // ── Fallback: try string-based M3U download if streaming returned nothing ──
-            // Some servers don't work well with the streaming parser — the old approach
-            // catches those cases. Catch Throwable to survive OOM on huge files.
-            if (m3uEntries == null || m3uEntries.isEmpty()) {
-                try {
-                    val m3uText = withTimeoutOrNull(80000L) {
-                        RawHttp.get(url, readTimeout = 60000)
-                    }
-                    if (m3uText != null && (m3uText.startsWith("#EXTM3U") || m3uText.startsWith("#EXTINF"))) {
-                        m3uEntries = parseM3U(m3uText)
-                    }
-                } catch (_: Throwable) { /* OOM or other — skip */ }
-            }
-
-            if (m3uEntries != null && m3uEntries.isNotEmpty()) {
-                cachedM3U = m3uEntries
-                // Cache Xtream data for search (don't block if it fails)
-                xtreamDeferred?.let { job ->
-                    try { job.await()?.let { xt -> cacheXtreamResult(xt) } } catch (_: Exception) {}
-                }
-                lists.clear()
-                buildM3UHomePage(m3uEntries, lists)
-                if (lists.isNotEmpty()) return@coroutineScope newHomePageResponse(lists, false)
-            }
-
-            // ── Both M3U approaches failed → use Xtream API results (already running in parallel) ──
-            val xtreamResult = try { xtreamDeferred?.await() } catch (_: Exception) { null }
-            if (xtreamResult != null) {
+        // ── Step 1: Try Xtream API (FAST — returns in seconds) ──
+        if (c != null) {
+            val xtreamResult = fetchXtreamData(c)
+            if (xtreamResult != null && xtreamResult.hasAnyData()) {
                 cacheXtreamResult(xtreamResult)
                 buildXtreamHomePage(xtreamResult, catFilter, lists)
-                if (lists.isNotEmpty()) return@coroutineScope newHomePageResponse(lists, false)
+                if (lists.isNotEmpty()) {
+                    // Show catalogs now — don't make the user wait for M3U.
+                    // Download M3U in the background to populate the cache
+                    // for next app launch / richer search.
+                    val m3uUrl = url
+                    coroutineScope {
+                        async(Dispatchers.IO) {
+                            try {
+                                val m3uEntries = downloadAndParseM3U(m3uUrl)
+                                if (m3uEntries != null && m3uEntries.isNotEmpty()) {
+                                    cachedM3U = m3uEntries
+                                } else {
+                                    // Streaming parser failed — try string-based fallback
+                                    try {
+                                        val m3uText = RawHttp.get(m3uUrl, readTimeout = 60000)
+                                        if (m3uText != null && (m3uText.startsWith("#EXTM3U") || m3uText.startsWith("#EXTINF"))) {
+                                            val entries = parseM3U(m3uText)
+                                            if (entries.isNotEmpty()) cachedM3U = entries
+                                        }
+                                    } catch (_: Throwable) { /* OOM — skip */ }
+                                }
+                            } catch (_: Exception) {}
+                        }
+                    }
+                    return newHomePageResponse(lists, false)
+                }
             }
-
-            if (lists.isEmpty()) null else newHomePageResponse(lists, false)
         }
+
+        // ── Step 2: Xtream API failed or unavailable → try M3U (slower) ──
+        var m3uEntries = downloadAndParseM3U(url)
+
+        // Fallback: string-based M3U download if streaming returned nothing
+        if (m3uEntries == null || m3uEntries.isEmpty()) {
+            try {
+                val m3uText = withTimeoutOrNull(80000L) {
+                    RawHttp.get(url, readTimeout = 60000)
+                }
+                if (m3uText != null && (m3uText.startsWith("#EXTM3U") || m3uText.startsWith("#EXTINF"))) {
+                    m3uEntries = parseM3U(m3uText)
+                }
+            } catch (_: Throwable) { /* OOM or other — skip */ }
+        }
+
+        if (m3uEntries != null && m3uEntries.isNotEmpty()) {
+            cachedM3U = m3uEntries
+            lists.clear()
+            buildM3UHomePage(m3uEntries, lists)
+            if (lists.isNotEmpty()) return newHomePageResponse(lists, false)
+        }
+
+        return if (lists.isEmpty()) null else newHomePageResponse(lists, false)
     }
 
     /**
