@@ -614,18 +614,14 @@ class XtreamIPTVProvider : MainAPI() {
                 val encPass = URLEncoder.encode(c.pass, "UTF-8")
                 val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
 
-                // Load first few VOD categories
+                // Load a few VOD categories for search
                 val vodCats = cachedXtreamVodCats?.let { tryParseJson<List<XCat>>(it) } ?: emptyList()
-                for (cat in vodCats.take(10)) {
+                for (cat in vodCats.take(5)) {
                     val catId = cat.category_id ?: continue
                     val key = "v_$catId"
                     if (cachedCatStreams.containsKey(key)) continue
                     if (cachedCatStreams.size >= MAX_CACHED_CATEGORIES) break
-
-                    // Memory guard — check before each fetch
-                    val rt = Runtime.getRuntime()
-                    val freeMB = (rt.maxMemory() - (rt.totalMemory() - rt.freeMemory())) / (1024 * 1024)
-                    if (freeMB < 10) break
+                    if (!enoughMemory()) break
 
                     try {
                         val text = RawHttp.apiGet("$apiBase&action=get_vod_streams&category_id=$catId", 15000)
@@ -637,17 +633,15 @@ class XtreamIPTVProvider : MainAPI() {
                     } catch (_: Throwable) { break }
                 }
 
-                // Load first few series categories
+                // Load a few series categories for search
+                if (!enoughMemory()) return@launch
                 val serCats = cachedXtreamSeriesCats?.let { tryParseJson<List<XCat>>(it) } ?: emptyList()
-                for (cat in serCats.take(10)) {
+                for (cat in serCats.take(5)) {
                     val catId = cat.category_id ?: continue
                     val key = "s_$catId"
                     if (cachedCatStreams.containsKey(key)) continue
                     if (cachedCatStreams.size >= MAX_CACHED_CATEGORIES) break
-
-                    val rt = Runtime.getRuntime()
-                    val freeMB = (rt.maxMemory() - (rt.totalMemory() - rt.freeMemory())) / (1024 * 1024)
-                    if (freeMB < 10) break
+                    if (!enoughMemory()) break
 
                     try {
                         val text = RawHttp.apiGet("$apiBase&action=get_series&category_id=$catId", 15000)
@@ -659,17 +653,15 @@ class XtreamIPTVProvider : MainAPI() {
                     } catch (_: Throwable) { break }
                 }
 
-                // Load first few live categories
+                // Load a few live categories for search
+                if (!enoughMemory()) return@launch
                 val liveCats = cachedXtreamLiveCats?.let { tryParseJson<List<XCat>>(it) } ?: emptyList()
-                for (cat in liveCats.take(5)) {
+                for (cat in liveCats.take(3)) {
                     val catId = cat.category_id ?: continue
                     val key = "l_$catId"
                     if (cachedCatStreams.containsKey(key)) continue
                     if (cachedCatStreams.size >= MAX_CACHED_CATEGORIES) break
-
-                    val rt = Runtime.getRuntime()
-                    val freeMB = (rt.maxMemory() - (rt.totalMemory() - rt.freeMemory())) / (1024 * 1024)
-                    if (freeMB < 10) break
+                    if (!enoughMemory()) break
 
                     try {
                         val text = RawHttp.apiGet("$apiBase&action=get_live_streams&category_id=$catId", 15000)
@@ -681,9 +673,16 @@ class XtreamIPTVProvider : MainAPI() {
                     } catch (_: Throwable) { break }
                 }
             } catch (_: Throwable) {
-                // OOM or other — stop background loading
+                // OOM or other — stop background loading silently
             }
         }
+    }
+
+    /** Check if there's enough free memory to continue loading data. */
+    private fun enoughMemory(): Boolean {
+        val rt = Runtime.getRuntime()
+        val freeMB = (rt.maxMemory() - (rt.totalMemory() - rt.freeMemory())) / (1024 * 1024)
+        return freeMB >= 15
     }
 
     /** Check if Xtream categories are already cached — return true if we can rebuild the home page. */
@@ -691,12 +690,7 @@ class XtreamIPTVProvider : MainAPI() {
         return (cachedXtreamVodCats != null || cachedXtreamSeriesCats != null || cachedXtreamLiveCats != null)
     }
 
-    /** Build home page from cached Xtream categories. */
-    private fun buildXtreamHomePageFromCache(catFilter: List<String>?, lists: MutableList<HomePageList>): Boolean {
-        buildFeaturedFromCache(lists, catFilter)
-        buildCategoryHomePage(cachedXtreamVodCats, cachedXtreamSeriesCats, cachedXtreamLiveCats, catFilter, lists)
-        return lists.isNotEmpty()
-    }
+
 
     /**
      * Build home page from categories only — each category becomes a clickable card.
@@ -753,64 +747,7 @@ class XtreamIPTVProvider : MainAPI() {
         }
     }
 
-    /**
-     * Build featured rows from per-category stream cache.
-     * Shows actual content cards when available, not just category cards.
-     * Populated by background preloading and user browsing.
-     */
-    private fun buildFeaturedFromCache(lists: MutableList<HomePageList>, catFilter: List<String>?) {
-        val vodStreams = mutableListOf<XVod>()
-        val seriesStreams = mutableListOf<XSeries>()
-        val liveStreams = mutableListOf<XLive>()
 
-        for ((key, streams) in cachedCatStreams) {
-            when {
-                key.startsWith("v_") -> (streams as? List<XVod>)?.let { vodStreams.addAll(it) }
-                key.startsWith("s_") -> (streams as? List<XSeries>)?.let { seriesStreams.addAll(it) }
-                key.startsWith("l_") -> (streams as? List<XLive>)?.let { liveStreams.addAll(it) }
-            }
-        }
-
-        // Apply category filter if specified
-        val filteredVod = if (catFilter != null) {
-            vodStreams.filter { v -> catFilter.any { f -> v.name.contains(f, ignoreCase = true) } }
-        } else vodStreams
-
-        val filteredSeries = if (catFilter != null) {
-            seriesStreams.filter { s -> catFilter.any { f -> s.name.contains(f, ignoreCase = true) } }
-        } else seriesStreams
-
-        val filteredLive = if (catFilter != null) {
-            liveStreams.filter { l -> catFilter.any { f -> l.name.contains(f, ignoreCase = true) } }
-        } else liveStreams
-
-        if (filteredVod.isNotEmpty()) {
-            val items = filteredVod.take(20).map { s ->
-                newMovieSearchResponse(s.name, ItemRef("m", s.stream_id, s.name, s.container_extension ?: "mp4").toJson(), TvType.Movie) {
-                    posterUrl = s.stream_icon
-                }
-            }
-            lists.add(HomePageList("\uD83C\uDFAC Featured Movies", items))
-        }
-
-        if (filteredSeries.isNotEmpty()) {
-            val items = filteredSeries.take(20).map { s ->
-                newTvSeriesSearchResponse(s.name, ItemRef("s", s.series_id, s.name).toJson(), TvType.TvSeries) {
-                    posterUrl = s.cover
-                }
-            }
-            lists.add(HomePageList("\uD83C\uDFA6 Featured Series", items))
-        }
-
-        if (filteredLive.isNotEmpty()) {
-            val items = filteredLive.take(20).map { s ->
-                newMovieSearchResponse(s.name, ItemRef("l", s.stream_id, s.name).toJson(), TvType.Live) {
-                    posterUrl = s.stream_icon
-                }
-            }
-            lists.add(HomePageList("\uD83D\uDCE1 Live TV", items))
-        }
-    }
 
     // ═══════════════════════════════════════════════════════════════════
     //  HOME PAGE
@@ -819,6 +756,8 @@ class XtreamIPTVProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val url = cleanUrl()
         if (url.isEmpty() || url == "http://example.com/username/password") return null
+        // Only serve page 1 — we don't paginate
+        if (page > 1) return null
 
         val lists = mutableListOf<HomePageList>()
         val catFilter = parseCategoryFilter()
@@ -830,9 +769,9 @@ class XtreamIPTVProvider : MainAPI() {
             if (lists.isNotEmpty()) return newHomePageResponse(lists, false)
         }
         if (hasXtreamCache()) {
-            if (buildXtreamHomePageFromCache(catFilter, lists)) {
-                return newHomePageResponse(lists, false)
-            }
+            // Build ONLY category cards from cache — no featured rows (more stable)
+            buildCategoryHomePage(cachedXtreamVodCats, cachedXtreamSeriesCats, cachedXtreamLiveCats, catFilter, lists)
+            if (lists.isNotEmpty()) return newHomePageResponse(lists, false)
         }
 
         val c = cfg()
@@ -863,10 +802,7 @@ class XtreamIPTVProvider : MainAPI() {
                 seriesCatsText?.let { cachedXtreamSeriesCats = it }
                 liveCatsText?.let { cachedXtreamLiveCats = it }
 
-                // Build featured rows from per-category cache if available
-                buildFeaturedFromCache(lists, catFilter)
-
-                // Build category cards
+                // Build category cards only — consistent layout every time
                 buildCategoryHomePage(vodCatsText, seriesCatsText, liveCatsText, catFilter, lists)
 
                 if (lists.isNotEmpty()) {
@@ -1455,10 +1391,19 @@ class XtreamIPTVProvider : MainAPI() {
             return loadM3ULinks(m3uRef, callback)
         }
 
-        // Try Xtream entry
+        // Try Xtream LinkData (direct play links)
         val xtRef = tryParseJson<LinkData>(data)
         if (xtRef != null) {
             return loadXtreamLinks(xtRef, callback)
+        }
+
+        // Try ItemRef (series/movie/live from category page — expand into playable links)
+        // When a user clicks a series in a category page, CloudStream calls loadLinks()
+        // because the series was wrapped as an "episode" in a TvSeriesLoadResponse.
+        // We need to fetch the series info and return all its episode links.
+        val itemRef = tryParseJson<ItemRef>(data)
+        if (itemRef != null) {
+            return loadItemRefLinks(itemRef, callback)
         }
 
         return false
@@ -1621,5 +1566,79 @@ class XtreamIPTVProvider : MainAPI() {
             }
         }
         return true
+    }
+
+    /**
+     * Handle ItemRef from category pages.
+     *
+     * When a user clicks a category (e.g. "French Series"), the category's
+     * streams are shown as episodes in a TvSeriesLoadResponse. Clicking one
+     * of those "episodes" calls loadLinks() with the ItemRef data.
+     *
+     * For series: fetch series_info API and return all episode links.
+     * For movies: return the direct movie stream URL.
+     * For live: return the HLS + MPEG-TS stream URLs.
+     */
+    private suspend fun loadItemRefLinks(ref: ItemRef, callback: (ExtractorLink) -> Unit): Boolean {
+        val c = cfg() ?: return false
+        val streamHeaders = mapOf("User-Agent" to "okhttp/4.12.0")
+
+        when (ref.t) {
+            "s" -> {
+                // Series from category page — fetch series info, return all episode links
+                val apiBase = "${c.server}/player_api.php?username=${c.user}&password=${c.pass}"
+                val infoText = RawHttp.apiGet("$apiBase&action=get_series_info&series_id=${ref.id}", 15000)
+                if (infoText == null) return false
+                val info = tryParseJson<XSeriesInfo>(infoText) ?: return false
+                val epMap = info.episodes ?: return false
+                if (epMap.isEmpty()) return false
+
+                epMap.toSortedMap(compareBy { it.toIntOrNull() ?: 0 }).forEach { (_, eps) ->
+                    eps.sortedBy { it.episode_num }.forEach { ep ->
+                        val ext = ep.container_extension ?: "mp4"
+                        val label = "S${ep.season_num}E${ep.episode_num}" +
+                            (if (!ep.title.isNullOrBlank()) " - ${ep.title}" else "")
+                        callback(
+                            newExtractorLink(name, label, "${c.server}/series/${c.user}/${c.pass}/${ep.id}.$ext") {
+                                quality = Qualities.Unknown.value
+                                type = if (ext == "m3u8") ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                                headers = streamHeaders
+                            }
+                        )
+                    }
+                }
+                return true
+            }
+            "m" -> {
+                val ext = ref.e ?: "mp4"
+                callback(
+                    newExtractorLink(name, "Movie", "${c.server}/movie/${c.user}/${c.pass}/${ref.id}.$ext") {
+                        quality = Qualities.Unknown.value
+                        type = if (ext == "m3u8") ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        headers = streamHeaders
+                    }
+                )
+                return true
+            }
+            "l" -> {
+                val base = "${c.server}/live/${c.user}/${c.pass}/${ref.id}"
+                callback(
+                    newExtractorLink(name, "HLS", "$base.m3u8") {
+                        quality = Qualities.Unknown.value
+                        type = ExtractorLinkType.M3U8
+                        headers = streamHeaders
+                    }
+                )
+                callback(
+                    newExtractorLink(name, "MPEG-TS", "$base.ts") {
+                        quality = Qualities.Unknown.value
+                        type = ExtractorLinkType.VIDEO
+                        headers = streamHeaders
+                    }
+                )
+                return true
+            }
+        }
+        return false
     }
 }
