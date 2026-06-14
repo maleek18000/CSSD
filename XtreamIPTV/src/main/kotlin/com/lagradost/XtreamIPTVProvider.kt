@@ -699,15 +699,12 @@ class XtreamIPTVProvider : MainAPI() {
      */
     private fun buildCategoryHomePage(
         vodCatsText: String?, seriesCatsText: String?, liveCatsText: String?,
-        catFilter: List<String>?, lists: MutableList<HomePageList>
+        lists: MutableList<HomePageList>
     ) {
-        // Movie categories
+        // Movie categories — always show ALL category cards
         if (vodCatsText != null) {
             val cats = tryParseJson<List<XCat>>(vodCatsText) ?: emptyList()
-            val filtered = if (catFilter != null) cats.filter { cat ->
-                catFilter.any { f -> (cat.category_name ?: "").contains(f, ignoreCase = true) }
-            } else cats
-            val homeItems = filtered.map { cat ->
+            val homeItems = cats.map { cat ->
                 val ref = EntryRef("", "xtream_movie_cat", cat.category_name ?: "Movies", cat.category_id ?: "")
                 newMovieSearchResponse(cat.category_name ?: "Movies", ref.toJson(), TvType.Movie) {}
             }
@@ -716,13 +713,10 @@ class XtreamIPTVProvider : MainAPI() {
             }
         }
 
-        // Series categories
+        // Series categories — always show ALL category cards
         if (seriesCatsText != null) {
             val cats = tryParseJson<List<XCat>>(seriesCatsText) ?: emptyList()
-            val filtered = if (catFilter != null) cats.filter { cat ->
-                catFilter.any { f -> (cat.category_name ?: "").contains(f, ignoreCase = true) }
-            } else cats
-            val homeItems = filtered.map { cat ->
+            val homeItems = cats.map { cat ->
                 val ref = EntryRef("", "xtream_series_cat", cat.category_name ?: "Series", cat.category_id ?: "")
                 newTvSeriesSearchResponse(cat.category_name ?: "Series", ref.toJson(), TvType.TvSeries) {}
             }
@@ -731,13 +725,10 @@ class XtreamIPTVProvider : MainAPI() {
             }
         }
 
-        // Live TV categories
+        // Live TV categories — always show ALL category cards
         if (liveCatsText != null) {
             val cats = tryParseJson<List<XCat>>(liveCatsText) ?: emptyList()
-            val filtered = if (catFilter != null) cats.filter { cat ->
-                catFilter.any { f -> (cat.category_name ?: "").contains(f, ignoreCase = true) }
-            } else cats
-            val homeItems = filtered.map { cat ->
+            val homeItems = cats.map { cat ->
                 val ref = EntryRef("", "xtream_live_cat", cat.category_name ?: "Live TV", cat.category_id ?: "")
                 newMovieSearchResponse(cat.category_name ?: "Live TV", ref.toJson(), TvType.Live) {}
             }
@@ -749,10 +740,14 @@ class XtreamIPTVProvider : MainAPI() {
 
     /**
      * Build expanded content rows for categories matching the URL filter (~).
-     * When user adds ~FRENCH~DOCUMENTARY to the URL, this fetches actual stream
-     * cards for categories whose name contains "FRENCH" or "DOCUMENTARY" and
-     * adds them as separate rows on the home page — each matching category
-     * becomes its own row with clickable content cards.
+     *
+     * When the user adds ~FRENCH~DOCUMENTARY to the URL, this method
+     * finds all categories whose name contains "FRENCH" or "DOCUMENTARY",
+     * fetches their streams, and adds them as rows with actual content cards
+     * (not just category cards).
+     *
+     * This runs IN ADDITION to buildCategoryHomePage() — the category cards
+     * are still shown, but matching categories also get expanded content rows.
      */
     private suspend fun buildExpandedCategoryRows(
         c: Cfg,
@@ -783,7 +778,7 @@ class XtreamIPTVProvider : MainAPI() {
         } ?: emptyList()
 
         val totalCats = matchingVodCats.size + matchingSerCats.size + matchingLiveCats.size
-        if (totalCats == 0 || totalCats > 20) return
+        if (totalCats == 0) return
 
         try {
             coroutineScope {
@@ -909,11 +904,12 @@ class XtreamIPTVProvider : MainAPI() {
             if (lists.isNotEmpty()) return newHomePageResponse(lists, false)
         }
         if (hasXtreamCache()) {
-            buildCategoryHomePage(cachedXtreamVodCats, cachedXtreamSeriesCats, cachedXtreamLiveCats, catFilter, lists)
+            buildCategoryHomePage(cachedXtreamVodCats, cachedXtreamSeriesCats, cachedXtreamLiveCats, lists)
+            // If category filter specified, also expand matching categories into content rows
             if (catFilter != null) {
-                val c = cfg()
-                if (c != null) {
-                    buildExpandedCategoryRows(c, cachedXtreamVodCats, cachedXtreamSeriesCats, cachedXtreamLiveCats, catFilter, lists)
+                val cCfg = cfg()
+                if (cCfg != null) {
+                    buildExpandedCategoryRows(cCfg, cachedXtreamVodCats, cachedXtreamSeriesCats, cachedXtreamLiveCats, catFilter, lists)
                 }
             }
             if (lists.isNotEmpty()) return newHomePageResponse(lists, false)
@@ -948,9 +944,8 @@ class XtreamIPTVProvider : MainAPI() {
                 liveCatsText?.let { cachedXtreamLiveCats = it }
 
                 // Build category cards only — consistent layout every time
-                buildCategoryHomePage(vodCatsText, seriesCatsText, liveCatsText, catFilter, lists)
-
-                // Build expanded content rows for categories matching the ~ filter
+                buildCategoryHomePage(vodCatsText, seriesCatsText, liveCatsText, lists)
+                // If category filter specified, also expand matching categories into content rows
                 if (catFilter != null) {
                     buildExpandedCategoryRows(c, vodCatsText, seriesCatsText, liveCatsText, catFilter, lists)
                 }
