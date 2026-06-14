@@ -699,12 +699,15 @@ class XtreamIPTVProvider : MainAPI() {
      */
     private fun buildCategoryHomePage(
         vodCatsText: String?, seriesCatsText: String?, liveCatsText: String?,
-        lists: MutableList<HomePageList>
+        catFilter: List<String>?, lists: MutableList<HomePageList>
     ) {
         // Movie categories
         if (vodCatsText != null) {
             val cats = tryParseJson<List<XCat>>(vodCatsText) ?: emptyList()
-            val homeItems = cats.map { cat ->
+            val filtered = if (catFilter != null) cats.filter { cat ->
+                catFilter.any { f -> (cat.category_name ?: "").contains(f, ignoreCase = true) }
+            } else cats
+            val homeItems = filtered.map { cat ->
                 val ref = EntryRef("", "xtream_movie_cat", cat.category_name ?: "Movies", cat.category_id ?: "")
                 newMovieSearchResponse(cat.category_name ?: "Movies", ref.toJson(), TvType.Movie) {}
             }
@@ -716,7 +719,10 @@ class XtreamIPTVProvider : MainAPI() {
         // Series categories
         if (seriesCatsText != null) {
             val cats = tryParseJson<List<XCat>>(seriesCatsText) ?: emptyList()
-            val homeItems = cats.map { cat ->
+            val filtered = if (catFilter != null) cats.filter { cat ->
+                catFilter.any { f -> (cat.category_name ?: "").contains(f, ignoreCase = true) }
+            } else cats
+            val homeItems = filtered.map { cat ->
                 val ref = EntryRef("", "xtream_series_cat", cat.category_name ?: "Series", cat.category_id ?: "")
                 newTvSeriesSearchResponse(cat.category_name ?: "Series", ref.toJson(), TvType.TvSeries) {}
             }
@@ -728,7 +734,10 @@ class XtreamIPTVProvider : MainAPI() {
         // Live TV categories
         if (liveCatsText != null) {
             val cats = tryParseJson<List<XCat>>(liveCatsText) ?: emptyList()
-            val homeItems = cats.map { cat ->
+            val filtered = if (catFilter != null) cats.filter { cat ->
+                catFilter.any { f -> (cat.category_name ?: "").contains(f, ignoreCase = true) }
+            } else cats
+            val homeItems = filtered.map { cat ->
                 val ref = EntryRef("", "xtream_live_cat", cat.category_name ?: "Live TV", cat.category_id ?: "")
                 newMovieSearchResponse(cat.category_name ?: "Live TV", ref.toJson(), TvType.Live) {}
             }
@@ -896,7 +905,7 @@ class XtreamIPTVProvider : MainAPI() {
             if (lists.isNotEmpty()) return newHomePageResponse(lists, false)
         }
         if (hasXtreamCache()) {
-            buildCategoryHomePage(cachedXtreamVodCats, cachedXtreamSeriesCats, cachedXtreamLiveCats, lists)
+            buildCategoryHomePage(cachedXtreamVodCats, cachedXtreamSeriesCats, cachedXtreamLiveCats, expandFilter, lists)
             if (expandFilter != null) {
                 val c = cfg()
                 if (c != null) {
@@ -935,7 +944,7 @@ class XtreamIPTVProvider : MainAPI() {
                 liveCatsText?.let { cachedXtreamLiveCats = it }
 
                 // Build category cards only — consistent layout every time
-                buildCategoryHomePage(vodCatsText, seriesCatsText, liveCatsText, lists)
+                buildCategoryHomePage(vodCatsText, seriesCatsText, liveCatsText, expandFilter, lists)
                 if (expandFilter != null) {
                     buildExpandedCategoryRows(c, vodCatsText, seriesCatsText, liveCatsText, expandFilter, lists)
                 }
@@ -1589,9 +1598,7 @@ class XtreamIPTVProvider : MainAPI() {
     }
 
     private suspend fun loadM3ULinks(ref: EntryRef, callback: (ExtractorLink) -> Unit): Boolean {
-        val c = cfg()
-        val serverReferer = c?.let { "${it.server}/" } ?: ""
-        val streamHeaders = mapOf("User-Agent" to "okhttp/4.12.0", "Referer" to serverReferer)
+        val streamHeaders = mapOf("User-Agent" to "okhttp/4.12.0")
 
         // ── Series browse: clicked a series from category page ──
         // Return all episodes of this series as separate links
@@ -1703,8 +1710,7 @@ class XtreamIPTVProvider : MainAPI() {
 
     private suspend fun loadXtreamLinks(ld: LinkData, callback: (ExtractorLink) -> Unit): Boolean {
         val c = cfg() ?: return false
-        val serverReferer = "${c.server}/"
-        val streamHeaders = mapOf("User-Agent" to "okhttp/4.12.0", "Referer" to serverReferer)
+        val streamHeaders = mapOf("User-Agent" to "okhttp/4.12.0")
 
         when (ld.t) {
             "l" -> {
@@ -1763,8 +1769,7 @@ class XtreamIPTVProvider : MainAPI() {
      */
     private suspend fun loadItemRefLinks(ref: ItemRef, callback: (ExtractorLink) -> Unit): Boolean {
         val c = cfg() ?: return false
-        val serverReferer = "${c.server}/"
-        val streamHeaders = mapOf("User-Agent" to "okhttp/4.12.0", "Referer" to serverReferer)
+        val streamHeaders = mapOf("User-Agent" to "okhttp/4.12.0")
 
         when (ref.t) {
             "s" -> {
