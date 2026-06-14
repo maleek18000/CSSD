@@ -137,6 +137,9 @@ object RawHttp {
         } catch (_: Exception) { null }
     }
 
+    /** Maximum size (bytes) for an API response — prevents OOM on huge JSON. */
+    private const val MAX_API_RESPONSE_SIZE = 10 * 1024 * 1024  // 10 MB
+
     private fun fetch(url: String, userAgent: String, connectTimeout: Int, readTimeout: Int, extraHeaders: Map<String, String>): String? {
         val conn = URL(url).openConnection() as HttpURLConnection
         try {
@@ -155,6 +158,11 @@ object RawHttp {
             var line: String?
             while (reader.readLine().also { line = it } != null) {
                 sb.append(line).append("\n")
+                if (sb.length > MAX_API_RESPONSE_SIZE) {
+                    reader.close()
+                    conn.disconnect()
+                    return null  // response too large — abort to prevent OOM
+                }
             }
             reader.close()
             return sb.toString()
@@ -352,19 +360,37 @@ class XtreamIPTVProvider : MainAPI() {
 
     /**
      * Maximum M3U entries to parse — prevents OOM on huge playlists (50k+).
-     * Parse M3U from a BufferedReader line-by-line.
-     * Does NOT load the entire file into memory — prevents OOM on huge playlists.
-     * Returns partial results if the connection drops mid-download.
+     * Once this cap is reached the connection is closed immediately to avoid
+     * streaming hundreds of MB of unused data into memory.
      */
     private val MAX_M3U_ENTRIES = 10000
 
+    /**
+     * Parse M3U from a BufferedReader line-by-line.
+     * STOPS reading as soon as MAX_M3U_ENTRIES is reached and closes the reader,
+     * which kills the underlying HTTP connection — no more data streams in.
+     * Returns partial results if the connection drops mid-download.
+     */
     private fun parseM3UFromReader(reader: BufferedReader): List<M3UEntry> {
         val entries = mutableListOf<M3UEntry>()
         var currentInfLine: String? = null
 
         try {
-            reader.forEachLine { line ->
-                if (entries.size >= MAX_M3U_ENTRIES) return@forEachLine
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (entries.size >= MAX_M3U_ENTRIES) {
+                    reader.close()  // kill the connection — stop downloading
+                    break
+                }
+                // Memory guard: bail out before OOM if free memory drops below 4MB
+                if (entries.size % 500 == 0) {
+                    val rt = Runtime.getRuntime()
+                    val freeMB = (rt.maxMemory() - (rt.totalMemory() - rt.freeMemory())) / (1024 * 1024)
+                    if (freeMB < 4) {
+                        reader.close()
+                        break
+                    }
+                }
                 val trimmed = line.trim()
                 if (trimmed.startsWith("#EXTINF")) {
                     currentInfLine = trimmed
@@ -382,8 +408,8 @@ class XtreamIPTVProvider : MainAPI() {
                     entries.add(M3UEntry(name, group, logo, trimmed, detectedType, sName))
                 }
             }
-        } catch (_: Exception) {
-            // Partial download — return whatever we have so far
+        } catch (_: Throwable) {
+            // OOM or I/O error — return whatever we have so far
         }
 
         return entries
@@ -795,7 +821,12 @@ class XtreamIPTVProvider : MainAPI() {
         }
 
         // ── Step 2: Xtream API failed or unavailable → try M3U (streaming only) ──
-        var m3uEntries = downloadAndParseM3U(url)
+        var m3uEntries: List<M3UEntry>? = null
+        try {
+            m3uEntries = withTimeoutOrNull(30000L) {
+                downloadAndParseM3U(url)
+            }
+        } catch (_: Throwable) { /* OOM — skip */ }
 
         if (m3uEntries != null && m3uEntries.isNotEmpty()) {
             cachedM3U = m3uEntries
