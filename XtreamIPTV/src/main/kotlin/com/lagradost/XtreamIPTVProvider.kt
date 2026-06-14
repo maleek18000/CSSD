@@ -20,6 +20,7 @@ import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
+import java.net.URLDecoder
 import java.net.URLEncoder
 
 // ═══════════════════════════════════════════════════════════════════
@@ -202,8 +203,8 @@ class XtreamIPTVProvider : MainAPI() {
                     val kv = param.split("=", limit = 2)
                     if (kv.size == 2) {
                         when (kv[0].lowercase()) {
-                            "username" -> user = kv[1]
-                            "password" -> pass = kv[1]
+                            "username" -> user = URLDecoder.decode(kv[1], "UTF-8")
+                            "password" -> pass = URLDecoder.decode(kv[1], "UTF-8")
                         }
                     }
                 }
@@ -287,7 +288,7 @@ class XtreamIPTVProvider : MainAPI() {
      * Prevents OOM crashes on very large playlists (e.g. 300MB+).
      * Reads line by line from the HTTP connection and builds M3UEntry objects directly.
      */
-    private suspend fun downloadAndParseM3U(url: String, readTimeout: Int = 45000): List<M3UEntry>? = withContext(Dispatchers.IO) {
+    private suspend fun downloadAndParseM3U(url: String, readTimeout: Int = 60000): List<M3UEntry>? = withContext(Dispatchers.IO) {
         val uri = try { URI(url) } catch (_: Exception) { return@withContext null }
         val referer = "${uri.scheme}://${uri.host}/"
         val uas = listOf("okhttp/4.12.0", "IPTVSmarters/2", "TiviMate/4.7.0")
