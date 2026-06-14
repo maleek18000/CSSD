@@ -11,6 +11,8 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.BufferedReader
@@ -67,6 +69,7 @@ data class XEpInfo(val plot: String? = null, val image: String? = null)
 
 data class ItemRef(val t: String, val id: Int, val n: String, val e: String? = null)
 data class LinkData(val t: String, val id: Int, val e: String? = null)
+data class SixStrings(val a: String?, val b: String?, val c: String?, val d: String?, val e: String?, val f: String?)
 
 // ═══════════════════════════════════════════════════════════════════
 //  RAW HTTP CLIENT  (bypasses CloudStream's app.get to avoid 403)
@@ -418,12 +421,30 @@ class XtreamIPTVProvider : MainAPI() {
                 val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
                 val catFilter = parseCategoryFilter()
 
+                // ── Fetch all 6 API endpoints in parallel ──
+                val (vodStreamsText, seriesText, liveStreamsText,
+                     vodCatsText, seriesCatsText, liveCatsText) = coroutineScope {
+                    val vodDef = async { RawHttp.get("$apiBase&action=get_vod_streams", 15000) }
+                    val serDef = async { RawHttp.get("$apiBase&action=get_series", 15000) }
+                    val liveDef = async { RawHttp.get("$apiBase&action=get_live_streams", 15000) }
+                    val vodCatDef = async { RawHttp.get("$apiBase&action=get_vod_categories", 10000) }
+                    val serCatDef = async { RawHttp.get("$apiBase&action=get_series_categories", 10000) }
+                    val liveCatDef = async { RawHttp.get("$apiBase&action=get_live_categories", 10000) }
+                    SixStrings(vodDef.await(), serDef.await(), liveDef.await(),
+                               vodCatDef.await(), serCatDef.await(), liveCatDef.await())
+                }
+
+                // Parse streams
+                val vodStreams = if (vodStreamsText != null) tryParseJson<List<XVod>>(vodStreamsText) else null
+                val seriesList = if (seriesText != null) tryParseJson<List<XSeries>>(seriesText) else null
+                val liveStreams = if (liveStreamsText != null) tryParseJson<List<XLive>>(liveStreamsText) else null
+                if (vodStreams != null) cachedXtreamVod = vodStreams
+                if (seriesList != null) cachedXtreamSeries = seriesList
+                if (liveStreams != null) cachedXtreamLive = liveStreams
+
                 // Movies - featured row
-                val vodStreamsText = RawHttp.get("$apiBase&action=get_vod_streams", 15000)
-                if (vodStreamsText != null) {
-                    val streams = tryParseJson<List<XVod>>(vodStreamsText) ?: emptyList()
-                    cachedXtreamVod = streams
-                    val homeItems = streams.take(20).map { s ->
+                if (vodStreams != null) {
+                    val homeItems = vodStreams.take(20).map { s ->
                         newMovieSearchResponse(s.name, ItemRef("m", s.stream_id, s.name, s.container_extension ?: "mp4").toJson(), TvType.Movie) {
                             posterUrl = s.stream_icon
                         }
@@ -432,11 +453,8 @@ class XtreamIPTVProvider : MainAPI() {
                 }
 
                 // Series - featured row
-                val seriesText = RawHttp.get("$apiBase&action=get_series", 15000)
-                if (seriesText != null) {
-                    val series = tryParseJson<List<XSeries>>(seriesText) ?: emptyList()
-                    cachedXtreamSeries = series
-                    val homeItems = series.take(20).map { s ->
+                if (seriesList != null) {
+                    val homeItems = seriesList.take(20).map { s ->
                         newTvSeriesSearchResponse(s.name, ItemRef("s", s.series_id, s.name).toJson(), TvType.TvSeries) {
                             posterUrl = s.cover
                         }
@@ -445,11 +463,8 @@ class XtreamIPTVProvider : MainAPI() {
                 }
 
                 // Live - featured row
-                val liveStreamsText = RawHttp.get("$apiBase&action=get_live_streams", 15000)
-                if (liveStreamsText != null) {
-                    val streams = tryParseJson<List<XLive>>(liveStreamsText) ?: emptyList()
-                    cachedXtreamLive = streams
-                    val homeItems = streams.take(20).map { s ->
+                if (liveStreams != null) {
+                    val homeItems = liveStreams.take(20).map { s ->
                         newMovieSearchResponse(s.name, ItemRef("l", s.stream_id, s.name).toJson(), TvType.Live) {
                             posterUrl = s.stream_icon
                         }
@@ -461,12 +476,10 @@ class XtreamIPTVProvider : MainAPI() {
                 // No more category cards that show episodes — actual content in each row.
 
                 // Series categories — each category row has series cards
-                val seriesCatsText = RawHttp.get("$apiBase&action=get_series_categories", 10000)
-                if (seriesCatsText != null && seriesText != null) {
+                if (seriesCatsText != null && seriesList != null) {
                     val cats = tryParseJson<List<XCat>>(seriesCatsText) ?: emptyList()
-                    val series = tryParseJson<List<XSeries>>(seriesText) ?: emptyList()
                     val catNames = cats.associate { it.category_id to (it.category_name ?: "Series") }
-                    series.groupBy { it.category_id }
+                    seriesList.groupBy { it.category_id }
                         .mapNotNull { (catId, items) ->
                             val catName = catNames[catId] ?: return@mapNotNull null
                             catName to items
@@ -486,12 +499,10 @@ class XtreamIPTVProvider : MainAPI() {
                 }
 
                 // Movie categories — each category row has movie cards
-                val vodCatsText = RawHttp.get("$apiBase&action=get_vod_categories", 10000)
-                if (vodCatsText != null && vodStreamsText != null) {
+                if (vodCatsText != null && vodStreams != null) {
                     val cats = tryParseJson<List<XCat>>(vodCatsText) ?: emptyList()
-                    val streams = tryParseJson<List<XVod>>(vodStreamsText) ?: emptyList()
                     val catNames = cats.associate { it.category_id to (it.category_name ?: "Movies") }
-                    streams.groupBy { it.category_id }
+                    vodStreams.groupBy { it.category_id }
                         .mapNotNull { (catId, items) ->
                             val catName = catNames[catId] ?: return@mapNotNull null
                             catName to items
@@ -511,12 +522,10 @@ class XtreamIPTVProvider : MainAPI() {
                 }
 
                 // Live TV categories — each category row has channel cards
-                val liveCatsText = RawHttp.get("$apiBase&action=get_live_categories", 10000)
-                if (liveCatsText != null && liveStreamsText != null) {
+                if (liveCatsText != null && liveStreams != null) {
                     val cats = tryParseJson<List<XCat>>(liveCatsText) ?: emptyList()
-                    val streams = tryParseJson<List<XLive>>(liveStreamsText) ?: emptyList()
                     val catNames = cats.associate { it.category_id to (it.category_name ?: "Live TV") }
-                    streams.groupBy { it.category_id }
+                    liveStreams.groupBy { it.category_id }
                         .mapNotNull { (catId, items) ->
                             val catName = catNames[catId] ?: return@mapNotNull null
                             catName to items
