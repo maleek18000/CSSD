@@ -137,8 +137,8 @@ object RawHttp {
         } catch (_: Exception) { null }
     }
 
-    /** Maximum size (bytes) for an API response — prevents OOM on huge JSON. */
-    private const val MAX_API_RESPONSE_SIZE = 10 * 1024 * 1024  // 10 MB
+    /** Maximum size (chars) for an API response — prevents OOM on huge JSON. */
+    private const val MAX_API_RESPONSE_SIZE = 25 * 1024 * 1024  // 25 MB
 
     private fun fetch(url: String, userAgent: String, connectTimeout: Int, readTimeout: Int, extraHeaders: Map<String, String>): String? {
         val conn = URL(url).openConnection() as HttpURLConnection
@@ -159,9 +159,11 @@ object RawHttp {
             while (reader.readLine().also { line = it } != null) {
                 sb.append(line).append("\n")
                 if (sb.length > MAX_API_RESPONSE_SIZE) {
-                    reader.close()
+                    // Close connection to stop downloading, but return what we have.
+                    // tryParseJson may still parse a partial JSON array.
+                    try { reader.close() } catch (_: Exception) {}
                     conn.disconnect()
-                    return null  // response too large — abort to prevent OOM
+                    return sb.toString()
                 }
             }
             reader.close()
@@ -538,13 +540,13 @@ class XtreamIPTVProvider : MainAPI() {
      * call compared to cycling through 3 UAs.
      *
      * Connect timeout: 6s (enough for slow servers to accept connection)
-     * Read timeout: 12s streams / 8s categories (enough to receive data)
+     * Read timeout: 20s streams / 10s categories (enough for large JSON responses)
      * Total: first data should arrive in 1-3s on a normal server.
      */
     private suspend fun fetchXtreamData(
         c: Cfg,
-        streamReadTimeout: Int = 12000,
-        catReadTimeout: Int = 8000,
+        streamReadTimeout: Int = 20000,
+        catReadTimeout: Int = 10000,
         connectTimeout: Int = 6000
     ): XtreamFetchResult? {
         try {
