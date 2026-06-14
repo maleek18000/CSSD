@@ -642,8 +642,23 @@ class XtreamIPTVProvider : MainAPI() {
             val m3uDeferred = async { downloadAndParseM3U(url) }
             val xtreamDeferred = if (c != null) async { fetchXtreamData(c) } else null
 
-            // ── Try M3U first (primary source — has all data) ──
-            val m3uEntries = m3uDeferred.await()
+            // ── Try M3U streaming download first (memory-safe for huge playlists) ──
+            var m3uEntries = m3uDeferred.await()
+
+            // ── Fallback: try string-based M3U download if streaming returned nothing ──
+            // Some servers don't work well with the streaming parser — the old approach
+            // catches those cases. Catch Throwable to survive OOM on huge files.
+            if (m3uEntries == null || m3uEntries.isEmpty()) {
+                try {
+                    val m3uText = withTimeoutOrNull(80000L) {
+                        RawHttp.get(url, readTimeout = 60000)
+                    }
+                    if (m3uText != null && (m3uText.startsWith("#EXTM3U") || m3uText.startsWith("#EXTINF"))) {
+                        m3uEntries = parseM3U(m3uText)
+                    }
+                } catch (_: Throwable) { /* OOM or other — skip */ }
+            }
+
             if (m3uEntries != null && m3uEntries.isNotEmpty()) {
                 cachedM3U = m3uEntries
                 // Cache Xtream data for search (don't block if it fails)
@@ -655,7 +670,7 @@ class XtreamIPTVProvider : MainAPI() {
                 if (lists.isNotEmpty()) return@coroutineScope newHomePageResponse(lists, false)
             }
 
-            // ── M3U failed → use Xtream API results (already running in parallel) ──
+            // ── Both M3U approaches failed → use Xtream API results (already running in parallel) ──
             val xtreamResult = try { xtreamDeferred?.await() } catch (_: Exception) { null }
             if (xtreamResult != null) {
                 cacheXtreamResult(xtreamResult)
