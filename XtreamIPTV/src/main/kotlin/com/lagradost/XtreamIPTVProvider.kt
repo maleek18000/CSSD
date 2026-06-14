@@ -341,8 +341,8 @@ class XtreamIPTVProvider : MainAPI() {
                 reader.close()
                 conn.disconnect()
                 if (entries.isNotEmpty()) return@withContext entries
-            } catch (_: Exception) {
-                // try next user agent
+            } catch (_: Throwable) {
+                // OOM or other — try next user agent
             } finally {
                 conn?.disconnect()
             }
@@ -351,16 +351,20 @@ class XtreamIPTVProvider : MainAPI() {
     }
 
     /**
+     * Maximum M3U entries to parse — prevents OOM on huge playlists (50k+).
      * Parse M3U from a BufferedReader line-by-line.
      * Does NOT load the entire file into memory — prevents OOM on huge playlists.
      * Returns partial results if the connection drops mid-download.
      */
+    private val MAX_M3U_ENTRIES = 10000
+
     private fun parseM3UFromReader(reader: BufferedReader): List<M3UEntry> {
         val entries = mutableListOf<M3UEntry>()
         var currentInfLine: String? = null
 
         try {
             reader.forEachLine { line ->
+                if (entries.size >= MAX_M3U_ENTRIES) return@forEachLine
                 val trimmed = line.trim()
                 if (trimmed.startsWith("#EXTINF")) {
                     currentInfLine = trimmed
@@ -774,22 +778,15 @@ class XtreamIPTVProvider : MainAPI() {
                     retryXtreamInBackground(c)
 
                     // Fire-and-forget: download M3U in background for richer cache
+                    // Only uses streaming parser — never loads full file into a String.
                     val m3uUrl = url
                     bgScope.launch {
                         try {
                             val m3uEntries = downloadAndParseM3U(m3uUrl)
                             if (m3uEntries != null && m3uEntries.isNotEmpty()) {
                                 cachedM3U = m3uEntries
-                            } else {
-                                try {
-                                    val m3uText = RawHttp.apiGet(m3uUrl, readTimeout = 60000)
-                                    if (m3uText != null && (m3uText.startsWith("#EXTM3U") || m3uText.startsWith("#EXTINF"))) {
-                                        val entries = parseM3U(m3uText)
-                                        if (entries.isNotEmpty()) cachedM3U = entries
-                                    }
-                                } catch (_: Throwable) { /* OOM — skip */ }
                             }
-                        } catch (_: Exception) {}
+                        } catch (_: Throwable) { /* OOM or other — skip */ }
                     }
 
                     return response
@@ -797,20 +794,8 @@ class XtreamIPTVProvider : MainAPI() {
             }
         }
 
-        // ── Step 2: Xtream API failed or unavailable → try M3U (slower) ──
+        // ── Step 2: Xtream API failed or unavailable → try M3U (streaming only) ──
         var m3uEntries = downloadAndParseM3U(url)
-
-        // Fallback: string-based M3U download if streaming returned nothing
-        if (m3uEntries == null || m3uEntries.isEmpty()) {
-            try {
-                val m3uText = withTimeoutOrNull(80000L) {
-                    RawHttp.apiGet(url, readTimeout = 60000)
-                }
-                if (m3uText != null && (m3uText.startsWith("#EXTM3U") || m3uText.startsWith("#EXTINF"))) {
-                    m3uEntries = parseM3U(m3uText)
-                }
-            } catch (_: Throwable) { /* OOM or other — skip */ }
-        }
 
         if (m3uEntries != null && m3uEntries.isNotEmpty()) {
             cachedM3U = m3uEntries
