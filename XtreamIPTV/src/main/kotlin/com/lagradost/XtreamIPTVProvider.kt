@@ -10,9 +10,11 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.BufferedReader
@@ -97,11 +99,12 @@ object RawHttp {
 
     /**
      * Fetch URL with IPTV player user agents to bypass 403/521 blocks.
+     * Tries each user agent until one works.
      *
-     * @param connectTimeout  TCP connect timeout in ms (default 5s)
+     * @param connectTimeout  TCP connect timeout in ms (default 6s)
      * @param readTimeout     socket read timeout in ms (default 15s)
      */
-    suspend fun get(url: String, readTimeout: Int = 15000, connectTimeout: Int = 5000): String? = withContext(Dispatchers.IO) {
+    suspend fun get(url: String, readTimeout: Int = 15000, connectTimeout: Int = 6000): String? = withContext(Dispatchers.IO) {
         val uri = try { URI(url) } catch (_: Exception) { return@withContext null }
         val referer = "${uri.scheme}://${uri.host}/"
 
@@ -115,6 +118,23 @@ object RawHttp {
             } catch (_: Exception) { continue }
         }
         null
+    }
+
+    /**
+     * Fast single-attempt fetch for Xtream API calls.
+     * No user-agent rotation — the API is designed for programmatic access.
+     * Uses okhttp UA (same as OTT Navigator / TiviMate use internally).
+     * Returns immediately on success or failure — no retry loop.
+     */
+    suspend fun apiGet(url: String, readTimeout: Int = 12000, connectTimeout: Int = 6000): String? = withContext(Dispatchers.IO) {
+        try {
+            val uri = URI(url)
+            val referer = "${uri.scheme}://${uri.host}/"
+            fetch(url, "okhttp/4.12.0", connectTimeout, readTimeout, mapOf(
+                "Referer" to referer,
+                "Accept" to "*/*"
+            ))
+        } catch (_: Exception) { null }
     }
 
     private fun fetch(url: String, userAgent: String, connectTimeout: Int, readTimeout: Int, extraHeaders: Map<String, String>): String? {
@@ -481,20 +501,21 @@ class XtreamIPTVProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * Fetch all 6 Xtream API endpoints in parallel with tight per-call timeouts.
+     * Fetch all 6 Xtream API endpoints in parallel using single-attempt fast fetch.
      *
-     * Key insight: HttpURLConnection doesn't respect coroutine cancellation.
-     * So we use very short connect timeouts (3s) and read timeouts (8s).
-     * If a server is slow, we show what we have and retry in background.
+     * Uses RawHttp.apiGet() — no user-agent rotation (the API is designed for
+     * programmatic access, not browser blocking). This saves 6-12 seconds per
+     * call compared to cycling through 3 UAs.
      *
-     * Worst case: 3 UAs × 3s connect = 9s per call before moving on.
-     * Fast server: first UA connects in ~1s, reads in ~2s = 3s total.
+     * Connect timeout: 6s (enough for slow servers to accept connection)
+     * Read timeout: 12s streams / 8s categories (enough to receive data)
+     * Total: first data should arrive in 1-3s on a normal server.
      */
     private suspend fun fetchXtreamData(
         c: Cfg,
-        streamReadTimeout: Int = 8000,
-        catReadTimeout: Int = 5000,
-        connectTimeout: Int = 3000
+        streamReadTimeout: Int = 12000,
+        catReadTimeout: Int = 8000,
+        connectTimeout: Int = 6000
     ): XtreamFetchResult? {
         try {
             val encUser = URLEncoder.encode(c.user, "UTF-8")
@@ -503,12 +524,12 @@ class XtreamIPTVProvider : MainAPI() {
 
             val (vodStreamsText, seriesText, liveStreamsText,
                  vodCatsText, seriesCatsText, liveCatsText) = coroutineScope {
-                val vodDef = async { RawHttp.get("$apiBase&action=get_vod_streams", streamReadTimeout, connectTimeout) }
-                val serDef = async { RawHttp.get("$apiBase&action=get_series", streamReadTimeout, connectTimeout) }
-                val liveDef = async { RawHttp.get("$apiBase&action=get_live_streams", streamReadTimeout, connectTimeout) }
-                val vodCatDef = async { RawHttp.get("$apiBase&action=get_vod_categories", catReadTimeout, connectTimeout) }
-                val serCatDef = async { RawHttp.get("$apiBase&action=get_series_categories", catReadTimeout, connectTimeout) }
-                val liveCatDef = async { RawHttp.get("$apiBase&action=get_live_categories", catReadTimeout, connectTimeout) }
+                val vodDef = async { RawHttp.apiGet("$apiBase&action=get_vod_streams", streamReadTimeout, connectTimeout) }
+                val serDef = async { RawHttp.apiGet("$apiBase&action=get_series", streamReadTimeout, connectTimeout) }
+                val liveDef = async { RawHttp.apiGet("$apiBase&action=get_live_streams", streamReadTimeout, connectTimeout) }
+                val vodCatDef = async { RawHttp.apiGet("$apiBase&action=get_vod_categories", catReadTimeout, connectTimeout) }
+                val serCatDef = async { RawHttp.apiGet("$apiBase&action=get_series_categories", catReadTimeout, connectTimeout) }
+                val liveCatDef = async { RawHttp.apiGet("$apiBase&action=get_live_categories", catReadTimeout, connectTimeout) }
                 SixStrings(vodDef.await(), serDef.await(), liveDef.await(),
                            vodCatDef.await(), serCatDef.await(), liveCatDef.await())
             }
@@ -524,49 +545,50 @@ class XtreamIPTVProvider : MainAPI() {
     }
 
     /**
-     * Retry timed-out Xtream API calls in the background with longer timeouts.
-     * Only fetches stream types that are still missing from cache.
-     * Uses generous timeouts since this runs after the user already sees the home page.
+     * Truly fire-and-forget background scope for retries and M3U download.
+     * Uses CoroutineScope(Dispatchers.IO) + launch so it does NOT block the caller.
      */
-    private suspend fun retryXtreamInBackground(c: Cfg) {
-        try {
-            coroutineScope {
-                async(Dispatchers.IO) {
-                    try {
-                        val encUser = URLEncoder.encode(c.user, "UTF-8")
-                        val encPass = URLEncoder.encode(c.pass, "UTF-8")
-                        val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
-                        val longRead = 30000
-                        val longConnect = 8000
+    private val bgScope = CoroutineScope(Dispatchers.IO)
 
-                        if (cachedXtreamVod == null) {
-                            val text = RawHttp.get("$apiBase&action=get_vod_streams", longRead, longConnect)
-                            if (text != null) tryParseJson<List<XVod>>(text)?.let { cachedXtreamVod = it }
-                        }
-                        if (cachedXtreamSeries == null) {
-                            val text = RawHttp.get("$apiBase&action=get_series", longRead, longConnect)
-                            if (text != null) tryParseJson<List<XSeries>>(text)?.let { cachedXtreamSeries = it }
-                        }
-                        if (cachedXtreamLive == null) {
-                            val text = RawHttp.get("$apiBase&action=get_live_streams", longRead, longConnect)
-                            if (text != null) tryParseJson<List<XLive>>(text)?.let { cachedXtreamLive = it }
-                        }
-                        if (cachedXtreamVodCats == null) {
-                            val text = RawHttp.get("$apiBase&action=get_vod_categories", 15000, longConnect)
-                            if (text != null) cachedXtreamVodCats = text
-                        }
-                        if (cachedXtreamSeriesCats == null) {
-                            val text = RawHttp.get("$apiBase&action=get_series_categories", 15000, longConnect)
-                            if (text != null) cachedXtreamSeriesCats = text
-                        }
-                        if (cachedXtreamLiveCats == null) {
-                            val text = RawHttp.get("$apiBase&action=get_live_categories", 15000, longConnect)
-                            if (text != null) cachedXtreamLiveCats = text
-                        }
-                    } catch (_: Exception) {}
+    /**
+     * Retry any Xtream API calls that timed out during the fast initial fetch.
+     * Fire-and-forget: returns immediately, work happens in background.
+     */
+    private fun retryXtreamInBackground(c: Cfg) {
+        bgScope.launch {
+            try {
+                val encUser = URLEncoder.encode(c.user, "UTF-8")
+                val encPass = URLEncoder.encode(c.pass, "UTF-8")
+                val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
+                val longRead = 30000
+                val longConnect = 8000
+
+                if (cachedXtreamVod == null) {
+                    val text = RawHttp.apiGet("$apiBase&action=get_vod_streams", longRead, longConnect)
+                    if (text != null) tryParseJson<List<XVod>>(text)?.let { cachedXtreamVod = it }
                 }
-            }
-        } catch (_: Exception) {}
+                if (cachedXtreamSeries == null) {
+                    val text = RawHttp.apiGet("$apiBase&action=get_series", longRead, longConnect)
+                    if (text != null) tryParseJson<List<XSeries>>(text)?.let { cachedXtreamSeries = it }
+                }
+                if (cachedXtreamLive == null) {
+                    val text = RawHttp.apiGet("$apiBase&action=get_live_streams", longRead, longConnect)
+                    if (text != null) tryParseJson<List<XLive>>(text)?.let { cachedXtreamLive = it }
+                }
+                if (cachedXtreamVodCats == null) {
+                    val text = RawHttp.apiGet("$apiBase&action=get_vod_categories", 15000, longConnect)
+                    if (text != null) cachedXtreamVodCats = text
+                }
+                if (cachedXtreamSeriesCats == null) {
+                    val text = RawHttp.apiGet("$apiBase&action=get_series_categories", 15000, longConnect)
+                    if (text != null) cachedXtreamSeriesCats = text
+                }
+                if (cachedXtreamLiveCats == null) {
+                    val text = RawHttp.apiGet("$apiBase&action=get_live_categories", 15000, longConnect)
+                    if (text != null) cachedXtreamLiveCats = text
+                }
+            } catch (_: Exception) {}
+        }
     }
 
     /** Cache Xtream results for search and home page reuse. */
@@ -745,28 +767,32 @@ class XtreamIPTVProvider : MainAPI() {
                 cacheXtreamResult(xtreamResult)
                 buildXtreamHomePage(xtreamResult, catFilter, lists)
                 if (lists.isNotEmpty()) {
-                    // Show catalogs now! Retry any timed-out calls + M3U in background.
+                    // Show catalogs NOW! Return immediately, then do background work.
+                    val response = newHomePageResponse(lists, false)
+
+                    // Fire-and-forget: retry timed-out API calls in background
                     retryXtreamInBackground(c)
+
+                    // Fire-and-forget: download M3U in background for richer cache
                     val m3uUrl = url
-                    coroutineScope {
-                        async(Dispatchers.IO) {
-                            try {
-                                val m3uEntries = downloadAndParseM3U(m3uUrl)
-                                if (m3uEntries != null && m3uEntries.isNotEmpty()) {
-                                    cachedM3U = m3uEntries
-                                } else {
-                                    try {
-                                        val m3uText = RawHttp.get(m3uUrl, readTimeout = 60000)
-                                        if (m3uText != null && (m3uText.startsWith("#EXTM3U") || m3uText.startsWith("#EXTINF"))) {
-                                            val entries = parseM3U(m3uText)
-                                            if (entries.isNotEmpty()) cachedM3U = entries
-                                        }
-                                    } catch (_: Throwable) { /* OOM — skip */ }
-                                }
-                            } catch (_: Exception) {}
-                        }
+                    bgScope.launch {
+                        try {
+                            val m3uEntries = downloadAndParseM3U(m3uUrl)
+                            if (m3uEntries != null && m3uEntries.isNotEmpty()) {
+                                cachedM3U = m3uEntries
+                            } else {
+                                try {
+                                    val m3uText = RawHttp.apiGet(m3uUrl, readTimeout = 60000)
+                                    if (m3uText != null && (m3uText.startsWith("#EXTM3U") || m3uText.startsWith("#EXTINF"))) {
+                                        val entries = parseM3U(m3uText)
+                                        if (entries.isNotEmpty()) cachedM3U = entries
+                                    }
+                                } catch (_: Throwable) { /* OOM — skip */ }
+                            }
+                        } catch (_: Exception) {}
                     }
-                    return newHomePageResponse(lists, false)
+
+                    return response
                 }
             }
         }
@@ -778,7 +804,7 @@ class XtreamIPTVProvider : MainAPI() {
         if (m3uEntries == null || m3uEntries.isEmpty()) {
             try {
                 val m3uText = withTimeoutOrNull(80000L) {
-                    RawHttp.get(url, readTimeout = 60000)
+                    RawHttp.apiGet(url, readTimeout = 60000)
                 }
                 if (m3uText != null && (m3uText.startsWith("#EXTM3U") || m3uText.startsWith("#EXTINF"))) {
                     m3uEntries = parseM3U(m3uText)
@@ -991,7 +1017,7 @@ class XtreamIPTVProvider : MainAPI() {
                     val encPass = URLEncoder.encode(c.pass, "UTF-8")
                     val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
 
-                    val vodText = RawHttp.get("$apiBase&action=get_vod_streams", 15000)
+                    val vodText = RawHttp.apiGet("$apiBase&action=get_vod_streams", 15000)
                     if (vodText != null) {
                         val streams = tryParseJson<List<XVod>>(vodText) ?: emptyList()
                         cachedXtreamVod = streams
@@ -1002,7 +1028,7 @@ class XtreamIPTVProvider : MainAPI() {
                         }
                     }
 
-                    val serText = RawHttp.get("$apiBase&action=get_series", 15000)
+                    val serText = RawHttp.apiGet("$apiBase&action=get_series", 15000)
                     if (serText != null) {
                         val series = tryParseJson<List<XSeries>>(serText) ?: emptyList()
                         cachedXtreamSeries = series
@@ -1013,7 +1039,7 @@ class XtreamIPTVProvider : MainAPI() {
                         }
                     }
 
-                    val liveText = RawHttp.get("$apiBase&action=get_live_streams", 15000)
+                    val liveText = RawHttp.apiGet("$apiBase&action=get_live_streams", 15000)
                     if (liveText != null) {
                         val streams = tryParseJson<List<XLive>>(liveText) ?: emptyList()
                         cachedXtreamLive = streams
@@ -1134,7 +1160,7 @@ class XtreamIPTVProvider : MainAPI() {
                 val encUser = URLEncoder.encode(c.user, "UTF-8")
                 val encPass = URLEncoder.encode(c.pass, "UTF-8")
                 val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
-                val streamsText = RawHttp.get("$apiBase&action=get_vod_streams&category_id=${ref.group}", 15000) ?: return null
+                val streamsText = RawHttp.apiGet("$apiBase&action=get_vod_streams&category_id=${ref.group}", 15000) ?: return null
                 val streams = tryParseJson<List<XVod>>(streamsText) ?: return null
                 if (streams.isEmpty()) return null
 
@@ -1156,7 +1182,7 @@ class XtreamIPTVProvider : MainAPI() {
                 val encUser = URLEncoder.encode(c.user, "UTF-8")
                 val encPass = URLEncoder.encode(c.pass, "UTF-8")
                 val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
-                val seriesText = RawHttp.get("$apiBase&action=get_series&category_id=${ref.group}", 15000) ?: return null
+                val seriesText = RawHttp.apiGet("$apiBase&action=get_series&category_id=${ref.group}", 15000) ?: return null
                 val series = tryParseJson<List<XSeries>>(seriesText) ?: return null
                 if (series.isEmpty()) return null
 
@@ -1179,7 +1205,7 @@ class XtreamIPTVProvider : MainAPI() {
                 val encUser = URLEncoder.encode(c.user, "UTF-8")
                 val encPass = URLEncoder.encode(c.pass, "UTF-8")
                 val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
-                val streamsText = RawHttp.get("$apiBase&action=get_live_streams&category_id=${ref.group}", 15000) ?: return null
+                val streamsText = RawHttp.apiGet("$apiBase&action=get_live_streams&category_id=${ref.group}", 15000) ?: return null
                 val streams = tryParseJson<List<XLive>>(streamsText) ?: return null
                 if (streams.isEmpty()) return null
 
@@ -1243,7 +1269,7 @@ class XtreamIPTVProvider : MainAPI() {
             "l" -> newMovieLoadResponse(ref.n, ref.toJson(), TvType.Live, LinkData("l", ref.id).toJson()) {}
             "m" -> {
                 val apiBase = "${c.server}/player_api.php?username=${c.user}&password=${c.pass}"
-                val infoText = RawHttp.get("$apiBase&action=get_vod_info&vod_id=${ref.id}", 15000)
+                val infoText = RawHttp.apiGet("$apiBase&action=get_vod_info&vod_id=${ref.id}", 15000)
                 val info = if (!infoText.isNullOrEmpty()) tryParseJson<XVodInfo>(infoText) else null
                 val detail = info?.info
                 val ext = info?.movie_data?.container_extension ?: ref.e ?: "mp4"
@@ -1256,7 +1282,7 @@ class XtreamIPTVProvider : MainAPI() {
             }
             "s" -> {
                 val apiBase = "${c.server}/player_api.php?username=${c.user}&password=${c.pass}"
-                val infoText = RawHttp.get("$apiBase&action=get_series_info&series_id=${ref.id}", 15000)
+                val infoText = RawHttp.apiGet("$apiBase&action=get_series_info&series_id=${ref.id}", 15000)
                 val info = if (!infoText.isNullOrEmpty()) tryParseJson<XSeriesInfo>(infoText) else null
                 val detail = info?.info
                 val epMap = info?.episodes
