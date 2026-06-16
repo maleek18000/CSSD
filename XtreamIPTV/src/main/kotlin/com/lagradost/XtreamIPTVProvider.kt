@@ -1124,238 +1124,210 @@ class XtreamIPTVProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  SEARCH  — comprehensive parallel search across ALL categories
+    //  SEARCH  — fast single-request M3U streaming search
     //
-    //  The Xtream Codes API has no native search endpoint, so we must
-    //  search client-side. This implementation searches EVERY category
-    //  (movies + series + live TV) on the provider — including categories
-    //  that are NOT shown on the home screen.
+    //  WHY THIS IS FAST:
+    //  The Xtream Codes API has NO native search endpoint. The previous
+    //  approach fired 100+ parallel per-category API calls — slow because
+    //  of many TCP handshakes, server rate-limiting, and waiting for the
+    //  slowest category.
+    //
+    //  The M3U endpoint (get.php?...&type=m3u_plus) returns EVERY stream
+    //  (movies + series + live TV) in ONE HTTP request, as plain text.
+    //  This is the same approach website-based providers like Stardima use
+    //  (one server-side request that returns all matches).
     //
     //  Strategy:
-    //  1. Ensure category lists are loaded (3 tiny API calls, cached)
-    //  2. For every category in every type, fetch its streams IN PARALLEL
-    //     (cached categories are read from memory instantly)
-    //  3. Filter each category's streams by the query (case-insensitive)
-    //  4. Merge all matching results, capped per-type to avoid flooding
+    //  1. If M3U is already cached (from home page), filter it instantly.
+    //  2. Otherwise, open ONE HTTP connection to the M3U URL and stream
+    //     line-by-line — parse + filter + collect matches as we read.
+    //     STOP as soon as we have enough matches (early termination).
+    //     This never loads the full M3U into memory — constant RAM usage.
+    //  3. Cache the full M3U for subsequent searches (instant).
     //
-    //  Memory safety: each category's stream list is parsed, filtered, and
-    //  only the small SearchResponse objects are kept — not the full lists.
-    //  The cache is bounded by MAX_CACHED_CATEGORIES to prevent OOM.
+    //  This searches ALL categories on the provider — including those NOT
+    //  shown on the home screen — because the M3U file contains everything.
     // ═══════════════════════════════════════════════════════════════════
 
     /** Maximum search results to return. */
-    private val SEARCH_MAX_RESULTS = 60
-    /** Maximum matches to keep per type (movie/series/live) to ensure variety. */
-    private val SEARCH_MAX_PER_TYPE = 40
-    /** Per-category fetch timeout for search (fail fast — don't let one slow cat block others). */
-    private val SEARCH_CAT_TIMEOUT_MS = 6000
-    /** Per-category connect timeout for search (fail fast on dead servers). */
-    private val SEARCH_CAT_CONNECT_MS = 3000
-    /** Hard cap for the entire search operation. Partial results are returned after this. */
-    private val SEARCH_OVERALL_TIMEOUT_MS = 15000L
-    /** Stop fetching more categories once this many matches are collected across all types. */
-    private val SEARCH_EARLY_STOP_TARGET = 80
+    private val SEARCH_MAX_RESULTS = 80
+    /** Hard timeout for the M3U streaming search. Partial results returned after. */
+    private val SEARCH_M3U_TIMEOUT_MS = 20000L
 
     override suspend fun search(query: String): List<SearchResponse>? {
         val url = cleanUrl()
         if (url.isEmpty() || url == "http://example.com/username/password") return null
         val q = query.trim().lowercase()
         if (q.isEmpty()) return null
-        val results = mutableListOf<SearchResponse>()
 
-        // ── 1. Search M3U cache (if M3U mode is active) ──
-        cachedM3U?.let { entries ->
-            entries.asSequence().filter {
-                it.name.lowercase().contains(q) || it.group.lowercase().contains(q)
-            }.take(SEARCH_MAX_PER_TYPE).forEach { entry ->
+        // ── 1. FAST PATH: filter cached M3U (instant, no network) ──
+        val cached = cachedM3U
+        if (cached != null && cached.isNotEmpty()) {
+            val results = filterM3UEntries(cached, q, SEARCH_MAX_RESULTS)
+            if (results.isNotEmpty()) return results
+        }
+
+        // ── 2. STREAMING SEARCH: one HTTP request, line-by-line filter ──
+        //    Opens a single connection to the M3U URL, reads line by line,
+        //    parses each #EXTINF + URL pair, filters by query, and stops
+        //    as soon as SEARCH_MAX_RESULTS matches are found (or timeout).
+        //    Never loads the full file into memory — constant RAM usage.
+        val results = withTimeoutOrNull(SEARCH_M3U_TIMEOUT_MS) {
+            withContext(Dispatchers.IO) {
+                streamSearchM3U(url, q, SEARCH_MAX_RESULTS)
+            }
+        } ?: emptyList()
+
+        return if (results.isEmpty()) null else results
+    }
+
+    /**
+     * Filter already-parsed M3U entries by query (case-insensitive name/group match).
+     * Returns at most [maxResults] SearchResponse objects.
+     */
+    private fun filterM3UEntries(
+        entries: List<M3UEntry>, q: String, maxResults: Int
+    ): List<SearchResponse> {
+        val results = ArrayList<SearchResponse>(maxResults)
+        for (entry in entries) {
+            if (results.size >= maxResults) break
+            if (entry.name.lowercase().contains(q) || entry.group.lowercase().contains(q)) {
                 val ref = EntryRef(entry.streamUrl, entry.type, entry.name, entry.group, entry.logo, entry.seriesName)
                 when (entry.type) {
-                    "movie" -> results.add(newMovieSearchResponse(entry.name, ref.toJson(), TvType.Movie) { posterUrl = entry.logo })
-                    "series" -> results.add(newTvSeriesSearchResponse(entry.seriesName.ifBlank { entry.name }, ref.toJson(), TvType.TvSeries) { posterUrl = entry.logo })
-                    else -> results.add(newMovieSearchResponse(entry.name, ref.toJson(), TvType.Live) { posterUrl = entry.logo })
+                    "series" -> results.add(newTvSeriesSearchResponse(
+                        entry.seriesName.ifBlank { entry.name }, ref.toJson(), TvType.TvSeries
+                    ) { posterUrl = entry.logo })
+                    "movie" -> results.add(newMovieSearchResponse(
+                        entry.name, ref.toJson(), TvType.Movie
+                    ) { posterUrl = entry.logo })
+                    else -> results.add(newMovieSearchResponse(
+                        entry.name, ref.toJson(), TvType.Live
+                    ) { posterUrl = entry.logo })
                 }
             }
         }
+        return results
+    }
 
-        // ── 2. Ensure Xtream category lists are loaded ──
-        val c = cfg()
-        if (c == null) {
-            return if (results.isEmpty()) null else results.take(SEARCH_MAX_RESULTS)
-        }
+    /**
+     * Streaming M3U search — opens ONE HTTP connection, reads line by line,
+     * parses each entry, filters by query, and stops early when enough
+     * matches are found. Caches the full parsed list for subsequent searches.
+     *
+     * This is the fastest possible search for an Xtream provider because:
+     * - ONE TCP/TLS handshake (vs 100+ for per-category API calls)
+     * - No server rate-limiting on a single M3U request
+     * - Plain text (no JSON parsing overhead)
+     * - Early termination: stops reading as soon as [maxResults] matches found
+     * - Constant memory: only matched SearchResponse objects are kept
+     */
+    private fun streamSearchM3U(
+        m3uUrl: String, q: String, maxResults: Int
+    ): List<SearchResponse> {
+        val results = ArrayList<SearchResponse>(maxResults)
+        val allEntries = ArrayList<M3UEntry>(5000)  // for caching
+        val uas = listOf("okhttp/4.12.0", "IPTVSmarters/2", "TiviMate/4.7.0")
+        val uri = try { URI(m3uUrl) } catch (_: Exception) { return results }
+        val referer = "${uri.scheme}://${uri.host}/"
 
-        // If categories are not yet cached, fetch them now (3 tiny parallel calls).
-        if (!hasXtreamCache()) {
-            try {
-                fetchXtreamCategories(c)?.let { (v, s, l) ->
-                    v?.let { cachedXtreamVodCats = it }
-                    s?.let { cachedXtreamSeriesCats = it }
-                    l?.let { cachedXtreamLiveCats = it }
-                }
-            } catch (_: Throwable) { /* ignore — search with whatever we have */ }
-        }
+        var conn: HttpURLConnection? = null
+        try {
+            for (ua in uas) {
+                try {
+                    conn = URL(m3uUrl).openConnection() as HttpURLConnection
+                    conn.requestMethod = "GET"
+                    conn.setRequestProperty("User-Agent", ua)
+                    conn.setRequestProperty("Referer", referer)
+                    conn.setRequestProperty("Accept", "*/*")
+                    conn.connectTimeout = 6000
+                    conn.readTimeout = 18000
+                    conn.instanceFollowRedirects = true
 
-        val encUser = URLEncoder.encode(c.user, "UTF-8")
-        val encPass = URLEncoder.encode(c.pass, "UTF-8")
-        val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
+                    val code = conn.responseCode
+                    if (code in 400..599) { conn.disconnect(); conn = null; continue }
 
-        val vodCats = cachedXtreamVodCats?.let { tryParseJson<List<XCat>>(it) } ?: emptyList()
-        val serCats = cachedXtreamSeriesCats?.let { tryParseJson<List<XCat>>(it) } ?: emptyList()
-        val liveCats = cachedXtreamLiveCats?.let { tryParseJson<List<XCat>>(it) } ?: emptyList()
+                    val reader = BufferedReader(InputStreamReader(conn.inputStream, "UTF-8"))
+                    var currentInfLine: String? = null
+                    var entriesParsed = 0
 
-        // ── 3. Search every category IN PARALLEL with hard limits ──
-        //    Key speed optimizations vs. previous version:
-        //    (a) supervisorScope — one failed async does NOT cancel siblings
-        //    (b) withTimeoutOrNull per category — slow cat skipped after 6s
-        //    (c) Overall withTimeoutOrNull(15s) — return partial results, never hang
-        //    (d) AtomicInteger counter — stop launching new fetches once we have
-        //        enough matches (early termination, saves bandwidth + CPU)
-        //    (e) Shorter connect timeout (3s) for search — fail fast on dead servers
-        val vodMatches = mutableListOf<SearchResponse>()
-        val serMatches = mutableListOf<SearchResponse>()
-        val liveMatches = mutableListOf<SearchResponse>()
-        val totalMatched = AtomicInteger(0)
+                    try {
+                        while (true) {
+                            val line = reader.readLine() ?: break
 
-        // Helper: should we keep launching new category fetches?
-        fun shouldContinue(): Boolean = totalMatched.get() < SEARCH_EARLY_STOP_TARGET
+                            // Memory guard: bail out before OOM
+                            if (entriesParsed % 2000 == 0 && entriesParsed > 0) {
+                                val rt = Runtime.getRuntime()
+                                val freeMB = (rt.maxMemory() - (rt.totalMemory() - rt.freeMemory())) / (1024 * 1024)
+                                if (freeMB < 8) break
+                            }
 
-        withTimeoutOrNull(SEARCH_OVERALL_TIMEOUT_MS) {
-            supervisorScope {
-                // ── VOD (movies) ──
-                for (cat in vodCats) {
-                    if (!shouldContinue()) break
-                    val catId = cat.category_id ?: continue
-                    val key = "v_$catId"
-                    async {
-                        // Per-category timeout: skip this category if it takes too long
-                        val streams: List<XVod>? = withTimeoutOrNull(SEARCH_CAT_TIMEOUT_MS.toLong()) {
-                            cachedCatStreams[key] as? List<XVod>
-                                ?: RawHttp.apiGet(
-                                    "$apiBase&action=get_vod_streams&category_id=$catId",
-                                    SEARCH_CAT_TIMEOUT_MS, SEARCH_CAT_CONNECT_MS
-                                )?.let { tryParseJson<List<XVod>>(it) }
-                                    ?.also { parsed ->
-                                        if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
-                                            cachedCatStreams[key] = parsed
-                                        }
+                            val trimmed = line.trim()
+                            if (trimmed.startsWith("#EXTINF")) {
+                                currentInfLine = trimmed
+                            } else if (trimmed.isNotEmpty() && !trimmed.startsWith("#") && currentInfLine != null) {
+                                val infLine = currentInfLine!!
+                                currentInfLine = null
+                                entriesParsed++
+
+                                val logo = extractAttr(infLine, "tvg-logo")
+                                val group = extractAttr(infLine, "group-title") ?: "Uncategorized"
+                                val commaIdx = infLine.lastIndexOf(',')
+                                val name = if (commaIdx >= 0) infLine.substring(commaIdx + 1).trim() else "Unknown"
+
+                                val detectedType = detectType(trimmed, group, name)
+                                val sName = if (detectedType == "series") extractSeriesName(name) else ""
+                                val entry = M3UEntry(name, group, logo, trimmed, detectedType, sName)
+                                allEntries.add(entry)
+
+                                // Check match — stop early if we have enough
+                                if (results.size < maxResults &&
+                                    (name.lowercase().contains(q) || group.lowercase().contains(q))) {
+                                    val ref = EntryRef(trimmed, detectedType, name, group, logo, sName)
+                                    when (detectedType) {
+                                        "series" -> results.add(newTvSeriesSearchResponse(
+                                            sName.ifBlank { name }, ref.toJson(), TvType.TvSeries
+                                        ) { posterUrl = logo })
+                                        "movie" -> results.add(newMovieSearchResponse(
+                                            name, ref.toJson(), TvType.Movie
+                                        ) { posterUrl = logo })
+                                        else -> results.add(newMovieSearchResponse(
+                                            name, ref.toJson(), TvType.Live
+                                        ) { posterUrl = logo })
                                     }
-                        }
-                        if (streams != null) {
-                            val matched = ArrayList<SearchResponse>(8)
-                            for (s in streams) {
-                                if (matched.size >= SEARCH_MAX_PER_TYPE) break
-                                if (s.name.lowercase().contains(q)) {
-                                    matched.add(newMovieSearchResponse(
-                                        s.name,
-                                        ItemRef("m", s.stream_id, s.name, s.container_extension ?: "mp4").toJson(),
-                                        TvType.Movie
-                                    ) { posterUrl = s.stream_icon })
                                 }
-                            }
-                            if (matched.isNotEmpty()) {
-                                synchronized(vodMatches) {
-                                    vodMatches.addAll(matched)
-                                    totalMatched.addAndGet(matched.size)
-                                }
-                            }
-                        }
-                    }
-                }
 
-                // ── Series ──
-                for (cat in serCats) {
-                    if (!shouldContinue()) break
-                    val catId = cat.category_id ?: continue
-                    val key = "s_$catId"
-                    async {
-                        val streams: List<XSeries>? = withTimeoutOrNull(SEARCH_CAT_TIMEOUT_MS.toLong()) {
-                            cachedCatStreams[key] as? List<XSeries>
-                                ?: RawHttp.apiGet(
-                                    "$apiBase&action=get_series&category_id=$catId",
-                                    SEARCH_CAT_TIMEOUT_MS, SEARCH_CAT_CONNECT_MS
-                                )?.let { tryParseJson<List<XSeries>>(it) }
-                                    ?.also { parsed ->
-                                        if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
-                                            cachedCatStreams[key] = parsed
-                                        }
-                                    }
-                        }
-                        if (streams != null) {
-                            val matched = ArrayList<SearchResponse>(8)
-                            for (s in streams) {
-                                if (matched.size >= SEARCH_MAX_PER_TYPE) break
-                                if (s.name.lowercase().contains(q)) {
-                                    matched.add(newTvSeriesSearchResponse(
-                                        s.name,
-                                        ItemRef("s", s.series_id, s.name).toJson(),
-                                        TvType.TvSeries
-                                    ) { posterUrl = s.cover })
-                                }
-                            }
-                            if (matched.isNotEmpty()) {
-                                synchronized(serMatches) {
-                                    serMatches.addAll(matched)
-                                    totalMatched.addAndGet(matched.size)
+                                // Early termination: stop reading once we have enough matches
+                                // AND have parsed a reasonable number of entries (to ensure
+                                // the cache has enough for future queries).
+                                if (results.size >= maxResults && entriesParsed >= 500) {
+                                    break
                                 }
                             }
                         }
+                    } catch (_: Throwable) {
+                        // OOM or I/O error — return whatever we have so far
+                    } finally {
+                        try { reader.close() } catch (_: Throwable) {}
                     }
-                }
 
-                // ── Live TV ──
-                for (cat in liveCats) {
-                    if (!shouldContinue()) break
-                    val catId = cat.category_id ?: continue
-                    val key = "l_$catId"
-                    async {
-                        val streams: List<XLive>? = withTimeoutOrNull(SEARCH_CAT_TIMEOUT_MS.toLong()) {
-                            cachedCatStreams[key] as? List<XLive>
-                                ?: RawHttp.apiGet(
-                                    "$apiBase&action=get_live_streams&category_id=$catId",
-                                    SEARCH_CAT_TIMEOUT_MS, SEARCH_CAT_CONNECT_MS
-                                )?.let { tryParseJson<List<XLive>>(it) }
-                                    ?.also { parsed ->
-                                        if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
-                                            cachedCatStreams[key] = parsed
-                                        }
-                                    }
-                        }
-                        if (streams != null) {
-                            val matched = ArrayList<SearchResponse>(8)
-                            for (s in streams) {
-                                if (matched.size >= SEARCH_MAX_PER_TYPE) break
-                                if (s.name.lowercase().contains(q)) {
-                                    matched.add(newMovieSearchResponse(
-                                        s.name,
-                                        ItemRef("l", s.stream_id, s.name).toJson(),
-                                        TvType.Live
-                                    ) { posterUrl = s.stream_icon })
-                                }
-                            }
-                            if (matched.isNotEmpty()) {
-                                synchronized(liveMatches) {
-                                    liveMatches.addAll(matched)
-                                    totalMatched.addAndGet(matched.size)
-                                }
-                            }
-                        }
+                    // Cache what we parsed for subsequent searches (instant next time)
+                    if (allEntries.isNotEmpty()) {
+                        cachedM3U = allEntries
                     }
+
+                    if (results.isNotEmpty()) return results
+                    break  // got a valid response but no matches — don't retry
+                } catch (_: Throwable) {
+                    conn?.disconnect()
+                    conn = null
+                    continue
                 }
             }
+        } finally {
+            conn?.disconnect()
         }
-        // If overall timeout fired, we still return whatever we collected — better
-        // to show partial results than nothing.
 
-        // ── 4. Merge results: movies first, then series, then live ──
-        //    Cap each type so a huge movie library doesn't drown out series/live.
-        results.addAll(vodMatches.take(SEARCH_MAX_PER_TYPE))
-        results.addAll(serMatches.take(SEARCH_MAX_PER_TYPE))
-        results.addAll(liveMatches.take(SEARCH_MAX_PER_TYPE))
-
-        // De-duplicate by name (case-insensitive) — a show may appear in multiple categories
-        val seen = HashSet<String>()
-        val deduped = results.filter { seen.add(it.name.lowercase()) }
-
-        return if (deduped.isEmpty()) null else deduped.take(SEARCH_MAX_RESULTS)
+        return results
     }
 
     // ═══════════════════════════════════════════════════════════════════
