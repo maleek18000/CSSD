@@ -13,10 +13,13 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicInteger
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
@@ -1144,8 +1147,14 @@ class XtreamIPTVProvider : MainAPI() {
     private val SEARCH_MAX_RESULTS = 60
     /** Maximum matches to keep per type (movie/series/live) to ensure variety. */
     private val SEARCH_MAX_PER_TYPE = 40
-    /** Per-category fetch timeout for search (shorter than browse — fail fast). */
-    private val SEARCH_CAT_TIMEOUT_MS = 12000
+    /** Per-category fetch timeout for search (fail fast — don't let one slow cat block others). */
+    private val SEARCH_CAT_TIMEOUT_MS = 6000
+    /** Per-category connect timeout for search (fail fast on dead servers). */
+    private val SEARCH_CAT_CONNECT_MS = 3000
+    /** Hard cap for the entire search operation. Partial results are returned after this. */
+    private val SEARCH_OVERALL_TIMEOUT_MS = 15000L
+    /** Stop fetching more categories once this many matches are collected across all types. */
+    private val SEARCH_EARLY_STOP_TARGET = 80
 
     override suspend fun search(query: String): List<SearchResponse>? {
         val url = cleanUrl()
@@ -1193,42 +1202,60 @@ class XtreamIPTVProvider : MainAPI() {
         val serCats = cachedXtreamSeriesCats?.let { tryParseJson<List<XCat>>(it) } ?: emptyList()
         val liveCats = cachedXtreamLiveCats?.let { tryParseJson<List<XCat>>(it) } ?: emptyList()
 
-        // ── 3. Search every category IN PARALLEL (movies + series + live) ──
-        //    Each async block either reads from cache (instant) or fetches
-        //    the per-category stream list, then filters by the query.
-        //    Results are collected thread-safely into typed buffers, then
-        //    merged at the end (so a single slow category doesn't block others).
+        // ── 3. Search every category IN PARALLEL with hard limits ──
+        //    Key speed optimizations vs. previous version:
+        //    (a) supervisorScope — one failed async does NOT cancel siblings
+        //    (b) withTimeoutOrNull per category — slow cat skipped after 6s
+        //    (c) Overall withTimeoutOrNull(15s) — return partial results, never hang
+        //    (d) AtomicInteger counter — stop launching new fetches once we have
+        //        enough matches (early termination, saves bandwidth + CPU)
+        //    (e) Shorter connect timeout (3s) for search — fail fast on dead servers
         val vodMatches = mutableListOf<SearchResponse>()
         val serMatches = mutableListOf<SearchResponse>()
         val liveMatches = mutableListOf<SearchResponse>()
+        val totalMatched = AtomicInteger(0)
 
-        try {
-            coroutineScope {
+        // Helper: should we keep launching new category fetches?
+        fun shouldContinue(): Boolean = totalMatched.get() < SEARCH_EARLY_STOP_TARGET
+
+        withTimeoutOrNull(SEARCH_OVERALL_TIMEOUT_MS) {
+            supervisorScope {
                 // ── VOD (movies) ──
                 for (cat in vodCats) {
+                    if (!shouldContinue()) break
                     val catId = cat.category_id ?: continue
                     val key = "v_$catId"
                     async {
-                        val streams: List<XVod>? = cachedCatStreams[key] as? List<XVod>
-                            ?: RawHttp.apiGet("$apiBase&action=get_vod_streams&category_id=$catId", SEARCH_CAT_TIMEOUT_MS)
-                                ?.let { tryParseJson<List<XVod>>(it) }
-                                ?.also { parsed ->
-                                    if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
-                                        cachedCatStreams[key] = parsed
+                        // Per-category timeout: skip this category if it takes too long
+                        val streams: List<XVod>? = withTimeoutOrNull(SEARCH_CAT_TIMEOUT_MS.toLong()) {
+                            cachedCatStreams[key] as? List<XVod>
+                                ?: RawHttp.apiGet(
+                                    "$apiBase&action=get_vod_streams&category_id=$catId",
+                                    SEARCH_CAT_TIMEOUT_MS, SEARCH_CAT_CONNECT_MS
+                                )?.let { tryParseJson<List<XVod>>(it) }
+                                    ?.also { parsed ->
+                                        if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
+                                            cachedCatStreams[key] = parsed
+                                        }
                                     }
-                                }
+                        }
                         if (streams != null) {
-                            val matched = streams.asSequence()
-                                .filter { it.name.lowercase().contains(q) }
-                                .take(SEARCH_MAX_PER_TYPE)
-                                .map { s ->
-                                    newMovieSearchResponse(s.name, ItemRef("m", s.stream_id, s.name, s.container_extension ?: "mp4").toJson(), TvType.Movie) {
-                                        posterUrl = s.stream_icon
-                                    }
+                            val matched = ArrayList<SearchResponse>(8)
+                            for (s in streams) {
+                                if (matched.size >= SEARCH_MAX_PER_TYPE) break
+                                if (s.name.lowercase().contains(q)) {
+                                    matched.add(newMovieSearchResponse(
+                                        s.name,
+                                        ItemRef("m", s.stream_id, s.name, s.container_extension ?: "mp4").toJson(),
+                                        TvType.Movie
+                                    ) { posterUrl = s.stream_icon })
                                 }
-                                .toList()
+                            }
                             if (matched.isNotEmpty()) {
-                                synchronized(vodMatches) { vodMatches.addAll(matched) }
+                                synchronized(vodMatches) {
+                                    vodMatches.addAll(matched)
+                                    totalMatched.addAndGet(matched.size)
+                                }
                             }
                         }
                     }
@@ -1236,29 +1263,39 @@ class XtreamIPTVProvider : MainAPI() {
 
                 // ── Series ──
                 for (cat in serCats) {
+                    if (!shouldContinue()) break
                     val catId = cat.category_id ?: continue
                     val key = "s_$catId"
                     async {
-                        val streams: List<XSeries>? = cachedCatStreams[key] as? List<XSeries>
-                            ?: RawHttp.apiGet("$apiBase&action=get_series&category_id=$catId", SEARCH_CAT_TIMEOUT_MS)
-                                ?.let { tryParseJson<List<XSeries>>(it) }
-                                ?.also { parsed ->
-                                    if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
-                                        cachedCatStreams[key] = parsed
+                        val streams: List<XSeries>? = withTimeoutOrNull(SEARCH_CAT_TIMEOUT_MS.toLong()) {
+                            cachedCatStreams[key] as? List<XSeries>
+                                ?: RawHttp.apiGet(
+                                    "$apiBase&action=get_series&category_id=$catId",
+                                    SEARCH_CAT_TIMEOUT_MS, SEARCH_CAT_CONNECT_MS
+                                )?.let { tryParseJson<List<XSeries>>(it) }
+                                    ?.also { parsed ->
+                                        if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
+                                            cachedCatStreams[key] = parsed
+                                        }
                                     }
-                                }
+                        }
                         if (streams != null) {
-                            val matched = streams.asSequence()
-                                .filter { it.name.lowercase().contains(q) }
-                                .take(SEARCH_MAX_PER_TYPE)
-                                .map { s ->
-                                    newTvSeriesSearchResponse(s.name, ItemRef("s", s.series_id, s.name).toJson(), TvType.TvSeries) {
-                                        posterUrl = s.cover
-                                    }
+                            val matched = ArrayList<SearchResponse>(8)
+                            for (s in streams) {
+                                if (matched.size >= SEARCH_MAX_PER_TYPE) break
+                                if (s.name.lowercase().contains(q)) {
+                                    matched.add(newTvSeriesSearchResponse(
+                                        s.name,
+                                        ItemRef("s", s.series_id, s.name).toJson(),
+                                        TvType.TvSeries
+                                    ) { posterUrl = s.cover })
                                 }
-                                .toList()
+                            }
                             if (matched.isNotEmpty()) {
-                                synchronized(serMatches) { serMatches.addAll(matched) }
+                                synchronized(serMatches) {
+                                    serMatches.addAll(matched)
+                                    totalMatched.addAndGet(matched.size)
+                                }
                             }
                         }
                     }
@@ -1266,38 +1303,47 @@ class XtreamIPTVProvider : MainAPI() {
 
                 // ── Live TV ──
                 for (cat in liveCats) {
+                    if (!shouldContinue()) break
                     val catId = cat.category_id ?: continue
                     val key = "l_$catId"
                     async {
-                        val streams: List<XLive>? = cachedCatStreams[key] as? List<XLive>
-                            ?: RawHttp.apiGet("$apiBase&action=get_live_streams&category_id=$catId", SEARCH_CAT_TIMEOUT_MS)
-                                ?.let { tryParseJson<List<XLive>>(it) }
-                                ?.also { parsed ->
-                                    if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
-                                        cachedCatStreams[key] = parsed
+                        val streams: List<XLive>? = withTimeoutOrNull(SEARCH_CAT_TIMEOUT_MS.toLong()) {
+                            cachedCatStreams[key] as? List<XLive>
+                                ?: RawHttp.apiGet(
+                                    "$apiBase&action=get_live_streams&category_id=$catId",
+                                    SEARCH_CAT_TIMEOUT_MS, SEARCH_CAT_CONNECT_MS
+                                )?.let { tryParseJson<List<XLive>>(it) }
+                                    ?.also { parsed ->
+                                        if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
+                                            cachedCatStreams[key] = parsed
+                                        }
                                     }
-                                }
+                        }
                         if (streams != null) {
-                            val matched = streams.asSequence()
-                                .filter { it.name.lowercase().contains(q) }
-                                .take(SEARCH_MAX_PER_TYPE)
-                                .map { s ->
-                                    newMovieSearchResponse(s.name, ItemRef("l", s.stream_id, s.name).toJson(), TvType.Live) {
-                                        posterUrl = s.stream_icon
-                                    }
+                            val matched = ArrayList<SearchResponse>(8)
+                            for (s in streams) {
+                                if (matched.size >= SEARCH_MAX_PER_TYPE) break
+                                if (s.name.lowercase().contains(q)) {
+                                    matched.add(newMovieSearchResponse(
+                                        s.name,
+                                        ItemRef("l", s.stream_id, s.name).toJson(),
+                                        TvType.Live
+                                    ) { posterUrl = s.stream_icon })
                                 }
-                                .toList()
+                            }
                             if (matched.isNotEmpty()) {
-                                synchronized(liveMatches) { liveMatches.addAll(matched) }
+                                synchronized(liveMatches) {
+                                    liveMatches.addAll(matched)
+                                    totalMatched.addAndGet(matched.size)
+                                }
                             }
                         }
                     }
                 }
             }
-        } catch (_: Throwable) {
-            // coroutineScope throws on first child failure — but each async has
-            // its own try/catch via the ?:-null fallback, so this is just a safety net.
         }
+        // If overall timeout fired, we still return whatever we collected — better
+        // to show partial results than nothing.
 
         // ── 4. Merge results: movies first, then series, then live ──
         //    Cap each type so a huge movie library doesn't drown out series/live.
