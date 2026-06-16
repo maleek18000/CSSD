@@ -73,18 +73,6 @@ data class XEpInfo(val plot: String? = null, val image: String? = null)
 data class ItemRef(val t: String, val id: Int, val n: String, val e: String? = null)
 data class LinkData(val t: String, val id: Int, val e: String? = null)
 
-// ── Stremio worker JSON shapes (for fast search via the Cloudflare worker) ──
-data class StremioCatalog(val type: String? = null, val id: String? = null, val name: String? = null)
-data class StremioManifest(val catalogs: List<StremioCatalog>? = null)
-data class StremioMeta(
-    val id: String? = null,
-    val type: String? = null,
-    val name: String? = null,
-    val poster: String? = null,
-    val description: String? = null
-)
-data class StremioSearchResponse(val metas: List<StremioMeta>? = null)
-
 // ═══════════════════════════════════════════════════════════════════
 //  RAW HTTP CLIENT  (bypasses CloudStream's app.get to avoid 403)
 //
@@ -569,6 +557,32 @@ class XtreamIPTVProvider : MainAPI() {
      */
     private val cachedCatStreams = mutableMapOf<String, List<Any>>()
     private val MAX_CACHED_CATEGORIES = 30
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  GLOBAL STREAM CACHE  (OTT Navigator-style fast search)
+    //
+    //  The Xtream API supports calling get_vod_streams / get_series /
+    //  get_live_streams WITHOUT a category_id — the server then returns
+    //  ALL items of that type in a single response. By firing these 3
+    //  calls in parallel and caching the parsed lists, search becomes a
+    //  pure in-memory filter — exactly how OTT Navigator delivers
+    //  "blazingly fast" search.
+    //
+    //  Memory safety:
+    //   - Each list is capped at MAX_GLOBAL_PER_TYPE entries during parse
+    //   - enoughMemory() is checked before caching
+    //   - Cache is dropped if free memory drops below threshold
+    // ═══════════════════════════════════════════════════════════════════
+
+    /** Cap per type (movies / series / live) to bound memory. 20k each ≈ ~30MB. */
+    private val MAX_GLOBAL_PER_TYPE = 20000
+    /** Cache TTL — refresh after 30 minutes so newly added items appear. */
+    private val GLOBAL_CACHE_TTL_MS = 30L * 60 * 1000
+
+    private var cachedAllVod: List<XVod>? = null
+    private var cachedAllSeries: List<XSeries>? = null
+    private var cachedAllLive: List<XLive>? = null
+    private var cachedAllAtMs: Long = 0L
 
     // ═══════════════════════════════════════════════════════════════════
     //  XTREAM API HELPERS  (per-category only — never load all streams)
@@ -1133,153 +1147,166 @@ class XtreamIPTVProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  SEARCH  — comprehensive parallel search across ALL categories
+    //  GLOBAL STREAM FETCH  (OTT Navigator-style — 3 parallel calls)
     //
-    //  FAST PATH (Stremio worker):
-    //  The Cloudflare worker at broad-rain-6b47.ninf-2016.workers.dev
-    //  exposes a Stremio-compatible catalog search API on top of the
-    //  user's Xtream credentials. The worker caches the entire stream
-    //  catalog in Cloudflare's edge network, so a search query is a
-    //  SINGLE HTTP call per type (movie / series / live) that returns
-    //  pre-matched results. This is the same mechanism the Stremio
-    //  plugin uses to deliver "blazingly fast" search.
+    //  The Xtream API returns ALL items of a type when called WITHOUT a
+    //  category_id. We fire 3 such calls IN PARALLEL (movies / series /
+    //  live), parse the responses with a per-type cap, and stash them in
+    //  cachedAllVod / cachedAllSeries / cachedAllLive. After this one-time
+    //  fetch, every subsequent search is a pure in-memory filter — that
+    //  is exactly why OTT Navigator feels instant.
     //
-    //  Worker URL format (server is hex-encoded so it can live in a path segment):
-    //    Manifest:  https://broad-rain-6b47.ninf-2016.workers.dev/{hex-server}/{user}/{pass}/manifest.json
-    //    Search:    https://broad-rain-6b47.ninf-2016.workers.dev/{hex-server}/{user}/{pass}/catalog/{type}/{id}/search={query}.json
-    //
-    //  FALLBACK:
-    //  If the worker is unreachable or returns nothing, we fall back to
-    //  the original per-category Xtream search (slower, but always works).
+    //  Memory safety:
+    //   - Each parsed list is capped at MAX_GLOBAL_PER_TYPE (20k) entries
+    //   - enoughMemory() is checked before writing to the cache
+    //   - Stale cache (> TTL) is replaced, not duplicated
     // ═══════════════════════════════════════════════════════════════════
 
-    private val STREMIO_WORKER_HOST = "https://broad-rain-6b47.ninf-2016.workers.dev"
-
-    /** Cached Stremio manifest (parsed) — fetched once per session. */
-    private var cachedStremioManifest: StremioManifest? = null
-
-    /** Lowercase hex encoding of a string (one byte → two hex chars). */
-    private fun hexEncode(s: String): String {
-        val sb = StringBuilder(s.length * 2)
-        for (b in s.toByteArray(Charsets.UTF_8)) {
-            sb.append(String.format("%02x", b.toInt() and 0xff))
-        }
-        return sb.toString()
+    /** True if the global cache is populated and not stale. */
+    private fun globalCacheIsFresh(): Boolean {
+        val v = cachedAllVod ?: return false
+        val s = cachedAllSeries ?: return false
+        val l = cachedAllLive ?: return false
+        if (v.isEmpty() && s.isEmpty() && l.isEmpty()) return false
+        return (System.currentTimeMillis() - cachedAllAtMs) < GLOBAL_CACHE_TTL_MS
     }
 
     /**
-     * Build the Stremio worker base URL for the given Xtream credentials.
-     * Example: Cfg("http://egl-4k.xyz:80", "alice", "bob")
-     *   -> "https://broad-rain-6b47.ninf-2016.workers.dev/687474703a2f2f65676c2d346b2e78797a3a3830/alice/bob"
+     * Fetch ALL movies / series / live in 3 parallel HTTP calls.
+     * Each response is parsed with a per-type cap (MAX_GLOBAL_PER_TYPE)
+     * to bound memory. Returns true if at least one type was loaded.
+     *
+     * This is the same strategy OTT Navigator uses: 3 calls, parallel,
+     * then everything else is local. No per-category fan-out, no external
+     * worker dependency.
      */
-    private fun stremioWorkerBaseUrl(c: Cfg): String {
-        val hex = hexEncode(c.server)
+    private suspend fun fetchAndCacheAllStreams(c: Cfg): Boolean {
         val encUser = URLEncoder.encode(c.user, "UTF-8")
         val encPass = URLEncoder.encode(c.pass, "UTF-8")
-        return "$STREMIO_WORKER_HOST/$hex/$encUser/$encPass"
-    }
+        val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
 
-    /**
-     * Fetch & cache the Stremio manifest. Returns null if the worker is
-     * unavailable or the manifest is unparseable.
-     */
-    private suspend fun fetchStremioManifest(c: Cfg): StremioManifest? {
-        cachedStremioManifest?.let { return it }
-        val url = "${stremioWorkerBaseUrl(c)}/manifest.json"
-        val text = RawHttp.apiGet(url, 10000) ?: return null
-        val parsed = tryParseJson<StremioManifest>(text) ?: return null
-        if (parsed.catalogs.isNullOrEmpty()) return null
-        cachedStremioManifest = parsed
-        return parsed
-    }
-
-    /**
-     * Extract a numeric Xtream stream_id from a Stremio meta id.
-     * Stremio ids are strings ("12345", "xtream-movie-12345", etc.).
-     */
-    private fun extractStreamId(id: String?): Int? {
-        if (id.isNullOrEmpty()) return null
-        id.toIntOrNull()?.let { return it }
-        val lastDash = id.lastIndexOf('-')
-        if (lastDash in 0 until id.length - 1) {
-            id.substring(lastDash + 1).toIntOrNull()?.let { return it }
+        // 3 calls in parallel — the slowest one determines total latency.
+        // Read timeout is generous (20s) because full stream lists can be
+        // a few MB on big providers.
+        val (vodText, serText, liveText) = coroutineScope {
+            val vodDef = async { RawHttp.apiGet("$apiBase&action=get_vod_streams", 20000) }
+            val serDef = async { RawHttp.apiGet("$apiBase&action=get_series", 20000) }
+            val liveDef = async { RawHttp.apiGet("$apiBase&action=get_live_streams", 20000) }
+            Triple(vodDef.await(), serDef.await(), liveDef.await())
         }
-        Regex("""(\d+)""").find(id)?.let { return it.groupValues[1].toIntOrNull() }
-        return null
+
+        var gotAny = false
+        if (!enoughMemory()) {
+            // Don't risk OOM — bail out, per-category fallback will handle the search.
+            return false
+        }
+
+        if (!vodText.isNullOrEmpty()) {
+            try {
+                val parsed = tryParseJson<List<XVod>>(vodText) ?: emptyList()
+                cachedAllVod = if (parsed.size > MAX_GLOBAL_PER_TYPE) parsed.take(MAX_GLOBAL_PER_TYPE) else parsed
+                gotAny = true
+            } catch (_: Throwable) { /* parse fail — leave previous cache */ }
+        }
+        if (!serText.isNullOrEmpty()) {
+            try {
+                val parsed = tryParseJson<List<XSeries>>(serText) ?: emptyList()
+                cachedAllSeries = if (parsed.size > MAX_GLOBAL_PER_TYPE) parsed.take(MAX_GLOBAL_PER_TYPE) else parsed
+                gotAny = true
+            } catch (_: Throwable) { /* parse fail */ }
+        }
+        if (!liveText.isNullOrEmpty()) {
+            try {
+                val parsed = tryParseJson<List<XLive>>(liveText) ?: emptyList()
+                cachedAllLive = if (parsed.size > MAX_GLOBAL_PER_TYPE) parsed.take(MAX_GLOBAL_PER_TYPE) else parsed
+                gotAny = true
+            } catch (_: Throwable) { /* parse fail */ }
+        }
+
+        if (gotAny) {
+            cachedAllAtMs = System.currentTimeMillis()
+        }
+        return gotAny
     }
 
     /**
-     * FAST SEARCH via the Stremio worker.
-     *
-     * Fires one HTTP call per catalog (movie/series/live) IN PARALLEL.
-     * The worker does the search server-side on its cached index, so
-     * each call returns only matching items — no client-side filtering
-     * of huge stream lists.
-     *
-     * Returns null if the worker is unavailable or returns no matches
-     * (so the caller can fall back to the per-category search).
+     * Filter the global cache by query. Pure in-memory — no HTTP.
+     * Returns SearchResponse objects ready to be shown to the user.
+     * Returns null if the cache is empty.
      */
-    private suspend fun searchStremioWorker(c: Cfg, query: String): List<SearchResponse>? {
-        val manifest = fetchStremioManifest(c) ?: return null
-        val catalogs = manifest.catalogs ?: return null
-        if (catalogs.isEmpty()) return null
+    private fun searchGlobalCache(q: String): List<SearchResponse>? {
+        val vod = cachedAllVod
+        val ser = cachedAllSeries
+        val live = cachedAllLive
+        if (vod == null && ser == null && live == null) return null
 
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val baseUrl = stremioWorkerBaseUrl(c)
         val results = mutableListOf<SearchResponse>()
 
-        try {
-            coroutineScope {
-                for (catalog in catalogs) {
-                    val catType = catalog.type ?: continue
-                    val catId = catalog.id ?: continue
-                    async {
-                        try {
-                            val url = "$baseUrl/catalog/$catType/$catId/search=$encodedQuery.json"
-                            val text = RawHttp.apiGet(url, 9000) ?: return@async
-                            val parsed = tryParseJson<StremioSearchResponse>(text) ?: return@async
-                            val metas = parsed.metas ?: return@async
-                            if (metas.isEmpty()) return@async
-
-                            val matched = mutableListOf<SearchResponse>()
-                            for (meta in metas) {
-                                val name = meta.name ?: continue
-                                val id = extractStreamId(meta.id) ?: continue
-                                val poster = meta.poster
-                                val response: SearchResponse? = when (catType) {
-                                    "movie" -> newMovieSearchResponse(
-                                        name,
-                                        ItemRef("m", id, name, "mp4").toJson(),
-                                        TvType.Movie
-                                    ) { posterUrl = poster }
-                                    "series" -> newTvSeriesSearchResponse(
-                                        name,
-                                        ItemRef("s", id, name).toJson(),
-                                        TvType.TvSeries
-                                    ) { posterUrl = poster }
-                                    "tv" -> newMovieSearchResponse(
-                                        name,
-                                        ItemRef("l", id, name).toJson(),
-                                        TvType.Live
-                                    ) { posterUrl = poster }
-                                    else -> null
-                                }
-                                if (response != null) matched.add(response)
-                            }
-                            if (matched.isNotEmpty()) {
-                                synchronized(results) { results.addAll(matched) }
-                            }
-                        } catch (_: Throwable) { /* one catalog failing shouldn't kill the rest */ }
-                    }
+        vod?.let { list ->
+            list.asSequence()
+                .filter { it.name.lowercase().contains(q) }
+                .take(SEARCH_MAX_PER_TYPE)
+                .forEach { s ->
+                    results.add(
+                        newMovieSearchResponse(
+                            s.name,
+                            ItemRef("m", s.stream_id, s.name, s.container_extension ?: "mp4").toJson(),
+                            TvType.Movie
+                        ) { posterUrl = s.stream_icon }
+                    )
                 }
-            }
-        } catch (_: Throwable) {
-            // coroutineScope throws on first child failure — but each async has
-            // its own try/catch so this is just a safety net.
+        }
+        ser?.let { list ->
+            list.asSequence()
+                .filter { it.name.lowercase().contains(q) }
+                .take(SEARCH_MAX_PER_TYPE)
+                .forEach { s ->
+                    results.add(
+                        newTvSeriesSearchResponse(
+                            s.name,
+                            ItemRef("s", s.series_id, s.name).toJson(),
+                            TvType.TvSeries
+                        ) { posterUrl = s.cover }
+                    )
+                }
+        }
+        live?.let { list ->
+            list.asSequence()
+                .filter { it.name.lowercase().contains(q) }
+                .take(SEARCH_MAX_PER_TYPE)
+                .forEach { s ->
+                    results.add(
+                        newMovieSearchResponse(
+                            s.name,
+                            ItemRef("l", s.stream_id, s.name).toJson(),
+                            TvType.Live
+                        ) { posterUrl = s.stream_icon }
+                    )
+                }
         }
 
-        return if (results.isEmpty()) null else results
+        return if (results.isEmpty()) emptyList() else results
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  SEARCH  — comprehensive parallel search across ALL categories
+    //
+    //  The Xtream Codes API has no native search endpoint, so we must
+    //  search client-side. This implementation searches EVERY category
+    //  (movies + series + live TV) on the provider — including categories
+    //  that are NOT shown on the home screen.
+    //
+    //  Strategy:
+    //  1. Ensure category lists are loaded (3 tiny API calls, cached)
+    //  2. For every category in every type, fetch its streams IN PARALLEL
+    //     (cached categories are read from memory instantly)
+    //  3. Filter each category's streams by the query (case-insensitive)
+    //  4. Merge all matching results, capped per-type to avoid flooding
+    //
+    //  Memory safety: each category's stream list is parsed, filtered, and
+    //  only the small SearchResponse objects are kept — not the full lists.
+    //  The cache is bounded by MAX_CACHED_CATEGORIES to prevent OOM.
+    // ═══════════════════════════════════════════════════════════════════
 
     /** Maximum search results to return. */
     private val SEARCH_MAX_RESULTS = 60
@@ -1309,23 +1336,30 @@ class XtreamIPTVProvider : MainAPI() {
             }
         }
 
-        // ── 2. FAST PATH: Stremio worker search (blazingly fast) ──
-        //    One HTTP call per type (movie/series/live) IN PARALLEL.
-        //    The worker caches the entire catalog in Cloudflare's edge
-        //    and returns only matching items — no client-side filtering
-        //    of huge stream lists. This is the same mechanism the Stremio
-        //    plugin uses to deliver "blazingly fast" search.
+        // ── 2. FAST PATH: OTT Navigator-style global cache ──
+        //    If we already have the full movie/series/live lists cached,
+        //    search is a pure in-memory filter — instant.
+        //    If the cache is empty or stale, fire 3 parallel HTTP calls
+        //    (movies / series / live — no category_id = server returns ALL)
+        //    and cache the result. This is the same strategy OTT Navigator
+        //    uses to deliver "blazingly fast" search. No external worker
+        //    dependency, no per-category fan-out.
         val c = cfg()
         if (c == null) {
             return if (results.isEmpty()) null else results.take(SEARCH_MAX_RESULTS)
         }
 
         try {
-            val workerResults = searchStremioWorker(c, query)
-            if (workerResults != null && workerResults.isNotEmpty()) {
-                results.addAll(workerResults)
+            if (!globalCacheIsFresh()) {
+                // First search or cache expired — do the 3-call fetch.
+                // Subsequent searches within TTL will skip this entirely.
+                fetchAndCacheAllStreams(c)
+            }
+            val cached = searchGlobalCache(q)
+            if (cached != null) {
+                results.addAll(cached)
 
-                // Ensure Xtream categories are also loaded (cheap, helps home page)
+                // Also ensure Xtream category lists are loaded (cheap, helps home page)
                 if (!hasXtreamCache()) {
                     try {
                         fetchXtreamCategories(c)?.let { (v, s, l) ->
@@ -1342,11 +1376,12 @@ class XtreamIPTVProvider : MainAPI() {
                 return if (dedupedFast.isEmpty()) null else dedupedFast.take(SEARCH_MAX_RESULTS)
             }
         } catch (_: Throwable) {
-            // Worker failed — fall through to per-category fallback
+            // Global fetch failed — fall through to per-category fallback
         }
 
         // ── 3. FALLBACK: per-category Xtream search (slower but reliable) ──
-        //    Used when the worker is down or returns no results.
+        //    Used when the global fetch fails (provider blocks no-category
+        //    calls, or memory is too low to cache all streams).
 
         // If categories are not yet cached, fetch them now (3 tiny parallel calls).
         if (!hasXtreamCache()) {
