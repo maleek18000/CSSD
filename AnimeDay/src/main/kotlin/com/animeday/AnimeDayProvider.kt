@@ -10,11 +10,8 @@ import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.sync.withPermit
 
 // ==================== Data Classes ====================
 
@@ -227,34 +224,24 @@ class AnimeDayProvider : MainAPI() {
     private val agentsMutex = Mutex()
 
     private suspend fun getAgents(): AgentsCookies? {
-        // Thread-safe: only one coroutine fetches, others wait and reuse the result.
-        // Prevents 6x duplicate HTTP fetches when loadLinks runs servers in parallel.
+        // Mutex prevents 6 parallel coroutines from firing duplicate HTTP POSTs.
+        // Without this, all 6 servers in loadLinks see agentsFetched=false at once
+        // and each fires its own fetch — 6x memory pressure during the crash window.
         agentsMutex.withLock {
             if (agentsFetched) return cachedAgents
             if (agentsFetchFailed) return null  // Don't retry if it failed before
             agentsFetched = true
             cachedAgents = try {
-                withTimeoutOrNull(5000L) {  // Reduced from 8000L
-                    val text = app.post(
-                        "$apiUrl/AgentsAndCookies/getData.php",
-                        headers = authHeaders
-                    ).text
-                    parseObject<AgentsCookies>(text)
-                }
+                val text = app.post(
+                    "$apiUrl/AgentsAndCookies/getData.php",
+                    headers = authHeaders
+                ).text
+                parseObject<AgentsCookies>(text)
             } catch (_: Throwable) {
                 agentsFetchFailed = true
                 null
             }
             return cachedAgents
-        }
-    }
-
-    // ========== OPTIMIZATION 2: URL resolution cache ==========
-    // Cache resolved video URLs in memory to avoid re-fetching
-    // when user switches quality/server for the same episode
-    private val urlCache = object : LinkedHashMap<String, List<ExtractorLink>>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<ExtractorLink>>): Boolean {
-            return size > 50  // Cache up to 50 resolved URLs
         }
     }
 
@@ -272,10 +259,7 @@ class AnimeDayProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
-            val response = withTimeoutOrNull(6000L) {  // Reduced from 12000L
-                app.get(url, headers = authHeaders)
-            } ?: return false
-
+            val response = app.get(url, headers = authHeaders)
             val responseText = response.text
 
             // Fast path: Try availableQualities first (most common format)
@@ -437,9 +421,7 @@ class AnimeDayProvider : MainAPI() {
                 gPhotosHeaders["Cookie"] = it
             }
 
-            val pageText = withTimeoutOrNull(5000L) {  // Reduced from 10000L
-                app.get(url, headers = gPhotosHeaders).text
-            } ?: return false
+            val pageText = app.get(url, headers = gPhotosHeaders).text
 
             // Fix malformed percent encoding
             val fixed = Regex("%(?![0-9a-fA-F]{2})").replace(pageText) { "%25" }
@@ -536,17 +518,15 @@ class AnimeDayProvider : MainAPI() {
 
             // Use metadata API — same as native app
             val metadataUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
-            val metaResponse = withTimeoutOrNull(5000L) {  // Reduced from 10000L
-                app.post(
-                    metadataUrl,
-                    headers = mapOf(
-                        "User-Agent" to userAgent,
-                        "Cookie" to cookie,
-                        "Content-Type" to "application/x-www-form-urlencoded"
-                    ),
-                    data = mapOf("" to "")
-                ).text
-            } ?: return false
+            val metaResponse = app.post(
+                metadataUrl,
+                headers = mapOf(
+                    "User-Agent" to userAgent,
+                    "Cookie" to cookie,
+                    "Content-Type" to "application/x-www-form-urlencoded"
+                ),
+                data = mapOf("" to "")
+            ).text
 
             val metadata = mapper.readTree(metaResponse)
 
@@ -577,15 +557,13 @@ class AnimeDayProvider : MainAPI() {
             // Try ondemandHls if videos array fails
             val hlsUrl = metadata?.get("ondemandHls")?.asText()
             if (hlsUrl != null && hlsUrl.isNotEmpty()) {
-                val hlsResponse = withTimeoutOrNull(5000L) {  // Reduced from 10000L
-                    app.get(
-                        hlsUrl,
-                        headers = mapOf(
-                            "User-Agent" to userAgent,
-                            "Cookie" to cookie
-                        )
-                    ).text
-                } ?: return false
+                val hlsResponse = app.get(
+                    hlsUrl,
+                    headers = mapOf(
+                        "User-Agent" to userAgent,
+                        "Cookie" to cookie
+                    )
+                ).text
 
                 val lines = hlsResponse.lines()
                 var foundAny = false
@@ -623,9 +601,8 @@ class AnimeDayProvider : MainAPI() {
 
         // Fallback: try CloudStream's built-in extractor (last resort)
         try {
-            withTimeoutOrNull(5000L) {  // Reduced from 10000L
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
-            }?.let { return true }
+            loadExtractor(url, mainUrl, subtitleCallback, callback)
+            return true
         } catch (_: Exception) {}
 
         return false
@@ -643,9 +620,8 @@ class AnimeDayProvider : MainAPI() {
     ): Boolean {
         // Try CloudStream's built-in extractor with reduced timeout
         try {
-            withTimeoutOrNull(5000L) {  // Reduced from 10000L
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
-            }?.let { return true }
+            loadExtractor(url, mainUrl, subtitleCallback, callback)
+            return true
         } catch (_: Exception) {}
         return false
     }
@@ -679,9 +655,8 @@ class AnimeDayProvider : MainAPI() {
 
         // Fallback: try CloudStream's built-in extractor
         try {
-            withTimeoutOrNull(5000L) {
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
-            }?.let { return true }
+            loadExtractor(url, mainUrl, subtitleCallback, callback)
+            return true
         } catch (_: Exception) {}
         return false
     }
@@ -775,9 +750,8 @@ class AnimeDayProvider : MainAPI() {
 
         // 9. Unknown URL - try CloudStream's built-in extractor with shorter timeout
         try {
-            withTimeoutOrNull(5000L) {  // Reduced from 8000L
-                loadExtractor(cleanUrl, mainUrl, subtitleCallback, callback)
-            }?.let { return true }
+            loadExtractor(cleanUrl, mainUrl, subtitleCallback, callback)
+            return true
         } catch (_: Exception) {}
 
         // 10. Last resort: pass as direct link
@@ -1021,43 +995,33 @@ class AnimeDayProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        // Pre-fetch agents/cookies in background (won't block if already fetched).
-        // Wrapped in try-catch(Throwable) so a failure here can never crash the app.
-        try {
-            coroutineScope {
-                async { getAgents() }
-            }
-        } catch (_: Throwable) {}
+        // Pre-fetch agents/cookies in background (won't block if already fetched)
+        coroutineScope {
+            async { getAgents() }
+        }
 
         var foundAny = false
-        // Limit parallel extractions to 2 at a time. On phones/Android TVs with
-        // 1-2GB RAM, launching all 6 servers in parallel causes OutOfMemoryError
-        // (which is an Error, not an Exception) and kills the app. The LDPlayer
-        // emulator (4-8GB RAM) tolerates this; real devices do not.
-        val semaphore = Semaphore(2)
+        // Top-level safety net: catch Throwable (not Exception) so OutOfMemoryError,
+        // StackOverflowError, etc. don't crash CloudStream on phones/Android TVs.
+        // The LDPlayer emulator has 4-8GB RAM and tolerates these; real devices do not.
         try {
             coroutineScope {
                 videoUrls.entries.map { (serverName, urlAndExtraction) ->
                     async {
-                        semaphore.withPermit {
-                            val result = withTimeoutOrNull(8000L) {  // Reduced from 15000L
-                                try {
-                                    val (url, needsExtraction) = urlAndExtraction
-                                    extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
-                                } catch (_: Throwable) {
-                                    // Catch Throwable (not Exception) so OutOfMemoryError,
-                                    // StackOverflowError, etc. don't crash the app.
-                                    false
-                                }
-                            } ?: false
-                            if (result) foundAny = true
+                        try {
+                            val (url, needsExtraction) = urlAndExtraction
+                            if (extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)) {
+                                foundAny = true
+                            }
+                        } catch (_: Throwable) {
+                            // Catch Throwable so an Error in one extractor doesn't
+                            // tear down the whole coroutineScope and the app.
                         }
                     }
                 }.forEach { it.await() }
             }
         } catch (_: Throwable) {
-            // Last-resort safety net: never let loadLinks propagate an Error up
-            // to CloudStream — that would shut down the app on phones/Android TVs.
+            // Last-resort safety net: never propagate an Error up to CloudStream.
         }
 
         return foundAny
