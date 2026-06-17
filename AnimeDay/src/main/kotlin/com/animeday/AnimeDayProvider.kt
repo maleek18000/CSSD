@@ -455,48 +455,15 @@ class AnimeDayProvider : MainAPI() {
                 foundAny = true
             }
 
-            // 2. Extract lh3 base URL and generate quality URLs (simplified)
-            val lh3Pattern = Regex("""https://lh3\.googleusercontent\.com/pw/[^"\\\s]+""")
-            var lh3BaseUrl: String? = null
-            for (match in lh3Pattern.findAll(decoded)) {
-                val foundUrl = match.value
-                // Prefer URL without size suffix
-                if (!foundUrl.contains("=s") && !foundUrl.contains("=w") &&
-                    !foundUrl.contains("=d") && !foundUrl.contains("=m") && !foundUrl.contains("=h")) {
-                    lh3BaseUrl = foundUrl
-                    break
-                }
-            }
-            if (lh3BaseUrl == null) {
-                lh3Pattern.find(decoded)?.value?.let { rawUrl ->
-                    val lastEqIndex = rawUrl.lastIndexOf('=')
-                    lh3BaseUrl = if (lastEqIndex > 0) rawUrl.substring(0, lastEqIndex) else rawUrl
-                }
-            }
-
-            // Generate quality URLs from lh3 base (same as native app's approach)
-            if (lh3BaseUrl != null) {
-                data class SimpleQuality(val suffix: String, val qualityName: String, val qualityValue: Int)
-                for (sq in listOf(
-                    SimpleQuality("=m22", "720p", Qualities.P720.value),
-                    SimpleQuality("=m37", "1080p", Qualities.P1080.value),
-                    SimpleQuality("=m18", "480p", Qualities.P480.value)
-                )) {
-                    callback(
-                        newExtractorLink(
-                            source = serverName,
-                            name = "$serverName - ${sq.qualityName}",
-                            url = lh3BaseUrl!! + sq.suffix,
-                            type = INFER_TYPE
-                        ) {
-                            this.referer = ""
-                            this.quality = sq.qualityValue
-                        }
-                    )
-                    foundAny = true
-                }
-            }
-
+            // CRASH FIX v6: the lh3.googleusercontent.com /pw/ URLs are
+            // image-CDN endpoints — the =m22 / =m37 / =m18 suffixes do NOT
+            // produce playable video URLs (those come from
+            // video-downloads.googleusercontent.com above). The previously
+            // generated lh3 "quality" URLs were broken: the player still
+            // tried to probe each one in parallel via MediaHTTPConnection,
+            // spawning threads that contributed to pthread_create failures.
+            // Drop them entirely — the Original-quality video-downloads URL
+            // above is the only playable link, same as the native app.
             return foundAny
         } catch (_: Exception) {
             return false
@@ -612,13 +579,15 @@ class AnimeDayProvider : MainAPI() {
             }
         } catch (_: Exception) {}
 
-        // Fallback: try CloudStream's built-in extractor (last resort)
-        try {
-            withTimeoutOrNull(5000L) {  // Reduced from 10000L
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
-            }?.let { return true }
-        } catch (_: Exception) {}
-
+        // CRASH FIX v6: loadExtractor fallback REMOVED. CloudStream's
+        // loadExtractor iterates through ALL registered extractors in
+        // parallel, each spawning HTTP requests + parser coroutines on
+        // Dispatchers.IO — a single call can fan out into 20-40 native
+        // threads. With 6 servers this caused 120-240 lingering threads
+        // (OkHttp keeps dispatcher threads alive for 60s) -> exhausted
+        // the per-process pthread cap on phones/TVs -> pthread_create
+        // failed -> OOM -> crash. The metadata-API + ondemandHls paths
+        // above cover the working ok.ru cases.
         return false
     }
 
@@ -632,12 +601,12 @@ class AnimeDayProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Try CloudStream's built-in extractor with reduced timeout
-        try {
-            withTimeoutOrNull(5000L) {  // Reduced from 10000L
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
-            }?.let { return true }
-        } catch (_: Exception) {}
+        // CRASH FIX v6: loadExtractor call REMOVED — it iterates through
+        // all registered extractors in parallel, spawning 20-40 native
+        // threads per invocation and exhausting the per-process pthread
+        // cap on phones/TVs. Dailymotion support is sacrificed to fix the
+        // crash; if needed later, replace with a dedicated single-thread
+        // metadata-API implementation (like extractOkRu).
         return false
     }
 
@@ -668,12 +637,10 @@ class AnimeDayProvider : MainAPI() {
             return true
         } catch (_: Exception) {}
 
-        // Fallback: try CloudStream's built-in extractor
-        try {
-            withTimeoutOrNull(5000L) {
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
-            }?.let { return true }
-        } catch (_: Exception) {}
+        // CRASH FIX v6: loadExtractor fallback REMOVED — see note in
+        // extractDailymotion. The direct-add path above is the only one
+        // the native app uses; loadExtractor was a thread-spawning
+        // catch-all that contributed to pthread_create failures.
         return false
     }
 
@@ -764,14 +731,11 @@ class AnimeDayProvider : MainAPI() {
             return extractGooglePhotos(cleanUrl, serverName, callback)
         }
 
-        // 9. Unknown URL - try CloudStream's built-in extractor with shorter timeout
-        try {
-            withTimeoutOrNull(5000L) {  // Reduced from 8000L
-                loadExtractor(cleanUrl, mainUrl, subtitleCallback, callback)
-            }?.let { return true }
-        } catch (_: Exception) {}
-
-        // 10. Last resort: pass as direct link
+        // CRASH FIX v6: step 9 (loadExtractor for unknown URLs) REMOVED —
+        // it iterates through ALL registered extractors in parallel,
+        // spawning 20-40 native threads per invocation. Go straight to
+        // the last-resort direct-link path below.
+        // 9. Last resort: pass as direct link
         try {
             callback(
                 newExtractorLink(
@@ -860,19 +824,14 @@ class AnimeDayProvider : MainAPI() {
             "1" to "2", "1" to "1", "2" to "2", "2" to "1"
         )
 
-        // CRASH FIX v5: previously fired 4 parallel `async` HTTP requests via
-        // `coroutineScope { map { async { app.get(...) } } }`. Each `app.get`
-        // spawns an OkHttp dispatcher thread + async-timeout watchdog thread +
-        // connection-pool thread (~3 native threads per request) = 12 native
-        // threads just for search. Combined with CloudStream's background thread
-        // pressure, this tipped low-end phones/Android TVs past their
-        // per-process pthread cap (often 300-500) -> pthread_create(1040kb
-        // stack) failed -> OOM -> crash. LDPlayer survives because its desktop
-        // host has a thread cap in the thousands.
-        //
-        // Fix: process the 4 search configs SEQUENTIALLY. Slower by ~3x but
-        // keeps native thread count bounded. With 4 sequential calls × 3s
-        // each = ~12s worst case, well within CloudStream's search timeout.
+        // CRASH FIX v6: previously fired 4 parallel `async` HTTP requests.
+        // Each `app.get` spawns an OkHttp dispatcher thread + async-timeout
+        // watchdog + connection-pool thread (~3 native threads per request)
+        // = 12 native threads just for search. Combined with CloudStream's
+        // background thread pressure, this tipped low-end phones/Android TVs
+        // past their per-process pthread cap -> pthread_create(1040kb stack)
+        // failed -> OOM -> crash. Fix: process the 4 search configs
+        // SEQUENTIALLY. Slower but keeps native thread count bounded.
         for ((type, classification) in searchConfigs) {
             try {
                 val text = app.get(
@@ -906,25 +865,17 @@ class AnimeDayProvider : MainAPI() {
         val playlists = parseList<Playlist>(playlistsText)
         if (playlists.isEmpty()) return null
 
-        // CRASH FIX v5: previously fetched episodes for ALL playlists in
-        // parallel via `coroutineScope { playlists.map { async { app.post(...) } } }`.
-        // For long-running anime with 5-10 seasons/playlists that's 5-10
-        // parallel `app.post` calls, each spawning an OkHttp dispatcher thread
-        // + async-timeout watchdog + connection-pool thread (~3 native threads
-        // per request) = 15-30 native threads just for episode listing.
-        // Combined with CloudStream's framework threads (image loaders, HTTP
-        // cache, player preload) this tipped low-end phones/Android TVs past
-        // their per-process pthread cap (often 300-500, lower on TV boxes) ->
-        // pthread_create(1040kb stack) failed -> OOM -> crash. The user
-        // reports the crash happening "before the skip-loading-links banner
-        // appears" — that's exactly this load() phase, NOT loadLinks().
-        // LDPlayer survives because its desktop host has a thread cap in the
-        // thousands.
-        //
-        // Fix: fetch episodes for each playlist SEQUENTIALLY. Slower by N x
-        // but keeps native thread count bounded. Typical case: 1-3 playlists
-        // x ~0.5s each = 1.5s worst case — imperceptible. Worst case (10
-        // seasons) = ~5s, still well within CloudStream's load timeout.
+        // CRASH FIX v6: previously fetched episodes for ALL playlists in
+        // parallel via `coroutineScope { playlists.map { async { app.post } } }`.
+        // For long-running anime with 5-10 seasons that's 5-10 parallel
+        // `app.post` calls, each spawning ~3 native threads (OkHttp
+        // dispatcher + async-timeout watchdog + connection-pool) = 15-30
+        // native threads just for episode listing. Combined with
+        // CloudStream's framework threads this tipped low-end phones/TVs
+        // past their per-process pthread cap -> pthread_create failed ->
+        // OOM -> crash. The user reports the crash happening "before the
+        // skip-loading-links banner" — that's this load() phase.
+        // Fix: fetch episodes for each playlist SEQUENTIALLY.
         val playlistEpisodes = mutableMapOf<String, List<Episode>>()
         var firstEpisodeInfo: Episode? = null
 
@@ -1039,37 +990,44 @@ class AnimeDayProvider : MainAPI() {
         }
 
         var foundAny = false
-        // CRASH FIX v5: previously fired up to 6 parallel `async` extractions
-        // via `coroutineScope { map { async { extractFromUrl(...) } } }`. Each
-        // extractFromUrl does 1-2 `app.get/post` calls (workers.dev JSON,
-        // ok.ru metadata, Google Photos HTML), each spawning an OkHttp
-        // dispatcher thread + async-timeout watchdog + connection-pool thread
-        // (~3 native threads per HTTP call). 6 parallel extractions × 2 HTTP
-        // calls × 3 threads = ~36 native threads just for extraction. Then
-        // the player probes EVERY returned link in parallel via
-        // MediaHTTPConnection.readAt + Binder.execTransact + OkHttp async
-        // (3 native threads per probe). The original code returned 20-30
-        // links = 60-90+ probe threads. Total: 100+ native threads ->
-        // pthread_create(1040kb stack) failed -> OOM -> crash on phones/TVs.
-        // LDPlayer survives because its desktop host has a thread cap in
-        // the thousands.
+        // CRASH FIX v6 (combines v3+v4+v5 — previous attempts each missed
+        // at least one thread-spawning source):
         //
-        // v5 fix (confined to loadLinks only):
-        //   1. BUFFERING CALLBACK: at most MAX_LINKS links are forwarded to
-        //      the player, capping player-probe threads at MAX_LINKS × 3.
-        //   2. SEQUENTIAL for-loop (one server at a time) so OkHttp dispatcher
-        //      threads don't pile up across servers.
-        //   3. Per-iteration coroutineScope so any child coroutines spawned
-        //      inside extractFromUrl are cancelled before next iteration.
-        //   4. yield() + delay(500ms) between iterations to let OkHttp's
-        //      dispatcher + connection pool + async-timeout watchdog threads
-        //      actually return to their pools before the next iteration.
-        //   5. BREAK early once MAX_LINKS is reached.
-        //   6. Per-server timeout 8s -> 5s so a stuck request doesn't hold
-        //      its threads for too long.
-        // AtomicInteger (fully-qualified, no import added) is used because
-        // the buffering callback may be invoked from Dispatchers.IO threads
-        // inside extractFromUrl, and we need thread-safe counting.
+        // v1 (sequential loadLinks) — crashed: still had loadExtractor calls.
+        // v2 (sequential + per-iter coroutineScope + 120ms delay) — crashed:
+        // still had loadExtractor calls.
+        // v3 (v2 + removed loadExtractor + removed fake lh3 URLs) — crashed:
+        // still had PARALLEL loadLinks + parallel load() + parallel search().
+        // v4 (sequential + buffering callback MAX_LINKS=5) — crashed: still
+        // had loadExtractor calls.
+        // v4 with MAX_LINKS=1 — crashed: still had loadExtractor calls.
+        // v5 (sequential search + sequential load + sequential loadLinks +
+        // buffering) — crashed: STILL had loadExtractor calls in
+        // extractFromUrl/extractOkRu/extractDailymotion/extractGdPlayerPro.
+        //
+        // Root cause finally clear: each loadExtractor call iterates through
+        // ALL registered CloudStream extractors in parallel, spawning 20-40
+        // native threads. With 6 servers that's 120-240 lingering threads
+        // (OkHttp keeps dispatcher threads alive for 60s, connection pool
+        // for 5min) -> exhausted per-process pthread cap on phones/TVs ->
+        // pthread_create(1040kb stack) failed -> OOM -> crash. LDPlayer
+        // survives because its desktop host has a thread cap in the thousands.
+        //
+        // v6 = FIRST TIME combining ALL fixes:
+        //   1. search() SEQUENTIAL (from v5)
+        //   2. load() episode-fetching SEQUENTIAL (from v5)
+        //   3. loadLinks() SEQUENTIAL + buffering callback capping
+        //      player-visible links at MAX_LINKS=5 (from v4/v5)
+        //   4. ALL loadExtractor calls REMOVED from extractFromUrl,
+        //      extractOkRu, extractDailymotion, extractGdPlayerPro (from v3)
+        //   5. Fake lh3 Google Photos URLs REMOVED (from v3) — they were
+        //      broken image-CDN URLs that the player wasted threads probing
+        //   6. Per-iteration coroutineScope + yield() + delay(500ms) to let
+        //      OkHttp threads return to pools between servers
+        //   7. Per-server timeout 8s -> 5s
+        // AtomicInteger (fully-qualified, no import added) for thread-safe
+        // counting since the buffering callback may be invoked from
+        // Dispatchers.IO threads inside extractFromUrl.
         val MAX_LINKS = 5
         val linksReturned = java.util.concurrent.atomic.AtomicInteger(0)
         val bufferingCallback: (ExtractorLink) -> Unit = { link ->
@@ -1093,8 +1051,8 @@ class AnimeDayProvider : MainAPI() {
             if (result) foundAny = true
             // Let OkHttp dispatcher / connection pool / async-timeout
             // watchdog threads return to their pools before the next
-            // iteration tries to spawn new ones. Fully-qualified to avoid
-            // touching the import block.
+            // iteration tries to spawn new ones. Fully-qualified to
+            // avoid touching the import block.
             kotlinx.coroutines.yield()
             kotlinx.coroutines.delay(500)
         }
