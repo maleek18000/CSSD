@@ -921,18 +921,19 @@ class AnimeDayProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        // CRASH FIX v21: FIRST SERVER WITH DIRECT URLs + break when found.
-        // v18/v19 stopped the crash (minimal loadLinks). v20 tried ALL servers
-        // and crashed again (too many cumulative HTTP requests). v21 = v19's
-        // minimal approach + v20's direct-URL filter:
-        //   - Try servers SEQUENTIALLY (one at a time, not parallel)
-        //   - Use a FILTERING callback that only forwards DIRECT video URLs
-        //     (mp4, m3u8, CDN, googleusercontent) to the player
-        //   - BREAK as soon as ONE server yields at least one direct video URL
-        //   - If first server yields no direct URLs, try next (sequentially)
-        //   - Stop after MAX_LINKS direct URLs collected
-        // This caps HTTP requests to ~2 (one server + maybe getAgents) while
-        // ensuring the player only gets URLs it can actually play (no 3003).
+        // CRASH FIX v22: v19 EXACTLY (break after first server returns ANY
+        // result) + v20's direct-URL filter.
+        // v21 crashed because it tried the NEXT server when the first yielded
+        // no direct URLs — this accumulated HTTP requests like v20 did.
+        // v22 goes back to v19's proven logic: break after the first server
+        // returns ANY result (extractFromUrl returns true). The filtering
+        // callback ensures only DIRECT video URLs reach the player, so:
+        //   - First server returns direct URLs -> player gets them -> plays
+        //   - First server returns non-direct URLs -> player gets NOTHING
+        //     (filtered) -> "no links found" but NO CRASH
+        //   - First server returns nothing -> try next server (sequentially)
+        // This caps HTTP requests to ~2 (one server + maybe getAgents), the
+        // same as v18/v19 which proved crash-free.
         var foundAny = false
         val MAX_LINKS = 5
         val linksReturned = java.util.concurrent.atomic.AtomicInteger(0)
@@ -944,18 +945,18 @@ class AnimeDayProvider : MainAPI() {
 
         for ((serverName, urlAndExtraction) in videoUrls.entries) {
             kotlinx.coroutines.yield()
-            if (linksReturned.get() > 0) break  // Got direct URLs from a server, stop
             val (url, needsExtraction) = urlAndExtraction
-            try {
+            val result = try {
                 extractFromUrl(url, serverName, needsExtraction, subtitleCallback, filteringCallback)
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
+                false
             }
-            if (linksReturned.get() > 0) {
+            if (result) {
                 foundAny = true
-                break  // FIRST SERVER with direct URLs — stop
+                break  // FIRST SERVER returned any result — stop (v19's logic)
             }
-            // If this server yielded no direct URLs, try next (sequentially)
+            // Only try next server if this one returned NOTHING (extractFromUrl=false)
         }
 
         return foundAny
