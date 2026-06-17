@@ -921,41 +921,33 @@ class AnimeDayProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        // CRASH FIX v23: ZERO HTTP in loadLinks + skip non-direct URLs.
+        // CRASH FIX v24 = v18 EXACTLY (the version that worked: no crash,
+        // some episodes playing).
         //
-        // BREAKTHROUGH: On Android, java.net.HttpURLConnection is BACKED BY
-        // OKHTTP internally (since Android 4.4). So v15-v22's "bypass OkHttp
-        // with HttpURLConnection" was an illusion — extraction HTTP requests
-        // still went through OkHttp's connection pool. That's why v19-v22 all
-        // crashed despite using HttpURLConnection.
+        // v23 filtered to only "direct video URLs" but NONE of the episode
+        // URLs are already direct (they're all workers.dev/ok.ru/Google Photos
+        // URLs needing extraction). So v23 showed "no links found" for
+        // everything.
         //
-        // v18 didn't crash because it did ZERO HTTP requests in loadLinks.
-        // v19-v22 all crashed because they called extractFromUrl which does
-        // HTTP (even via HttpURLConnection = OkHttp).
+        // v18 returned raw URLs and let the player try them. The player has
+        // built-in handlers for some URL types, so some episodes played. No
+        // crash because loadLinks does ZERO HTTP requests.
         //
-        // v23 = v18 (zero HTTP) + skip non-direct URLs:
+        // v24 = v18 exactly:
         //   - Return raw episode URLs DIRECTLY to the player (no extraction)
-        //   - SKIP URLs that aren't already direct video URLs (no workers.dev
-        //     JSON endpoints, no ok.ru webpages, no Google Photos URLs that
-        //     need HTML scraping)
-        //   - Only return URLs that are ALREADY playable: .mp4, .m3u8, CDN
-        //     URLs (okcdn.ru, vkuser.net), googleusercontent.com direct URLs
+        //   - First server only (break after first — minimizes player threads)
+        //   - Explicit ExtractorLinkType (VIDEO/M3U8, never INFER_TYPE)
         //   - No HTTP requests, no extraction, no OkHttp, no crash
         //
-        // Tradeoff: episodes whose servers only have URLs needing extraction
-        // (workers.dev, ok.ru, Google Photos) will show "no links found".
-        // Episodes with direct video URLs (mp4/m3u8/CDN) will play. This is
-        // the same as v18 but without passing non-playable URLs to the player
-        // (which caused 3003 errors in v18).
+        // Tradeoff: some episodes will show 3003 errors (URLs the player
+        // can't handle). But no crash, and some episodes play. This is the
+        // best we can do without extraction (which crashes).
         var foundAny = false
         for ((serverName, urlAndExtraction) in videoUrls.entries) {
             kotlinx.coroutines.yield()
             val (rawUrl, _) = urlAndExtraction
             val cleanUrl = rawUrl.trim()
             if (cleanUrl.isEmpty()) continue
-
-            // SKIP non-direct URLs — only return already-playable URLs
-            if (!isDirectVideoUrl(cleanUrl)) continue
 
             val linkType = when {
                 cleanUrl.contains(".m3u8") -> ExtractorLinkType.M3U8
@@ -975,7 +967,7 @@ class AnimeDayProvider : MainAPI() {
                     }
                 )
                 foundAny = true
-                // Don't break — collect direct URLs from ALL servers (no HTTP cost)
+                break  // Return ONLY the first server's link (minimize player threads)
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
             }
