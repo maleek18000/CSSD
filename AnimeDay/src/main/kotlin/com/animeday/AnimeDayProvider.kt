@@ -384,23 +384,13 @@ class AnimeDayProvider : MainAPI() {
 
             return false
         } catch (e: Exception) {
-            // Fallback: pass worker URL directly with auth headers
-            try {
-                callback(
-                    newExtractorLink(
-                        source = serverName,
-                        name = serverName,
-                        url = url,
-                        type = INFER_TYPE
-                    ) {
-                        this.referer = ""
-                        this.headers = mapOf("Authorization" to getAuthHeader())
-                    }
-                )
-                return true
-            } catch (_: Exception) {
-                return false
-            }
+            // CRASH FIX v9: previously passed the raw workers.dev URL
+            // directly to the player with INFER_TYPE. But workers.dev URLs
+            // return JSON (not video), so the player tried to play JSON
+            // as video -> "error parsing container 3003". Removed this
+            // fallback — if JSON extraction fails, return false so the
+            // next server can be tried instead.
+            return false
         }
     }
 
@@ -455,10 +445,9 @@ class AnimeDayProvider : MainAPI() {
                 foundAny = true
             }
 
-            // CRASH FIX v8: lh3.googleusercontent.com /pw/ URLs are image-CDN
+            // CRASH FIX v9: lh3.googleusercontent.com /pw/ URLs are image-CDN
             // endpoints; the =m22/=m37/=m18 suffixes don't produce playable
-            // video URLs. They were broken links the player probed in
-            // parallel, contributing to thread exhaustion. Dropped.
+            // video URLs. Dropped to avoid broken links.
             return foundAny
         } catch (_: Exception) {
             return false
@@ -574,11 +563,7 @@ class AnimeDayProvider : MainAPI() {
             }
         } catch (_: Exception) {}
 
-        // CRASH FIX v8: loadExtractor fallback REMOVED. It iterates through
-        // ALL registered CloudStream extractors in parallel, each spawning
-        // HTTP requests + OkHttp connection pool entries. With 6 servers this
-        // saturated OkHttp's connection pool -> pthread_create failed in
-        // okhttp connection pool / StreamAllocation.findStream.
+        // CRASH FIX v9: loadExtractor fallback REMOVED (thread-spawning).
         return false
     }
 
@@ -592,7 +577,7 @@ class AnimeDayProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // CRASH FIX v8: loadExtractor REMOVED (thread-spawning catch-all).
+        // CRASH FIX v9: loadExtractor REMOVED (thread-spawning catch-all).
         return false
     }
 
@@ -623,7 +608,7 @@ class AnimeDayProvider : MainAPI() {
             return true
         } catch (_: Exception) {}
 
-        // CRASH FIX v8: loadExtractor fallback REMOVED.
+        // CRASH FIX v9: loadExtractor fallback REMOVED.
         return false
     }
 
@@ -714,15 +699,10 @@ class AnimeDayProvider : MainAPI() {
             return extractGooglePhotos(cleanUrl, serverName, callback)
         }
 
-        // CRASH FIX v8: loadExtractor for unknown URLs REMOVED, AND the
-        // previous "last resort: pass as direct link" fallback is ALSO
-        // REMOVED. Returning unknown URLs to the player with INFER_TYPE
-        // forced the player to probe each one in parallel via
-        // MediaHTTPConnection + OkHttp async, and for non-video URLs the
-        // player retried with different strategies — each retry spawning
-        // more OkHttp connection pool threads. This is what saturated
-        // OkHttp's connection pool and caused pthread_create failures in
-        // okhttp connection pool / StreamAllocation.findStream.
+        // CRASH FIX v9: loadExtractor for unknown URLs REMOVED, AND the
+        // "last resort: pass as direct link" fallback is ALSO REMOVED.
+        // Returning unknown URLs to the player with INFER_TYPE caused
+        // runaway probing -> pthread_create failures.
         return false
     }
 
@@ -797,9 +777,7 @@ class AnimeDayProvider : MainAPI() {
             "1" to "2", "1" to "1", "2" to "2", "2" to "1"
         )
 
-        // CRASH FIX v8: SEQUENTIAL (was 4 parallel async). Each app.get
-        // uses OkHttp's shared connection pool + dispatcher. 4 parallel
-        // requests to the same host saturated the pool.
+        // CRASH FIX v9: SEQUENTIAL (was 4 parallel async).
         for ((type, classification) in searchConfigs) {
             try {
                 val text = app.get(
@@ -833,9 +811,7 @@ class AnimeDayProvider : MainAPI() {
         val playlists = parseList<Playlist>(playlistsText)
         if (playlists.isEmpty()) return null
 
-        // CRASH FIX v8: SEQUENTIAL (was parallel async per playlist).
-        // Each app.post uses OkHttp's shared connection pool. Parallel
-        // requests to the same API host saturated the pool.
+        // CRASH FIX v9: SEQUENTIAL (was parallel async per playlist).
         val playlistEpisodes = mutableMapOf<String, List<Episode>>()
         var firstEpisodeInfo: Episode? = null
 
@@ -950,45 +926,37 @@ class AnimeDayProvider : MainAPI() {
         }
 
         var foundAny = false
-        // CRASH FIX v8 (root cause: OkHttp connection pool saturation):
+        // CRASH FIX v9 (builds on v8 which stopped the crashes, now fixes
+        // the 2001/3003 errors and slow playback that v8 introduced):
         //
-        // New crash trace: binder_28824_3 -> pthread_create -> Thread.start
-        // -> ThreadPoolExecutor -> okhttp connection pool -> okhttp internal
-        // http StreamAllocation.findStream. The crash is INSIDE OkHttp's
-        // connection pool, not in the player or in our code's branches.
+        // v8 stopped the pthread_create crash by processing ONLY the first
+        // server. But this caused two new problems:
+        //   (A) 2001 "source error" / 3003 "error parsing container": if
+        //       the first server's links are broken (expired URL, workers.dev
+        //       returning JSON, etc.), the player gets broken links and the
+        //       user has no alternative (only 1 server was tried).
+        //   (B) Slow playback: v8's delay(1000ms) + timeout(5s) made it
+        //       very slow when the first server fails.
         //
-        // CloudStream's `app.get`/`app.post` use a shared OkHttpClient
-        // with a connection pool. Each call holds a connection pool entry +
-        // dispatcher thread + connection attempt thread. With 6 servers,
-        // each making 1-2 HTTP requests (workers.dev JSON, ok.ru metadata,
-        // ok.ru HLS, Google Photos HTML), that's 6-12 concurrent OkHttp
-        // requests, each to a DIFFERENT host. OkHttp's connection pool
-        // spawns a cleanup/eviction thread + new connection attempt threads
-        // per host. The pool saturates -> pthread_create fails in
-        // StreamAllocation.findStream -> OOM -> crash.
-        //
-        // v1-v7 all crashed because they still made too many concurrent
-        // HTTP requests. Even v7 (sequential + no loadExtractor + no
-        // fallback + buffering MAX_LINKS=5) made 6-12 sequential HTTP
-        // requests, and OkHttp's connection pool threads don't release
-        // instantly between sequential calls (pool keeps connections alive
-        // for 5min, cleaner thread runs periodically).
-        //
-        // v8 fix: PROCESS ONLY THE FIRST SERVER that returns links. This
-        // caps total HTTP requests per loadLinks call to ~2 (one for the
-        // first server, possibly one for getAgents if not cached). OkHttp's
-        // connection pool never saturates. Combined with all previous fixes:
-        //   1. search() SEQUENTIAL
-        //   2. load() episode-fetching SEQUENTIAL
-        //   3. loadLinks() processes ONLY FIRST server, stops immediately
-        //   4. ALL loadExtractor calls REMOVED
-        //   5. Fake lh3 Google Photos URLs REMOVED
-        //   6. extractFromUrl last-resort direct-link fallback REMOVED
-        //   7. Per-iteration coroutineScope (cleanup child coroutines)
-        //   8. Per-server timeout 8s -> 5s
-        //   9. MAX_LINKS=3 (fewer links = fewer player probe threads)
-        val MAX_LINKS = 3
+        // v9 fixes:
+        //   1. Try up to MAX_SERVERS=3 servers (not just 1), giving the
+        //      user alternatives if the first server's links are broken.
+        //      This is safe because v8 already does up to 6 sequential HTTP
+        //      requests (when all servers fail) without crashing — 3 is
+        //      well within that limit.
+        //   2. DON'T break after first success — collect links from multiple
+        //      servers so the user can pick a working one from the picker.
+        //      Stop when MAX_LINKS=8 links collected OR 3 servers tried.
+        //   3. Reduce timeout 5s -> 3s (fail fast on broken servers).
+        //   4. Reduce delay 1000ms -> 200ms (less waiting between servers).
+        //   5. MAX_LINKS=8 (more alternatives in picker).
+        //   6. All v8 crash fixes retained: sequential, no loadExtractor,
+        //      no lh3 fake URLs, no extractFromUrl last-resort fallback,
+        //      no workers.dev raw-URL fallback.
+        val MAX_LINKS = 8
+        val MAX_SERVERS = 3
         val linksReturned = java.util.concurrent.atomic.AtomicInteger(0)
+        val serversTried = java.util.concurrent.atomic.AtomicInteger(0)
         val bufferingCallback: (ExtractorLink) -> Unit = { link ->
             if (linksReturned.getAndIncrement() < MAX_LINKS) {
                 callback(link)
@@ -996,12 +964,10 @@ class AnimeDayProvider : MainAPI() {
         }
 
         for ((serverName, urlAndExtraction) in videoUrls.entries) {
-            // CRASH FIX v8: stop as soon as the FIRST server returns any
-            // links. This caps total HTTP requests to ~2 per loadLinks
-            // call, keeping OkHttp's connection pool well below saturation.
-            if (linksReturned.get() > 0) break
+            if (linksReturned.get() >= MAX_LINKS) break
+            if (serversTried.getAndIncrement() >= MAX_SERVERS) break
             val result = coroutineScope {
-                withTimeoutOrNull(5000L) {
+                withTimeoutOrNull(3000L) {  // Reduced from 5000L -> 3000L
                     try {
                         val (url, needsExtraction) = urlAndExtraction
                         extractFromUrl(url, serverName, needsExtraction, subtitleCallback, bufferingCallback)
@@ -1011,11 +977,11 @@ class AnimeDayProvider : MainAPI() {
                 } ?: false
             }
             if (result) foundAny = true
-            // Let OkHttp's connection pool release the connection before
-            // any potential next iteration. Fully-qualified to avoid
-            // touching the import block.
+            // Short delay to let OkHttp's connection pool release the
+            // connection before the next iteration. Fully-qualified to
+            // avoid touching the import block.
             kotlinx.coroutines.yield()
-            kotlinx.coroutines.delay(1000)
+            kotlinx.coroutines.delay(200)
         }
 
         return foundAny
