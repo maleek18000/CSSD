@@ -404,23 +404,11 @@ class AnimeDayProvider : MainAPI() {
 
             return false
         } catch (e: Exception) {
-            // Fallback: pass worker URL directly with auth headers
-            try {
-                callback(
-                    newExtractorLink(
-                        source = serverName,
-                        name = serverName,
-                        url = url,
-                        type = INFER_TYPE
-                    ) {
-                        this.referer = ""
-                        this.headers = mapOf("Authorization" to getAuthHeader())
-                    }
-                )
-                return true
-            } catch (_: Exception) {
-                return false
-            }
+            // CRASH FIX: Do NOT pass the worker URL directly as a video link.
+            // The worker URL returns JSON (not video), and passing a custom
+            // Authorization header to ExoPlayer causes crashes on phones/Android
+            // TVs. Just return false so loadLinks can try other servers.
+            return false
         }
     }
 
@@ -662,9 +650,14 @@ class AnimeDayProvider : MainAPI() {
     }
 
     /**
-     * OPTIMIZATION 6: GDPlayer Pro — pass URL directly, no extraction needed
-     * The native app adds GDPlayer URLs directly as "سيرفر : GD" without
-     * any HTTP extraction. This is instant.
+     * OPTIMIZATION 6: GDPlayer Pro — use CloudStream's built-in extractor.
+     *
+     * CRASH FIX: Previously this passed the GDPlayer HTML page URL directly as a
+     * video link with INFER_TYPE. On phones/Android TVs, ExoPlayer crashes when
+     * it tries to parse an HTML page as video (the LDPlayer emulator's more
+     * lenient decoder tolerates it). The native Anime Day app has its own
+     * GDPlayer WebView handler — CloudStream does not. Use loadExtractor so
+     * CloudStream's extractor registry handles it properly.
      */
     private suspend fun extractGdPlayerPro(
         url: String,
@@ -672,25 +665,9 @@ class AnimeDayProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Pass directly — same as native app (instant, no HTTP request)
+        // Use CloudStream's built-in extractor (handles GDPlayer properly)
         try {
-            callback(
-                newExtractorLink(
-                    source = serverName,
-                    name = "$serverName - GD",
-                    url = url,
-                    type = INFER_TYPE
-                ) {
-                    this.referer = mainUrl
-                    this.quality = Qualities.Unknown.value
-                }
-            )
-            return true
-        } catch (_: Exception) {}
-
-        // Fallback: try CloudStream's built-in extractor
-        try {
-            withTimeoutOrNull(5000L) {
+            withTimeoutOrNull(8000L) {
                 loadExtractor(url, mainUrl, subtitleCallback, callback)
             }?.let { return true }
         } catch (_: Exception) {}
@@ -791,22 +768,12 @@ class AnimeDayProvider : MainAPI() {
             }?.let { return true }
         } catch (_: Exception) {}
 
-        // 10. Last resort: pass as direct link
-        try {
-            callback(
-                newExtractorLink(
-                    source = serverName,
-                    name = serverName,
-                    url = cleanUrl,
-                    type = INFER_TYPE
-                ) {
-                    this.referer = ""
-                }
-            )
-            return true
-        } catch (_: Exception) {
-            return false
-        }
+        // CRASH FIX: Previously this had a "last resort" fallback that passed the
+        // unknown URL directly as a video link with INFER_TYPE. If loadExtractor
+        // already failed on this URL, passing it to ExoPlayer will crash on
+        // phones/Android TVs (the LDPlayer emulator tolerates it). Return false
+        // instead so loadLinks can try other servers.
+        return false
     }
 
     // ==================== Home Page ====================
