@@ -214,6 +214,63 @@ class AnimeDayProvider : MainAPI() {
         return null
     }
 
+    // CRASH FIX v17: COMPLETELY eliminate OkHttp from the ENTIRE plugin.
+    // v1-v16 only replaced app.get/app.post in EXTRACTION functions, but left
+    // app.get/app.post in getMainPage, search, and load. getMainPage is called
+    // 6 times IN PARALLEL by CloudStream when loading the home page = 6 parallel
+    // OkHttp requests that pre-saturate the connection pool BEFORE any playback.
+    // Then load() and loadLinks add more, tipping it over -> pthread_create fails.
+    // v17 replaces ALL app.get/app.post with HttpURLConnection throughout the
+    // ENTIRE file. Zero OkHttp usage, anywhere. No connection pool, no dispatcher
+    // threads, no async timeout watchdogs — anywhere.
+    private fun simpleHttpGet(url: String, headers: Map<String, String> = emptyMap()): String? {
+        var conn: java.net.HttpURLConnection? = null
+        return try {
+            conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 15000
+                readTimeout = 15000
+                instanceFollowRedirects = true
+                headers.forEach { (k, v) -> setRequestProperty(k, v) }
+            }
+            conn.inputStream.bufferedReader().use { it.readText() }
+        } catch (e: Exception) { null }
+        finally { conn?.disconnect() }
+    }
+
+    private fun simpleHttpPost(url: String, headers: Map<String, String> = emptyMap(), formData: Map<String, String> = emptyMap()): String? {
+        var conn: java.net.HttpURLConnection? = null
+        return try {
+            conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 15000
+                readTimeout = 15000
+                instanceFollowRedirects = true
+                doOutput = true
+                headers.forEach { (k, v) -> setRequestProperty(k, v) }
+                if (formData.isNotEmpty()) setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+            }
+            if (formData.isNotEmpty()) {
+                val body = formData.entries.joinToString("&") {
+                    java.net.URLEncoder.encode(it.key, "UTF-8") + "=" + java.net.URLEncoder.encode(it.value, "UTF-8")
+                }
+                conn.outputStream.bufferedWriter().use { it.write(body) }
+            }
+            conn.inputStream.bufferedReader().use { it.readText() }
+        } catch (e: Exception) { null }
+        finally { conn?.disconnect() }
+    }
+
+    private fun simpleHttpGetWithParams(baseUrl: String, params: Map<String, String>, headers: Map<String, String> = emptyMap()): String? {
+        val url = baseUrl + "?" + params.entries.joinToString("&") {
+            java.net.URLEncoder.encode(it.key, "UTF-8") + "=" + java.net.URLEncoder.encode(it.value, "UTF-8")
+        }
+        return simpleHttpGet(url, headers)
+    }
+
+    private fun inferLinkType(url: String): ExtractorLinkType =
+        if (url.contains(".m3u8") || url.contains("m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+
     // ========== OPTIMIZATION 1: Pre-fetch agents/cookies at plugin load ==========
     // Instead of lazy-loading on first video play (which adds latency),
     // fetch immediately and cache aggressively.
@@ -221,22 +278,13 @@ class AnimeDayProvider : MainAPI() {
     private var agentsFetched = false
     private var agentsFetchFailed = false
 
-    private suspend fun getAgents(): AgentsCookies? {
+    private fun getAgents(): AgentsCookies? {
         if (agentsFetched) return cachedAgents
-        if (agentsFetchFailed) return null  // Don't retry if it failed before
+        if (agentsFetchFailed) return null
         agentsFetched = true
         cachedAgents = try {
-            withTimeoutOrNull(5000L) {  // Reduced from 8000L
-                val text = app.post(
-                    "$apiUrl/AgentsAndCookies/getData.php",
-                    headers = authHeaders
-                ).text
-                parseObject<AgentsCookies>(text)
-            }
-        } catch (_: Exception) {
-            agentsFetchFailed = true
-            null
-        }
+            simpleHttpPost("$apiUrl/AgentsAndCookies/getData.php", headers = authHeaders)?.let { parseObject<AgentsCookies>(it) }
+        } catch (_: Exception) { agentsFetchFailed = true; null }
         return cachedAgents
     }
 
@@ -263,11 +311,7 @@ class AnimeDayProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
-            val response = withTimeoutOrNull(6000L) {  // Reduced from 12000L
-                app.get(url, headers = authHeaders)
-            } ?: return false
-
-            val responseText = response.text
+            val responseText = simpleHttpGet(url, authHeaders) ?: return false
 
             // Fast path: Try availableQualities first (most common format)
             if (responseText.trim().startsWith("{")) {
@@ -286,7 +330,7 @@ class AnimeDayProvider : MainAPI() {
                                     source = serverName,
                                     name = "$serverName - $qualityStr",
                                     url = streamUrl,
-                                    type = INFER_TYPE
+                                    type = inferLinkType(streamUrl)
                                 ) {
                                     this.referer = ""
                                     this.quality = getQualityValue(qualityStr)
@@ -305,7 +349,7 @@ class AnimeDayProvider : MainAPI() {
                                 source = serverName,
                                 name = "$serverName - $quality",
                                 url = directUrl,
-                                type = INFER_TYPE
+                                type = inferLinkType(directUrl)
                             ) {
                                 this.referer = ""
                                 this.quality = getQualityValue(quality)
@@ -326,7 +370,7 @@ class AnimeDayProvider : MainAPI() {
                                         source = serverName,
                                         name = "$serverName - $vQuality",
                                         url = vUrl,
-                                        type = INFER_TYPE
+                                        type = inferLinkType(vUrl)
                                     ) {
                                         this.referer = ""
                                         this.quality = getQualityValue(vQuality)
@@ -353,7 +397,7 @@ class AnimeDayProvider : MainAPI() {
                                     source = serverName,
                                     name = "$serverName - $qualityStr",
                                     url = streamUrl,
-                                    type = INFER_TYPE
+                                    type = inferLinkType(streamUrl)
                                 ) {
                                     this.referer = ""
                                     this.quality = getQualityValue(qualityStr)
@@ -365,42 +409,10 @@ class AnimeDayProvider : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // Check for redirect
-            val finalUrl = response.url
-            if (finalUrl != url && finalUrl.isNotEmpty()) {
-                callback(
-                    newExtractorLink(
-                        source = serverName,
-                        name = "$serverName - تلقائي",
-                        url = finalUrl,
-                        type = INFER_TYPE
-                    ) {
-                        this.referer = ""
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-                return true
-            }
-
             return false
         } catch (e: Exception) {
-            // Fallback: pass worker URL directly with auth headers
-            try {
-                callback(
-                    newExtractorLink(
-                        source = serverName,
-                        name = serverName,
-                        url = url,
-                        type = INFER_TYPE
-                    ) {
-                        this.referer = ""
-                        this.headers = mapOf("Authorization" to getAuthHeader())
-                    }
-                )
-                return true
-            } catch (_: Exception) {
-                return false
-            }
+            if (e is java.util.concurrent.CancellationException) throw e
+            return false
         }
     }
 
@@ -428,9 +440,7 @@ class AnimeDayProvider : MainAPI() {
                 gPhotosHeaders["Cookie"] = it
             }
 
-            val pageText = withTimeoutOrNull(5000L) {  // Reduced from 10000L
-                app.get(url, headers = gPhotosHeaders).text
-            } ?: return false
+            val pageText = simpleHttpGet(url, gPhotosHeaders) ?: return false
 
             // Fix malformed percent encoding
             val fixed = Regex("%(?![0-9a-fA-F]{2})").replace(pageText) { "%25" }
@@ -446,55 +456,13 @@ class AnimeDayProvider : MainAPI() {
                         source = serverName,
                         name = "$serverName - Original",
                         url = videoUrl,
-                        type = INFER_TYPE
+                        type = ExtractorLinkType.VIDEO
                     ) {
                         this.referer = ""
                         this.quality = Qualities.P1080.value
                     }
                 )
                 foundAny = true
-            }
-
-            // 2. Extract lh3 base URL and generate quality URLs (simplified)
-            val lh3Pattern = Regex("""https://lh3\.googleusercontent\.com/pw/[^"\\\s]+""")
-            var lh3BaseUrl: String? = null
-            for (match in lh3Pattern.findAll(decoded)) {
-                val foundUrl = match.value
-                // Prefer URL without size suffix
-                if (!foundUrl.contains("=s") && !foundUrl.contains("=w") &&
-                    !foundUrl.contains("=d") && !foundUrl.contains("=m") && !foundUrl.contains("=h")) {
-                    lh3BaseUrl = foundUrl
-                    break
-                }
-            }
-            if (lh3BaseUrl == null) {
-                lh3Pattern.find(decoded)?.value?.let { rawUrl ->
-                    val lastEqIndex = rawUrl.lastIndexOf('=')
-                    lh3BaseUrl = if (lastEqIndex > 0) rawUrl.substring(0, lastEqIndex) else rawUrl
-                }
-            }
-
-            // Generate quality URLs from lh3 base (same as native app's approach)
-            if (lh3BaseUrl != null) {
-                data class SimpleQuality(val suffix: String, val qualityName: String, val qualityValue: Int)
-                for (sq in listOf(
-                    SimpleQuality("=m22", "720p", Qualities.P720.value),
-                    SimpleQuality("=m37", "1080p", Qualities.P1080.value),
-                    SimpleQuality("=m18", "480p", Qualities.P480.value)
-                )) {
-                    callback(
-                        newExtractorLink(
-                            source = serverName,
-                            name = "$serverName - ${sq.qualityName}",
-                            url = lh3BaseUrl!! + sq.suffix,
-                            type = INFER_TYPE
-                        ) {
-                            this.referer = ""
-                            this.quality = sq.qualityValue
-                        }
-                    )
-                    foundAny = true
-                }
             }
 
             return foundAny
@@ -527,17 +495,10 @@ class AnimeDayProvider : MainAPI() {
 
             // Use metadata API — same as native app
             val metadataUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
-            val metaResponse = withTimeoutOrNull(5000L) {  // Reduced from 10000L
-                app.post(
-                    metadataUrl,
-                    headers = mapOf(
-                        "User-Agent" to userAgent,
-                        "Cookie" to cookie,
-                        "Content-Type" to "application/x-www-form-urlencoded"
-                    ),
-                    data = mapOf("" to "")
-                ).text
-            } ?: return false
+            val metaResponse = simpleHttpPost(
+                metadataUrl,
+                headers = mapOf("User-Agent" to userAgent, "Cookie" to cookie, "Content-Type" to "application/x-www-form-urlencoded")
+            ) ?: return false
 
             val metadata = mapper.readTree(metaResponse)
 
@@ -553,7 +514,7 @@ class AnimeDayProvider : MainAPI() {
                                 source = serverName,
                                 name = "$serverName - $vName",
                                 url = vUrl,
-                                type = INFER_TYPE
+                                type = inferLinkType(vUrl)
                             ) {
                                 this.referer = ""
                                 this.quality = getQualityValue(vName)
@@ -568,15 +529,7 @@ class AnimeDayProvider : MainAPI() {
             // Try ondemandHls if videos array fails
             val hlsUrl = metadata?.get("ondemandHls")?.asText()
             if (hlsUrl != null && hlsUrl.isNotEmpty()) {
-                val hlsResponse = withTimeoutOrNull(5000L) {  // Reduced from 10000L
-                    app.get(
-                        hlsUrl,
-                        headers = mapOf(
-                            "User-Agent" to userAgent,
-                            "Cookie" to cookie
-                        )
-                    ).text
-                } ?: return false
+                val hlsResponse = simpleHttpGet(hlsUrl, headers = mapOf("User-Agent" to userAgent, "Cookie" to cookie)) ?: return false
 
                 val lines = hlsResponse.lines()
                 var foundAny = false
@@ -597,7 +550,7 @@ class AnimeDayProvider : MainAPI() {
                                         source = serverName,
                                         name = "$serverName - $qualityLabel",
                                         url = streamUrl,
-                                        type = INFER_TYPE
+                                        type = ExtractorLinkType.M3U8
                                     ) {
                                         this.referer = ""
                                         this.quality = getQualityValue(qualityLabel)
@@ -610,36 +563,19 @@ class AnimeDayProvider : MainAPI() {
                 }
                 if (foundAny) return true
             }
-        } catch (_: Exception) {}
-
-        // Fallback: try CloudStream's built-in extractor (last resort)
-        try {
-            withTimeoutOrNull(5000L) {  // Reduced from 10000L
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
-            }?.let { return true }
-        } catch (_: Exception) {}
+        } catch (e: Exception) { if (e is java.util.concurrent.CancellationException) throw e }
 
         return false
     }
 
     /**
-     * Dailymotion extraction — try CloudStream's built-in extractor
-     * with reduced timeout.
+     * Dailymotion extraction — CRASH FIX v17: loadExtractor REMOVED.
      */
     private suspend fun extractDailymotion(
-        url: String,
-        serverName: String,
+        url: String, serverName: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        // Try CloudStream's built-in extractor with reduced timeout
-        try {
-            withTimeoutOrNull(5000L) {  // Reduced from 10000L
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
-            }?.let { return true }
-        } catch (_: Exception) {}
-        return false
-    }
+    ): Boolean { return false }
 
     /**
      * OPTIMIZATION 6: GDPlayer Pro — pass URL directly, no extraction needed
@@ -659,21 +595,14 @@ class AnimeDayProvider : MainAPI() {
                     source = serverName,
                     name = "$serverName - GD",
                     url = url,
-                    type = INFER_TYPE
+                    type = ExtractorLinkType.VIDEO
                 ) {
                     this.referer = mainUrl
                     this.quality = Qualities.Unknown.value
                 }
             )
             return true
-        } catch (_: Exception) {}
-
-        // Fallback: try CloudStream's built-in extractor
-        try {
-            withTimeoutOrNull(5000L) {
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
-            }?.let { return true }
-        } catch (_: Exception) {}
+        } catch (e: Exception) { if (e is java.util.concurrent.CancellationException) throw e }
         return false
     }
 
@@ -698,7 +627,7 @@ class AnimeDayProvider : MainAPI() {
                     source = serverName,
                     name = "$serverName - $quality",
                     url = cleanUrl,
-                    type = if (cleanUrl.contains(".m3u8")) INFER_TYPE else ExtractorLinkType.VIDEO
+                    type = if (cleanUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                 ) {
                     this.referer = mainUrl
                     this.quality = getQualityValue(quality)
@@ -714,7 +643,7 @@ class AnimeDayProvider : MainAPI() {
                     source = serverName,
                     name = "$serverName - تلقائي",
                     url = cleanUrl,
-                    type = INFER_TYPE
+                    type = ExtractorLinkType.VIDEO
                 ) {
                     this.referer = ""
                     this.quality = Qualities.Unknown.value
@@ -730,7 +659,7 @@ class AnimeDayProvider : MainAPI() {
                     source = serverName,
                     name = serverName,
                     url = cleanUrl,
-                    type = INFER_TYPE
+                    type = ExtractorLinkType.VIDEO
                 ) {
                     this.referer = ""
                     this.quality = Qualities.Unknown.value
@@ -764,29 +693,7 @@ class AnimeDayProvider : MainAPI() {
             return extractGooglePhotos(cleanUrl, serverName, callback)
         }
 
-        // 9. Unknown URL - try CloudStream's built-in extractor with shorter timeout
-        try {
-            withTimeoutOrNull(5000L) {  // Reduced from 8000L
-                loadExtractor(cleanUrl, mainUrl, subtitleCallback, callback)
-            }?.let { return true }
-        } catch (_: Exception) {}
-
-        // 10. Last resort: pass as direct link
-        try {
-            callback(
-                newExtractorLink(
-                    source = serverName,
-                    name = serverName,
-                    url = cleanUrl,
-                    type = INFER_TYPE
-                ) {
-                    this.referer = ""
-                }
-            )
-            return true
-        } catch (_: Exception) {
-            return false
-        }
+        return false  // CRASH FIX v17: loadExtractor + fallback REMOVED
     }
 
     // ==================== Home Page ====================
@@ -810,7 +717,8 @@ class AnimeDayProvider : MainAPI() {
         val isLatest = request.data.contains("latest")
 
         if (isLatest) {
-            val responseText = app.get(url, headers = authHeaders).text
+            kotlinx.coroutines.yield()
+            val responseText = simpleHttpGet(url, authHeaders) ?: return newHomePageResponse(request.name, emptyList(), false)
             val res = parseList<EpisodeWithInfoLatest>(responseText)
             val items = res.mapNotNull { ep ->
                 val cartoon = ep.cartoon ?: return@mapNotNull null
@@ -819,7 +727,8 @@ class AnimeDayProvider : MainAPI() {
             return newHomePageResponse(request.name, items, false)
         }
 
-        val responseText = app.get(url, headers = authHeaders).text
+        kotlinx.coroutines.yield()
+        val responseText = simpleHttpGet(url, authHeaders) ?: return newHomePageResponse(request.name, emptyList(), false)
         val res = parseList<CartoonWithInfo>(responseText)
         val items = res.mapNotNull { toSearchResult(it) }
         val hasNext = res.size >= 20
@@ -860,21 +769,17 @@ class AnimeDayProvider : MainAPI() {
             "1" to "2", "1" to "1", "2" to "2", "2" to "1"
         )
 
-        // OPTIMIZATION 8: Parallel search across all configs
-        coroutineScope {
-            searchConfigs.map { (type, classification) ->
-                async {
-                    try {
-                        val text = app.get(
-                            "$apiUrl/cartoon_with_info/searchCartoon.php",
-                            params = mapOf("search" to query, "type" to type, "classification" to classification),
-                            headers = authHeaders
-                        ).text
-                        val items = parseList<CartoonWithInfo>(text)
-                        items.forEach { toSearchResult(it)?.let { r -> results.add(r) } }
-                    } catch (_: Exception) {}
-                }
-            }.forEach { it.await() }
+        for ((type, classification) in searchConfigs) {
+            kotlinx.coroutines.yield()
+            try {
+                val text = simpleHttpGetWithParams(
+                    "$apiUrl/cartoon_with_info/searchCartoon.php",
+                    mapOf("search" to query, "type" to type, "classification" to classification),
+                    authHeaders
+                ) ?: continue
+                val items = parseList<CartoonWithInfo>(text)
+                items.forEach { toSearchResult(it)?.let { r -> results.add(r) } }
+            } catch (e: Exception) { if (e is java.util.concurrent.CancellationException) throw e }
         }
 
         return results.distinctBy { it.url }
@@ -890,38 +795,33 @@ class AnimeDayProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse? {
         val cartoonId = url.substringAfterLast("/")
 
-        val playlistsText = app.post(
+        kotlinx.coroutines.yield()
+        val playlistsText = simpleHttpPost(
             "$apiUrl/playlist/read.php",
-            headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
-            data = mapOf("cartoon_id" to cartoonId)
-        ).text
+            headers = authHeaders,
+            formData = mapOf("cartoon_id" to cartoonId)
+        ) ?: return null
         val playlists = parseList<Playlist>(playlistsText)
         if (playlists.isEmpty()) return null
 
-        // Fetch episodes for ALL playlists in parallel
         val playlistEpisodes = mutableMapOf<String, List<Episode>>()
         var firstEpisodeInfo: Episode? = null
 
-        coroutineScope {
-            playlists.map { playlist ->
-                val playlistId = playlist.id ?: return@map null
-                async {
-                    try {
-                        val epsText = app.post(
-                            "$apiUrl/episodeWithInfo/readPaging.php",
-                            headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
-                            data = mapOf("playlist_id" to playlistId)
-                        ).text
-                        parseList<Episode>(epsText) to playlistId
-                    } catch (_: Exception) {
-                        emptyList<Episode>() to playlistId
-                    }
-                }
-            }.filterNotNull().map { it.await() }.forEach { (eps, playlistId) ->
+        for (playlist in playlists) {
+            kotlinx.coroutines.yield()
+            val playlistId = playlist.id ?: continue
+            try {
+                val epsText = simpleHttpPost(
+                    "$apiUrl/episodeWithInfo/readPaging.php",
+                    headers = authHeaders,
+                    formData = mapOf("playlist_id" to playlistId)
+                )
+                val eps = if (epsText != null) parseList<Episode>(epsText) else emptyList()
                 playlistEpisodes[playlistId] = eps
-                if (firstEpisodeInfo == null && eps.isNotEmpty()) {
-                    firstEpisodeInfo = eps.first()
-                }
+                if (firstEpisodeInfo == null && eps.isNotEmpty()) firstEpisodeInfo = eps.first()
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                playlistEpisodes[playlistId] = emptyList()
             }
         }
 
@@ -1012,26 +912,24 @@ class AnimeDayProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        // Pre-fetch agents/cookies in background (won't block if already fetched)
-        coroutineScope {
-            async { getAgents() }
+        var foundAny = false
+        val MAX_LINKS = 5
+        val linksReturned = java.util.concurrent.atomic.AtomicInteger(0)
+        val bufferingCallback: (ExtractorLink) -> Unit = { link ->
+            if (linksReturned.getAndIncrement() < MAX_LINKS) callback(link)
         }
 
-        var foundAny = false
-        coroutineScope {
-            videoUrls.entries.map { (serverName, urlAndExtraction) ->
-                async {
-                    val result = withTimeoutOrNull(8000L) {  // Reduced from 15000L
-                        try {
-                            val (url, needsExtraction) = urlAndExtraction
-                            extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
-                        } catch (_: Exception) {
-                            false
-                        }
-                    } ?: false
-                    if (result) foundAny = true
-                }
-            }.forEach { it.await() }
+        for ((serverName, urlAndExtraction) in videoUrls.entries) {
+            kotlinx.coroutines.yield()
+            if (linksReturned.get() > 0) break
+            val result = try {
+                val (url, needsExtraction) = urlAndExtraction
+                extractFromUrl(url, serverName, needsExtraction, subtitleCallback, bufferingCallback)
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                false
+            }
+            if (result) foundAny = true
         }
 
         return foundAny
