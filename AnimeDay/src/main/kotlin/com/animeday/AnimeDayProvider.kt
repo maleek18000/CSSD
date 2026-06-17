@@ -10,9 +10,6 @@ import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.supervisorScope
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
 
 // ==================== Data Classes ====================
@@ -1015,42 +1012,37 @@ class AnimeDayProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        // Pre-fetch agents/cookies so they're warm by the time extractors need them.
-        // CRASH FIX: previously wrapped in `coroutineScope { async { getAgents() } }`
-        // which added structured-concurrency overhead without parallelism benefit
-        // (coroutineScope waits for the unawaited async anyway, so it was equivalent
-        // to a direct call) and could propagate cancellation into loadLinks on slow
-        // devices. Call directly — getAgents() is cached after first call.
-        try { getAgents() } catch (_: Exception) {}
+        // Pre-fetch agents/cookies in background (won't block if already fetched)
+        coroutineScope {
+            async { getAgents() }
+        }
 
         var foundAny = false
-        // CRASH FIX: Use supervisorScope + bounded concurrency (Semaphore) to prevent
-        // OOM / thread-pool exhaustion crashes on mobile phones and Android TVs.
-        // The previous code fired up to 6 parallel extractions, each potentially
-        // spawning more HTTP requests + loadExtractor coroutines and holding large
-        // response bodies (Google Photos HTML can be MBs) in memory at once.
-        // On low-RAM devices this caused OOM or thread-pool saturation -> ANR -> kill.
-        // - supervisorScope: one failing/cancelled extraction no longer cancels siblings.
-        // - Semaphore(2): limits concurrent extractions to 2, keeping memory/CPU usage
-        //   bounded while still parallel for speed. (LDPlayer had enough RAM to survive
-        //   the old unbounded version; phones/TVs do not.)
-        val semaphore = Semaphore(2)
-        supervisorScope {
-            videoUrls.entries.map { (serverName, urlAndExtraction) ->
-                async {
-                    semaphore.withPermit {
-                        val result = withTimeoutOrNull(8000L) {  // Reduced from 15000L
-                            try {
-                                val (url, needsExtraction) = urlAndExtraction
-                                extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
-                            } catch (_: Exception) {
-                                false
-                            }
-                        } ?: false
-                        if (result) foundAny = true
-                    }
+        // CRASH FIX (pthread_create failed / OOM on phones & Android TVs):
+        // The previous code launched one `async` per server (up to 6 in parallel)
+        // inside `coroutineScope`. Each `extractFromUrl` then runs HTTP requests
+        // via OkHttp's dispatcher AND may call CloudStream's `loadExtractor`,
+        // which spawns its OWN thread pool. With 6 parallel chains the process
+        // ended up creating dozens-to-hundreds of native threads, each needing
+        // ~1MB stack, until pthread_create() failed -> OOM -> process kill.
+        // LDPlayer survived because it runs on a desktop host with abundant
+        // memory and a much higher per-process thread limit.
+        //
+        // Fix: extract servers SEQUENTIALLY. Only one extraction chain runs at
+        // any moment, so thread creation stays bounded regardless of how many
+        // threads loadExtractor/OkHttp spawn internally. Each server still has
+        // its own 8s timeout, so worst case = 6 * 8s = 48s (well under
+        // CloudStream's 60s loadLinks ceiling). No new imports needed.
+        for ((serverName, urlAndExtraction) in videoUrls.entries) {
+            val result = withTimeoutOrNull(8000L) {  // Reduced from 15000L
+                try {
+                    val (url, needsExtraction) = urlAndExtraction
+                    extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
+                } catch (_: Exception) {
+                    false
                 }
-            }.forEach { it.await() }
+            } ?: false
+            if (result) foundAny = true
         }
 
         return foundAny
