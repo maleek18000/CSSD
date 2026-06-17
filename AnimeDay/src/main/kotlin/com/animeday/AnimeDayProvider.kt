@@ -1018,51 +1018,74 @@ class AnimeDayProvider : MainAPI() {
         }
 
         var foundAny = false
-        // CRASH FIX v2 (pthread_create(1040kb stack) failed; trace:
-        // ThreadPoolExecutor.java:975 -> Thread.java:733 -> pthread_create):
+        // CRASH FIX v4 (pthread_create(1040kb stack) failed; trace includes
+        // okhttp async-timeout / Http1xStream, MediaHTTPConnection.readAt,
+        // Binder.execTransact, ThreadPoolExecutor.java:975):
         //
-        // v1 made extraction sequential but the crash persisted. Root cause:
-        // CloudStream's `loadExtractor` (invoked by several branches of
-        // extractFromUrl for Dailymotion, GDPlayer fallback, ok.ru fallback,
-        // and unknown URLs) iterates through ALL registered extractors whose
-        // URL pattern matches, fanning out into many parallel child coroutines
-        // that each borrow a Dispatchers.IO thread. A single extractFromUrl
-        // call can therefore spawn dozens of native threads. On phones and
-        // Android TVs the per-process pthread limit (~500, lower on TV boxes)
-        // gets exhausted -> pthread_create fails -> OOM -> kill. LDPlayer
-        // survives because its host has a much higher per-process thread cap.
+        // v1 (sequential), v2 (sequential + per-iter coroutineScope + delay),
+        // and v3 (v2 + removed loadExtractor fallbacks + removed fake lh3
+        // URLs) all STILL CRASHED. Root cause they all missed: the crash is
+        // NOT primarily in extraction — it's in the PLAYER PROBING phase.
         //
-        // v2 strategy (all confined to loadLinks, no other file changes):
-        //  1. Process servers SEQUENTIALLY (kept from v1).
-        //  2. Wrap EACH server in its OWN coroutineScope so all child
-        //     coroutines spawned inside extractFromUrl / loadExtractor are
-        //     CANCELLED and their borrowed Dispatchers.IO threads RETURNED to
-        //     the pool before the next server starts. The original outer
-        //     `coroutineScope` kept all children alive until every server
-        //     finished, so threads accumulated across servers.
-        //  3. yield() + delay(120ms) between iterations to give the JVM time
-        //     to actually pthread_join finished native worker threads before
-        //     the next iteration tries to spawn new ones.
-        //  4. Reduced per-server timeout 8s -> 5s so a stuck request doesn't
-        //     hold its thread for too long.
+        // After loadLinks returns, CloudStream hands every ExtractorLink to
+        // the player, which probes EACH in parallel via
+        // MediaHTTPConnection.readAt + Binder.execTransact + OkHttp async
+        // calls. Each probe spawns ~3 native threads (media thread + binder
+        // thread + okhttp watchdog). The original code returned 20-30 links
+        // (workers.dev × 3-5 qualities, ok.ru × 5+ qualities, Google Photos
+        // × 4, etc. across 6 servers) = 60-90+ probe threads at once. On
+        // phones/Android TVs the per-process pthread cap (often 300-500,
+        // lower on TV boxes) gets exhausted -> pthread_create fails -> OOM
+        // -> crash. LDPlayer survives because its desktop host has a
+        // per-process thread cap in the thousands.
+        //
+        // v4 fix (confined to loadLinks only — no other file changes):
+        //   1. BUFFERING CALLBACK: wrap the real callback with a counter so
+        //      at most MAX_LINKS links are ever forwarded to the player.
+        //      This caps player-probing threads at MAX_LINKS × 3 = 15
+        //      native threads, well within the per-process pthread cap.
+        //      Extra links extracted beyond MAX_LINKS are silently dropped.
+        //   2. SEQUENTIAL for-loop (one server at a time) so extraction
+        //      threads don't compound with player-probe threads.
+        //   3. Per-iteration coroutineScope so child coroutines spawned
+        //      inside extractFromUrl are cancelled and their Dispatchers.IO
+        //      threads returned before the next server starts.
+        //   4. yield() + delay(500ms) between iterations to let the JVM
+        //      actually pthread_join finished native worker threads.
+        //   5. BREAK early once MAX_LINKS is reached — don't process
+        //      remaining servers unnecessarily.
+        //   6. Per-server timeout 8s -> 5s so a stuck server doesn't hold
+        //      its thread for too long.
+        // AtomicInteger is used (fully-qualified, no import added) because
+        // the buffering callback may be invoked from Dispatchers.IO threads
+        // inside extractFromUrl, and we need thread-safe counting.
+        val MAX_LINKS = 1
+        val linksReturned = java.util.concurrent.atomic.AtomicInteger(0)
+        val bufferingCallback: (ExtractorLink) -> Unit = { link ->
+            if (linksReturned.getAndIncrement() < MAX_LINKS) {
+                callback(link)
+            }
+        }
+
         for ((serverName, urlAndExtraction) in videoUrls.entries) {
+            if (linksReturned.get() >= MAX_LINKS) break  // Enough links, stop early
             val result = coroutineScope {
-                withTimeoutOrNull(5000L) {
+                withTimeoutOrNull(5000L) {  // Reduced from 8000L -> 5000L
                     try {
                         val (url, needsExtraction) = urlAndExtraction
-                        extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
+                        extractFromUrl(url, serverName, needsExtraction, subtitleCallback, bufferingCallback)
                     } catch (_: Exception) {
                         false
                     }
                 } ?: false
             }
             if (result) foundAny = true
-            // Allow inner thread pools (Dispatchers.IO, OkHttp dispatcher,
-            // loadExtractor's pool) to reclaim finished worker threads before
-            // the next extraction spawns new ones. Fully-qualified to avoid
-            // touching the import block.
+            // Let Dispatchers.IO / OkHttp dispatcher / player-probe threads
+            // release finished worker threads before the next iteration
+            // tries to spawn new ones. Fully-qualified to avoid touching
+            // the import block.
             kotlinx.coroutines.yield()
-            kotlinx.coroutines.delay(120)
+            kotlinx.coroutines.delay(500)
         }
 
         return foundAny
