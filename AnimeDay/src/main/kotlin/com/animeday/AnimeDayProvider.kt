@@ -225,12 +225,7 @@ class AnimeDayProvider : MainAPI() {
         if (agentsFetched) return cachedAgents
         if (agentsFetchFailed) return null  // Don't retry if it failed before
         agentsFetched = true
-        // CRASH FIX v13: removed withTimeoutOrNull wrapper. Stardima plugin
-        // (which works on all devices) NEVER uses withTimeoutOrNull — when
-        // the timeout fires, the OkHttp call is cancelled but its connection
-        // pool thread lingers. Across multiple loadLinks calls (playing
-        // multiple episodes), these lingering cancelled threads accumulate
-        // -> pool saturates -> pthread_create fails -> crash. Plain try/catch
+        // CRASH FIX v14: removed withTimeoutOrNull wrapper. Plain try/catch
         // lets the call complete or fail naturally and release its thread.
         cachedAgents = try {
             val text = app.post(
@@ -238,7 +233,8 @@ class AnimeDayProvider : MainAPI() {
                 headers = authHeaders
             ).text
             parseObject<AgentsCookies>(text)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
             agentsFetchFailed = true
             null
         }
@@ -268,8 +264,8 @@ class AnimeDayProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
-            // CRASH FIX v13: removed withTimeoutOrNull wrapper (see getAgents
-            // note). Plain app.get lets the call complete or fail naturally.
+            // CRASH FIX v14: removed withTimeoutOrNull wrapper. Plain app.get
+            // lets the call complete or fail naturally.
             val response = app.get(url, headers = authHeaders)
             val responseText = response.text
 
@@ -388,7 +384,11 @@ class AnimeDayProvider : MainAPI() {
 
             return false
         } catch (e: Exception) {
-            // CRASH FIX v13: previously passed the raw workers.dev URL
+            // CRASH FIX v14: rethrow CancellationException to allow proper
+            // coroutine cancellation. Previously this catch swallowed it,
+            // causing cancelled loadLinks to keep making HTTP requests.
+            if (e is java.util.concurrent.CancellationException) throw e
+            // CRASH FIX v14: previously passed the raw workers.dev URL
             // directly to the player with INFER_TYPE. But workers.dev URLs
             // return JSON (not video), so the player tried to play JSON
             // as video -> "error parsing container 3003". Removed this
@@ -423,11 +423,13 @@ class AnimeDayProvider : MainAPI() {
             }
 
             val pageText = try {
-                // CRASH FIX v13: removed withTimeoutOrNull wrapper (see
-                // getAgents note). Plain app.get lets the call complete or
-                // fail naturally and release its OkHttp thread.
+                // CRASH FIX v14: removed withTimeoutOrNull wrapper. Plain
+                // app.get lets the call complete or fail naturally.
                 app.get(url, headers = gPhotosHeaders).text
-            } catch (_: Exception) { return false }
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                return false
+            }
 
             // Fix malformed percent encoding
             val fixed = Regex("%(?![0-9a-fA-F]{2})").replace(pageText) { "%25" }
@@ -452,11 +454,13 @@ class AnimeDayProvider : MainAPI() {
                 foundAny = true
             }
 
-            // CRASH FIX v13: lh3.googleusercontent.com /pw/ URLs are image-CDN
+            // CRASH FIX v14: lh3.googleusercontent.com /pw/ URLs are image-CDN
             // endpoints; the =m22/=m37/=m18 suffixes don't produce playable
             // video URLs. Dropped to avoid broken links.
+            // CRASH FIX v14: lh3 URLs already removed above.
             return foundAny
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
             return false
         }
     }
@@ -485,9 +489,8 @@ class AnimeDayProvider : MainAPI() {
 
             // Use metadata API — same as native app
             val metadataUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
-            // CRASH FIX v13: removed withTimeoutOrNull wrapper (see
-            // getAgents note). Plain app.post lets the call complete or
-            // fail naturally and release its OkHttp thread.
+            // CRASH FIX v14: removed withTimeoutOrNull wrapper. Plain
+            // app.post lets the call complete or fail naturally.
             val metaResponse = try {
                 app.post(
                     metadataUrl,
@@ -498,7 +501,10 @@ class AnimeDayProvider : MainAPI() {
                     ),
                     data = mapOf("" to "")
                 ).text
-            } catch (_: Exception) { return false }
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                return false
+            }
 
             val metadata = mapper.readTree(metaResponse)
 
@@ -529,9 +535,8 @@ class AnimeDayProvider : MainAPI() {
             // Try ondemandHls if videos array fails
             val hlsUrl = metadata?.get("ondemandHls")?.asText()
             if (hlsUrl != null && hlsUrl.isNotEmpty()) {
-                // CRASH FIX v13: removed withTimeoutOrNull wrapper (see
-                // getAgents note). Plain app.get lets the call complete or
-                // fail naturally and release its OkHttp thread.
+                // CRASH FIX v14: removed withTimeoutOrNull wrapper. Plain
+                // app.get lets the call complete or fail naturally.
                 val hlsResponse = try {
                     app.get(
                         hlsUrl,
@@ -540,7 +545,10 @@ class AnimeDayProvider : MainAPI() {
                             "Cookie" to cookie
                         )
                     ).text
-                } catch (_: Exception) { return false }
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    return false
+                }
 
                 val lines = hlsResponse.lines()
                 var foundAny = false
@@ -574,9 +582,11 @@ class AnimeDayProvider : MainAPI() {
                 }
                 if (foundAny) return true
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+        }
 
-        // CRASH FIX v13: loadExtractor fallback REMOVED (thread-spawning).
+        // CRASH FIX v14: loadExtractor fallback REMOVED (thread-spawning).
         return false
     }
 
@@ -590,7 +600,7 @@ class AnimeDayProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // CRASH FIX v13: loadExtractor REMOVED (thread-spawning catch-all).
+        // CRASH FIX v14: loadExtractor REMOVED (thread-spawning catch-all).
         return false
     }
 
@@ -619,9 +629,11 @@ class AnimeDayProvider : MainAPI() {
                 }
             )
             return true
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+        }
 
-        // CRASH FIX v13: loadExtractor fallback REMOVED.
+        // CRASH FIX v14: loadExtractor fallback REMOVED.
         return false
     }
 
@@ -712,7 +724,7 @@ class AnimeDayProvider : MainAPI() {
             return extractGooglePhotos(cleanUrl, serverName, callback)
         }
 
-        // CRASH FIX v13: loadExtractor for unknown URLs REMOVED, AND the
+        // CRASH FIX v14: loadExtractor for unknown URLs REMOVED, AND the
         // "last resort: pass as direct link" fallback is ALSO REMOVED.
         // Returning unknown URLs to the player with INFER_TYPE caused
         // runaway probing -> pthread_create failures.
@@ -790,8 +802,12 @@ class AnimeDayProvider : MainAPI() {
             "1" to "2", "1" to "1", "2" to "2", "2" to "1"
         )
 
-        // CRASH FIX v13: SEQUENTIAL (was 4 parallel async).
+        // CRASH FIX v14: SEQUENTIAL (was 4 parallel async). Plus yield()
+        // at the START of each iteration to check for cancellation BEFORE
+        // making the HTTP request. And rethrow CancellationException in
+        // the catch block so proper coroutine cancellation works.
         for ((type, classification) in searchConfigs) {
+            kotlinx.coroutines.yield()  // Check cancellation before HTTP request
             try {
                 val text = app.get(
                     "$apiUrl/cartoon_with_info/searchCartoon.php",
@@ -800,7 +816,13 @@ class AnimeDayProvider : MainAPI() {
                 ).text
                 val items = parseList<CartoonWithInfo>(text)
                 items.forEach { toSearchResult(it)?.let { r -> results.add(r) } }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                // CRITICAL: rethrow CancellationException so CloudStream can
+                // properly cancel this coroutine. Previously catch (_: Exception)
+                // swallowed it, causing cancelled search to keep making HTTP
+                // requests and leaving lingering OkHttp threads.
+                if (e is java.util.concurrent.CancellationException) throw e
+            }
         }
 
         return results.distinctBy { it.url }
@@ -824,11 +846,16 @@ class AnimeDayProvider : MainAPI() {
         val playlists = parseList<Playlist>(playlistsText)
         if (playlists.isEmpty()) return null
 
-        // CRASH FIX v13: SEQUENTIAL (was parallel async per playlist).
+        // CRASH FIX v14: SEQUENTIAL (was parallel async per playlist).
+        // Plus yield() at the START of each iteration to check for
+        // cancellation BEFORE making the HTTP request. And rethrow
+        // CancellationException in the catch block so proper coroutine
+        // cancellation works.
         val playlistEpisodes = mutableMapOf<String, List<Episode>>()
         var firstEpisodeInfo: Episode? = null
 
         for (playlist in playlists) {
+            kotlinx.coroutines.yield()  // Check cancellation before HTTP request
             val playlistId = playlist.id ?: continue
             try {
                 val epsText = app.post(
@@ -841,7 +868,12 @@ class AnimeDayProvider : MainAPI() {
                 if (firstEpisodeInfo == null && eps.isNotEmpty()) {
                     firstEpisodeInfo = eps.first()
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                // CRITICAL: rethrow CancellationException so CloudStream can
+                // properly cancel this coroutine. Previously catch (_: Exception)
+                // swallowed it, causing cancelled load to keep making HTTP
+                // requests and leaving lingering OkHttp threads.
+                if (e is java.util.concurrent.CancellationException) throw e
                 playlistEpisodes[playlistId] = emptyList()
             }
         }
@@ -933,46 +965,41 @@ class AnimeDayProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        // Pre-fetch agents/cookies in background (won't block if already fetched)
-        coroutineScope {
-            async { getAgents() }
-        }
-
+        // CRASH FIX v14: removed the `coroutineScope { async { getAgents() } }`
+        // pre-fetch entirely. It was the last remaining structured concurrency
+        // in loadLinks, and it could leave lingering OkHttp threads when
+        // loadLinks was cancelled. getAgents() is called inside extractOkRu
+        // and extractGooglePhotos when needed, and it's cached after the
+        // first call — the pre-fetch was unnecessary.
         var foundAny = false
-        // CRASH FIX v13 (ROOT CAUSE FINALLY IDENTIFIED via Stardima plugin
-        // comparison: https://github.com/maleek18000/CSSD/):
+        // CRASH FIX v14 (ROOT CAUSE: CancellationException swallowing):
         //
-        // Stardima plugin works on ALL devices without crashing. Key finding:
-        // Stardima NEVER uses withTimeoutOrNull ANYWHERE. The agent analysis:
-        //   "when the timeout fires, the inner HTTP call is cancelled but the
-        //    OkHttp call may still be holding a pool thread; rapid retries
-        //    then stack up live pool threads."
+        // Every previous version (v1-v13) used `catch (_: Exception)` which
+        // swallows CancellationException. In Kotlin coroutines,
+        // CancellationException IS an Exception, so catch (_: Exception)
+        // catches it. This means when CloudStream cancels loadLinks (e.g.,
+        // user navigates away, or CloudStream retries), the cancellation is
+        // SWALLOWED, and the for-loop CONTINUES to the next server, making
+        // ANOTHER HTTP request. Each cancelled-but-continued HTTP request
+        // leaves lingering OkHttp threads. Over multiple episodes, these
+        // accumulate -> pool saturates -> pthread_create fails -> crash.
         //
-        // This is EXACTLY what happened in v1-v12. Every version wrapped
-        // extractions in withTimeoutOrNull. When the timeout fires, the
-        // OkHttp call is cancelled but its connection pool thread lingers.
-        // Across multiple loadLinks calls (playing multiple episodes), these
-        // lingering cancelled threads accumulate -> pool saturates ->
-        // pthread_create fails -> crash. v8 "didn't crash" on the FIRST
-        // episode, but after playing several, the accumulated lingering
-        // threads crashed it — which is why v12 (identical config) crashes.
-        //
-        // v13 = remove ALL withTimeoutOrNull (matching Stardima) + keep all
-        // structural fixes from v12:
-        //   1. REMOVED withTimeoutOrNull from: getAgents, extractWorkerUrl,
-        //      extractGooglePhotos, extractOkRu (x2), loadLinks. ALL of them.
-        //      Now HTTP calls complete or fail naturally via try/catch,
-        //      releasing their OkHttp threads cleanly.
-        //   2. Sequential search/load/loadLinks (from v12).
-        //   3. No loadExtractor calls (from v6+).
-        //   4. No fake lh3 URLs (from v3+).
-        //   5. No extractFromUrl last-resort fallback (from v7+).
-        //   6. No workers.dev raw-URL fallback (from v9+).
-        //   7. Break after first success (from v8).
-        //   8. Buffering callback MAX_LINKS=5 (safety net).
-        //   9. Removed delay(1000) between servers — Stardima doesn't use
-        //      delays, and without withTimeoutOrNull there are no lingering
-        //      threads to clean up.
+        // v14 fix:
+        //   1. yield() at the START of each iteration — checks for cancellation
+        //      BEFORE making the HTTP request. If cancelled, throws
+        //      CancellationException which propagates OUT of the for-loop
+        //      (it's outside the try/catch), properly cancelling loadLinks.
+        //   2. Rethrow CancellationException in the catch block — if
+        //      extractFromUrl is cancelled mid-HTTP-request, the
+        //      CancellationException is rethrown instead of swallowed,
+        //      allowing proper cancellation.
+        //   3. Removed coroutineScope { async { getAgents() } } pre-fetch —
+        //      eliminates the last structured concurrency that could leave
+        //      lingering threads on cancellation.
+        //   4. All v13 structural fixes retained: no withTimeoutOrNull, no
+        //      loadExtractor, no lh3 fake URLs, no extractFromUrl
+        //      last-resort fallback, no workers.dev raw-URL fallback,
+        //      sequential, break after first success.
         val MAX_LINKS = 5
         val linksReturned = java.util.concurrent.atomic.AtomicInteger(0)
         val bufferingCallback: (ExtractorLink) -> Unit = { link ->
@@ -982,11 +1009,17 @@ class AnimeDayProvider : MainAPI() {
         }
 
         for ((serverName, urlAndExtraction) in videoUrls.entries) {
+            kotlinx.coroutines.yield()  // Check cancellation BEFORE HTTP request
             if (linksReturned.get() > 0) break  // Got links, stop
             val result = try {
                 val (url, needsExtraction) = urlAndExtraction
                 extractFromUrl(url, serverName, needsExtraction, subtitleCallback, bufferingCallback)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                // CRITICAL: rethrow CancellationException so CloudStream can
+                // properly cancel this coroutine. Previously catch (_: Exception)
+                // swallowed it, causing cancelled loadLinks to keep making
+                // HTTP requests and leaving lingering OkHttp threads.
+                if (e is java.util.concurrent.CancellationException) throw e
                 false
             }
             if (result) foundAny = true
