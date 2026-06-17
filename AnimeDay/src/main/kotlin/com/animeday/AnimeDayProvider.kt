@@ -1018,31 +1018,51 @@ class AnimeDayProvider : MainAPI() {
         }
 
         var foundAny = false
-        // CRASH FIX (pthread_create failed / OOM on phones & Android TVs):
-        // The previous code launched one `async` per server (up to 6 in parallel)
-        // inside `coroutineScope`. Each `extractFromUrl` then runs HTTP requests
-        // via OkHttp's dispatcher AND may call CloudStream's `loadExtractor`,
-        // which spawns its OWN thread pool. With 6 parallel chains the process
-        // ended up creating dozens-to-hundreds of native threads, each needing
-        // ~1MB stack, until pthread_create() failed -> OOM -> process kill.
-        // LDPlayer survived because it runs on a desktop host with abundant
-        // memory and a much higher per-process thread limit.
+        // CRASH FIX v2 (pthread_create(1040kb stack) failed; trace:
+        // ThreadPoolExecutor.java:975 -> Thread.java:733 -> pthread_create):
         //
-        // Fix: extract servers SEQUENTIALLY. Only one extraction chain runs at
-        // any moment, so thread creation stays bounded regardless of how many
-        // threads loadExtractor/OkHttp spawn internally. Each server still has
-        // its own 8s timeout, so worst case = 6 * 8s = 48s (well under
-        // CloudStream's 60s loadLinks ceiling). No new imports needed.
+        // v1 made extraction sequential but the crash persisted. Root cause:
+        // CloudStream's `loadExtractor` (invoked by several branches of
+        // extractFromUrl for Dailymotion, GDPlayer fallback, ok.ru fallback,
+        // and unknown URLs) iterates through ALL registered extractors whose
+        // URL pattern matches, fanning out into many parallel child coroutines
+        // that each borrow a Dispatchers.IO thread. A single extractFromUrl
+        // call can therefore spawn dozens of native threads. On phones and
+        // Android TVs the per-process pthread limit (~500, lower on TV boxes)
+        // gets exhausted -> pthread_create fails -> OOM -> kill. LDPlayer
+        // survives because its host has a much higher per-process thread cap.
+        //
+        // v2 strategy (all confined to loadLinks, no other file changes):
+        //  1. Process servers SEQUENTIALLY (kept from v1).
+        //  2. Wrap EACH server in its OWN coroutineScope so all child
+        //     coroutines spawned inside extractFromUrl / loadExtractor are
+        //     CANCELLED and their borrowed Dispatchers.IO threads RETURNED to
+        //     the pool before the next server starts. The original outer
+        //     `coroutineScope` kept all children alive until every server
+        //     finished, so threads accumulated across servers.
+        //  3. yield() + delay(120ms) between iterations to give the JVM time
+        //     to actually pthread_join finished native worker threads before
+        //     the next iteration tries to spawn new ones.
+        //  4. Reduced per-server timeout 8s -> 5s so a stuck request doesn't
+        //     hold its thread for too long.
         for ((serverName, urlAndExtraction) in videoUrls.entries) {
-            val result = withTimeoutOrNull(8000L) {  // Reduced from 15000L
-                try {
-                    val (url, needsExtraction) = urlAndExtraction
-                    extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
-                } catch (_: Exception) {
-                    false
-                }
-            } ?: false
+            val result = coroutineScope {
+                withTimeoutOrNull(5000L) {
+                    try {
+                        val (url, needsExtraction) = urlAndExtraction
+                        extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
+                    } catch (_: Exception) {
+                        false
+                    }
+                } ?: false
+            }
             if (result) foundAny = true
+            // Allow inner thread pools (Dispatchers.IO, OkHttp dispatcher,
+            // loadExtractor's pool) to reclaim finished worker threads before
+            // the next extraction spawns new ones. Fully-qualified to avoid
+            // touching the import block.
+            kotlinx.coroutines.yield()
+            kotlinx.coroutines.delay(120)
         }
 
         return foundAny
