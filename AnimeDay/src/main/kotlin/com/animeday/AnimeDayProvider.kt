@@ -10,7 +10,12 @@ import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicBoolean
 
 // ==================== Data Classes ====================
 
@@ -217,27 +222,42 @@ class AnimeDayProvider : MainAPI() {
     // ========== OPTIMIZATION 1: Pre-fetch agents/cookies at plugin load ==========
     // Instead of lazy-loading on first video play (which adds latency),
     // fetch immediately and cache aggressively.
-    private var cachedAgents: AgentsCookies? = null
-    private var agentsFetched = false
-    private var agentsFetchFailed = false
+    //
+    // CRASH FIX: Made shared state @Volatile and guarded with a coroutine-safe Mutex.
+    // On phones/Android TVs (ARM, weaker memory model than x86 emulators),
+    // parallel coroutines could race here and cause inconsistent state.
+    // Note: Must use kotlinx.coroutines.sync.Mutex (NOT synchronized) because
+    // the fetch is a suspend function and Kotlin forbids suspend calls inside
+    // a synchronized block.
+    @Volatile private var cachedAgents: AgentsCookies? = null
+    @Volatile private var agentsFetched = false
+    @Volatile private var agentsFetchFailed = false
+    private val agentsMutex = Mutex()
 
     private suspend fun getAgents(): AgentsCookies? {
         if (agentsFetched) return cachedAgents
         if (agentsFetchFailed) return null  // Don't retry if it failed before
-        agentsFetched = true
-        cachedAgents = try {
-            withTimeoutOrNull(5000L) {  // Reduced from 8000L
-                val text = app.post(
-                    "$apiUrl/AgentsAndCookies/getData.php",
-                    headers = authHeaders
-                ).text
-                parseObject<AgentsCookies>(text)
+        return agentsMutex.withLock {
+            // Double-check after acquiring lock
+            if (agentsFetched) return@withLock cachedAgents
+            if (agentsFetchFailed) return@withLock null
+            agentsFetched = true
+            cachedAgents = try {
+                withTimeoutOrNull(5000L) {  // Reduced from 8000L
+                    val text = app.post(
+                        "$apiUrl/AgentsAndCookies/getData.php",
+                        headers = authHeaders
+                    ).text
+                    parseObject<AgentsCookies>(text)
+                }
+            } catch (_: Exception) {
+                null
             }
-        } catch (_: Exception) {
-            agentsFetchFailed = true
-            null
+            if (cachedAgents == null) {
+                agentsFetchFailed = true
+            }
+            cachedAgents
         }
-        return cachedAgents
     }
 
     // ========== OPTIMIZATION 2: URL resolution cache ==========
@@ -1001,6 +1021,15 @@ class AnimeDayProvider : MainAPI() {
      * OPTIMIZATION 10: Reduced per-server timeout from 15s to 8s
      * The native app uses 10s timeout for all HTTP operations.
      * Also pre-fetches agents/cookies in the background.
+     *
+     * CRASH FIX: Limit concurrent extractions to 3 (instead of unbounded parallel)
+     * to avoid OOM on phones/Android TVs. Emulators have plenty of RAM, but real
+     * devices often have only 1-2GB. With 6 servers in parallel, each downloading
+     * multi-MB HTML (Google Photos pages can be 5-10MB each), peak memory can
+     * easily exceed the device heap and crash CloudStream.
+     *
+     * Also added a top-level try-catch as a safety net so any unexpected exception
+     * (including OutOfMemoryError) is swallowed instead of crashing the app.
      */
     override suspend fun loadLinks(
         data: String,
@@ -1013,28 +1042,46 @@ class AnimeDayProvider : MainAPI() {
         if (videoUrls.isEmpty()) return false
 
         // Pre-fetch agents/cookies in background (won't block if already fetched)
-        coroutineScope {
-            async { getAgents() }
+        try {
+            coroutineScope { async { getAgents() } }
+        } catch (_: Throwable) {
+            // Never let agents fetch crash the app
         }
 
-        var foundAny = false
-        coroutineScope {
-            videoUrls.entries.map { (serverName, urlAndExtraction) ->
-                async {
-                    val result = withTimeoutOrNull(8000L) {  // Reduced from 15000L
+        val foundAny = AtomicBoolean(false)
+        // Limit concurrent extractions to avoid OOM on memory-constrained devices.
+        // 3 permits balances speed (still 3x parallel) against memory safety.
+        val semaphore = Semaphore(3)
+
+        try {
+            coroutineScope {
+                videoUrls.entries.map { (serverName, urlAndExtraction) ->
+                    async {
                         try {
-                            val (url, needsExtraction) = urlAndExtraction
-                            extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
-                        } catch (_: Exception) {
-                            false
+                            semaphore.withPermit {
+                                val result = withTimeoutOrNull(8000L) {  // Reduced from 15000L
+                                    try {
+                                        val (url, needsExtraction) = urlAndExtraction
+                                        extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
+                                    } catch (_: Exception) {
+                                        false
+                                    }
+                                } ?: false
+                                if (result) foundAny.set(true)
+                            }
+                        } catch (_: Throwable) {
+                            // Swallow any error (including OOM) from a single extraction
+                            // so it doesn't crash the whole app or cancel sibling extractions.
                         }
-                    } ?: false
-                    if (result) foundAny = true
-                }
-            }.forEach { it.await() }
+                    }
+                }.forEach { it.await() }
+            }
+        } catch (_: Throwable) {
+            // Final safety net: if coroutineScope itself throws (e.g., OOM, cancellation),
+            // return whatever we have so far instead of crashing CloudStream.
         }
 
-        return foundAny
+        return foundAny.get()
     }
 
     private fun getQualityFromUrl(url: String): String = when {
