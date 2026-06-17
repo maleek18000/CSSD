@@ -114,9 +114,8 @@ data class AgentsCookies(
     @JsonProperty("MF_Cookie") val mfCookie: String? = null
 )
 
-// Link data stores raw video URLs and jResolver flags from the episode
 data class LinkData(
-    val videoUrls: Map<String, Pair<String, Boolean>>  // server name -> (raw URL, needsExtraction)
+    val videoUrls: Map<String, Pair<String, Boolean>>
 )
 
 // ==================== Provider ====================
@@ -146,7 +145,7 @@ class AnimeDayProvider : MainAPI() {
         "Accept" to "application/json"
     )
 
-    // FIX 1: Cache the Base64-encoded auth header as a lazy val — computed once, never repeated
+    // FIX 1: Auth header cached once via lazy — never recomputed per-request
     private val cachedAuthHeader: String by lazy {
         val credentials = "$authUser:$authPass"
         "Basic ${android.util.Base64.encodeToString(credentials.toByteArray(), android.util.Base64.NO_WRAP)}"
@@ -154,7 +153,6 @@ class AnimeDayProvider : MainAPI() {
 
     private fun getAuthHeader(): String = cachedAuthHeader
 
-    // FIX 1 (cont): authHeaders is also lazy — built once, reused by all coroutines
     private val authHeaders by lazy { headers + mapOf("Authorization" to cachedAuthHeader) }
 
     private inline fun <reified T> parseList(text: String): List<T> {
@@ -220,18 +218,15 @@ class AnimeDayProvider : MainAPI() {
         return null
     }
 
-    // ========== OPTIMIZATION 1: Pre-fetch agents/cookies at plugin load ==========
+    // FIX 2: @Volatile flags + Mutex for thread-safe single-fetch of agents
     private var cachedAgents: AgentsCookies? = null
-    // FIX 2: @Volatile ensures flag visibility across threads on real Android hardware
     @Volatile private var agentsFetched = false
     @Volatile private var agentsFetchFailed = false
-    // FIX 2: Mutex prevents multiple coroutines from fetching simultaneously on first call
     private val agentsMutex = Mutex()
 
     private suspend fun getAgents(): AgentsCookies? {
         if (agentsFetched) return cachedAgents
         if (agentsFetchFailed) return null
-        // FIX 2: Double-checked locking — only one coroutine enters, others wait then reuse
         return agentsMutex.withLock {
             if (agentsFetched) return@withLock cachedAgents
             if (agentsFetchFailed) return@withLock null
@@ -252,18 +247,14 @@ class AnimeDayProvider : MainAPI() {
         }
     }
 
-    // ========== OPTIMIZATION 2: URL resolution cache ==========
     private val urlCache = object : LinkedHashMap<String, List<ExtractorLink>>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<ExtractorLink>>): Boolean {
             return size > 50
         }
     }
 
-    // ==================== Video Extraction (OPTIMIZED) ====================
+    // ==================== Video Extraction ====================
 
-    /**
-     * OPTIMIZATION 3: Streamlined workers.dev extraction
-     */
     private suspend fun extractWorkerUrl(
         url: String,
         serverName: String,
@@ -340,7 +331,6 @@ class AnimeDayProvider : MainAPI() {
                             if (found) return true
                         }
                     }
-
                 } catch (_: Exception) {}
             }
 
@@ -405,9 +395,6 @@ class AnimeDayProvider : MainAPI() {
         }
     }
 
-    /**
-     * OPTIMIZATION 4: Simplified Google Photos extraction
-     */
     private suspend fun extractGooglePhotos(
         url: String,
         serverName: String,
@@ -432,7 +419,7 @@ class AnimeDayProvider : MainAPI() {
 
             var foundAny = false
 
-            val videoDownloadPattern = Regex("""https://video-downloads\.googleusercontent\.com/[^"\\s]+""")
+            val videoDownloadPattern = Regex("""https://video-downloads\.googleusercontent\.com/[^"\\\s]+""")
             videoDownloadPattern.find(decoded)?.value?.let { videoUrl ->
                 callback(
                     newExtractorLink(
@@ -448,7 +435,7 @@ class AnimeDayProvider : MainAPI() {
                 foundAny = true
             }
 
-            val lh3Pattern = Regex("""https://lh3\.googleusercontent\.com/pw/[^"\\s]+""")
+            val lh3Pattern = Regex("""https://lh3\.googleusercontent\.com/pw/[^"\\\s]+""")
             var lh3BaseUrl: String? = null
             for (match in lh3Pattern.findAll(decoded)) {
                 val foundUrl = match.value
@@ -458,7 +445,6 @@ class AnimeDayProvider : MainAPI() {
                     break
                 }
             }
-
             if (lh3BaseUrl == null) {
                 lh3Pattern.find(decoded)?.value?.let { rawUrl ->
                     val lastEqIndex = rawUrl.lastIndexOf('=')
@@ -494,9 +480,6 @@ class AnimeDayProvider : MainAPI() {
         }
     }
 
-    /**
-     * OPTIMIZATION 5: Skip loadExtractor for ok.ru — go directly to metadata API
-     */
     private suspend fun extractOkRu(
         url: String,
         serverName: String,
@@ -593,7 +576,6 @@ class AnimeDayProvider : MainAPI() {
                 }
                 if (foundAny) return true
             }
-
         } catch (_: Exception) {}
 
         try {
@@ -605,9 +587,6 @@ class AnimeDayProvider : MainAPI() {
         return false
     }
 
-    /**
-     * Dailymotion extraction
-     */
     private suspend fun extractDailymotion(
         url: String,
         serverName: String,
@@ -622,9 +601,6 @@ class AnimeDayProvider : MainAPI() {
         return false
     }
 
-    /**
-     * OPTIMIZATION 6: GDPlayer Pro — pass URL directly
-     */
     private suspend fun extractGdPlayerPro(
         url: String,
         serverName: String,
@@ -654,9 +630,6 @@ class AnimeDayProvider : MainAPI() {
         return false
     }
 
-    /**
-     * OPTIMIZATION 7: Reordered URL routing for fastest path first
-     */
     private suspend fun extractFromUrl(
         url: String,
         serverName: String,
@@ -801,15 +774,12 @@ class AnimeDayProvider : MainAPI() {
             "2" -> TvType.Movie
             else -> TvType.TvSeries
         }
-
         val classificationTag = when (item.classification) {
             "1" -> "مدبلج"
             "2" -> "مترجم"
             else -> ""
         }
-
         val displayTitle = if (classificationTag.isNotEmpty()) "$title ($classificationTag)" else title
-
         val dubExist = item.classification == "1"
         val subExist = item.classification == "2"
 
@@ -822,14 +792,12 @@ class AnimeDayProvider : MainAPI() {
     // ==================== Search ====================
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val results = mutableListOf<SearchResponse>()
-
         val searchConfigs = listOf(
             "1" to "2", "1" to "1", "2" to "2", "2" to "1"
         )
 
-        // OPTIMIZATION 8: Parallel search across all configs
-        coroutineScope {
+        // FIX A: Each async returns its own list — no shared mutable list written from parallel coroutines
+        val results = coroutineScope {
             searchConfigs.map { (type, classification) ->
                 async {
                     try {
@@ -838,11 +806,12 @@ class AnimeDayProvider : MainAPI() {
                             params = mapOf("search" to query, "type" to type, "classification" to classification),
                             headers = authHeaders
                         ).text
-                        val items = parseList<CartoonWithInfo>(text)
-                        items.forEach { toSearchResult(it)?.let { r -> results.add(r) } }
-                    } catch (_: Exception) {}
+                        parseList<CartoonWithInfo>(text).mapNotNull { toSearchResult(it) }
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
                 }
-            }.forEach { it.await() }
+            }.flatMap { it.await() }
         }
 
         return results.distinctBy { it.url }
@@ -850,9 +819,6 @@ class AnimeDayProvider : MainAPI() {
 
     // ==================== Load Detail ====================
 
-    /**
-     * OPTIMIZATION 9: Parallel episode fetching
-     */
     override suspend fun load(url: String): LoadResponse? {
         val cartoonId = url.substringAfterLast("/")
 
@@ -864,31 +830,27 @@ class AnimeDayProvider : MainAPI() {
         val playlists = parseList<Playlist>(playlistsText)
         if (playlists.isEmpty()) return null
 
-        val playlistEpisodes = mutableMapOf<String, List<Episode>>()
-        var firstEpisodeInfo: Episode? = null
-
-        coroutineScope {
-            playlists.map { playlist ->
-                val playlistId = playlist.id ?: return@map null
+        // FIX B: Collect results as immutable map — no shared mutable state written from parallel coroutines
+        val episodeHeaders = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded")
+        val fetchedPairs = coroutineScope {
+            playlists.mapNotNull { playlist ->
+                val playlistId = playlist.id ?: return@mapNotNull null
                 async {
                     try {
                         val epsText = app.post(
                             "$apiUrl/episodeWithInfo/readPaging.php",
-                            headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
+                            headers = episodeHeaders,
                             data = mapOf("playlist_id" to playlistId)
                         ).text
-                        parseList<Episode>(epsText) to playlistId
+                        playlistId to parseList<Episode>(epsText)
                     } catch (_: Exception) {
-                        emptyList<Episode>() to playlistId
+                        playlistId to emptyList<Episode>()
                     }
                 }
-            }.filterNotNull().map { it.await() }.forEach { (eps, playlistId) ->
-                playlistEpisodes[playlistId] = eps
-                if (firstEpisodeInfo == null && eps.isNotEmpty()) {
-                    firstEpisodeInfo = eps.first()
-                }
-            }
+            }.map { it.await() }
         }
+        val playlistEpisodes: Map<String, List<Episode>> = fetchedPairs.toMap()
+        val firstEpisodeInfo: Episode? = fetchedPairs.firstOrNull { it.second.isNotEmpty() }?.second?.firstOrNull()
 
         val firstPlaylist = playlists.first()
         val firstPlaylistEps = playlistEpisodes[firstPlaylist.id] ?: emptyList()
@@ -918,7 +880,6 @@ class AnimeDayProvider : MainAPI() {
         for (playlist in playlists) {
             playlistEpisodes[playlist.id]?.let { allEpisodes.addAll(it) }
         }
-
         if (allEpisodes.isEmpty()) return null
 
         val episodes = allEpisodes.mapIndexed { idx, ep ->
@@ -962,11 +923,6 @@ class AnimeDayProvider : MainAPI() {
 
     // ==================== Video Extraction Entry Point ====================
 
-    /**
-     * OPTIMIZATION 10: Reduced per-server timeout to 8s.
-     * FIX 3: getAgents() called directly (suspend) — guaranteed to complete before extractions start.
-     * FIX 4: Semaphore(3) limits concurrent HTTP requests to prevent OOM/ANR on mobile & Android TV.
-     */
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -977,17 +933,17 @@ class AnimeDayProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        // FIX 3: Direct suspend call — agents fetched and ready before any extraction starts
+        // FIX 3: Direct suspend call — agents fetched and ready before extractions start
         getAgents()
 
-        // FIX 4: Max 3 concurrent network requests — prevents OOM/crash on real phones and Android TV
+        // FIX 4: Semaphore caps concurrent requests at 3 — prevents OOM/ANR on mobile & Android TV
         val semaphore = Semaphore(3)
-        var foundAny = false
-        coroutineScope {
+        // FIX C: Results collected via map — no shared mutable var written across parallel coroutines
+        val anyFound = coroutineScope {
             videoUrls.entries.map { (serverName, urlAndExtraction) ->
                 async {
                     semaphore.withPermit {
-                        val result = withTimeoutOrNull(8000L) {
+                        withTimeoutOrNull(8000L) {
                             try {
                                 val (url, needsExtraction) = urlAndExtraction
                                 extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
@@ -995,13 +951,12 @@ class AnimeDayProvider : MainAPI() {
                                 false
                             }
                         } ?: false
-                        if (result) foundAny = true
                     }
                 }
-            }.forEach { it.await() }
+            }.map { it.await() }.any { it }
         }
 
-        return foundAny
+        return anyFound
     }
 
     private fun getQualityFromUrl(url: String): String = when {
