@@ -567,25 +567,6 @@
     "name": "Asia2tv"
   },
   {
-    "iconUrl": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQ2vuGLv4zY3XpoN2jza2unCQ95xFfypfe-h3k3xteMbGxl7taw-ziXyNg&s=10",
-    "apiVersion": 1,
-    "repositoryUrl": "https://github.com/maleek18000/CSSD",
-    "fileSize": 18400,
-    "status": 1,
-    "language": "ar",
-    "authors": [
-      "Abodabodd"
-    ],
-    "tvTypes": [
-      "TvSeries",
-      "Movie"
-    ],
-    "version": 3,
-    "internalName": "Akwam",
-    "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/Akwam.cs3",
-    "name": "Akwam"
-  },
-  {
     "iconUrl": "https://3esk.onl/wp-content/uploads/2021/01/3isk-logo.png",
     "apiVersion": 1,
     "repositoryUrl": "https://github.com/maleek18000/CSSD",
