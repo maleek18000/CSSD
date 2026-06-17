@@ -214,18 +214,8 @@ class AnimeDayProvider : MainAPI() {
         return null
     }
 
-    // CRASH FIX v15: HttpURLConnection-based HTTP helpers that BYPASS
-    // OkHttp entirely. Every previous version (v1-v14) used CloudStream's
-    // app.get/app.post which uses OkHttp's shared connection pool + dispatcher.
-    // Even with sequential extraction, no timeouts, proper cancellation, the
-    // crash persisted because OkHttp's connection pool threads accumulate
-    // (each connection needs a pool thread, cleanup thread, and potentially
-    // async timeout watchdog threads). On phones/Android TVs with low
-    // per-process thread caps (300-500), this saturates -> pthread_create
-    // fails -> crash. Stardima works because it makes fewer requests to fewer
-    // hosts. HttpURLConnection doesn't use a connection pool — each request
-    // is a simple blocking call, fully cleaned up by disconnect(). No pool
-    // threads, no dispatcher threads, no async timeout watchdogs.
+
+    // CRASH FIX v16: HttpURLConnection helpers + explicit ExtractorLinkType.
     private fun simpleHttpGet(url: String, headers: Map<String, String> = emptyMap()): String? {
         var conn: java.net.HttpURLConnection? = null
         return try {
@@ -237,11 +227,8 @@ class AnimeDayProvider : MainAPI() {
                 headers.forEach { (k, v) -> setRequestProperty(k, v) }
             }
             conn.inputStream.bufferedReader().use { it.readText() }
-        } catch (e: Exception) {
-            null
-        } finally {
-            conn?.disconnect()
-        }
+        } catch (e: Exception) { null }
+        finally { conn?.disconnect() }
     }
 
     private fun simpleHttpPost(url: String, headers: Map<String, String> = emptyMap(), formData: Map<String, String> = emptyMap()): String? {
@@ -254,9 +241,7 @@ class AnimeDayProvider : MainAPI() {
                 instanceFollowRedirects = true
                 doOutput = true
                 headers.forEach { (k, v) -> setRequestProperty(k, v) }
-                if (formData.isNotEmpty()) {
-                    setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-                }
+                if (formData.isNotEmpty()) setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
             }
             if (formData.isNotEmpty()) {
                 val body = formData.entries.joinToString("&") {
@@ -265,12 +250,12 @@ class AnimeDayProvider : MainAPI() {
                 conn.outputStream.bufferedWriter().use { it.write(body) }
             }
             conn.inputStream.bufferedReader().use { it.readText() }
-        } catch (e: Exception) {
-            null
-        } finally {
-            conn?.disconnect()
-        }
+        } catch (e: Exception) { null }
+        finally { conn?.disconnect() }
     }
+
+    private fun inferLinkType(url: String): ExtractorLinkType =
+        if (url.contains(".m3u8") || url.contains("m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
 
     // ========== OPTIMIZATION 1: Pre-fetch agents/cookies at plugin load ==========
     // Instead of lazy-loading on first video play (which adds latency),
@@ -281,20 +266,11 @@ class AnimeDayProvider : MainAPI() {
 
     private fun getAgents(): AgentsCookies? {
         if (agentsFetched) return cachedAgents
-        if (agentsFetchFailed) return null  // Don't retry if it failed before
+        if (agentsFetchFailed) return null
         agentsFetched = true
-        // CRASH FIX v15: use HttpURLConnection instead of app.post to bypass
-        // OkHttp's connection pool entirely.
         cachedAgents = try {
-            val text = simpleHttpPost(
-                "$apiUrl/AgentsAndCookies/getData.php",
-                headers = authHeaders
-            )
-            text?.let { parseObject<AgentsCookies>(it) }
-        } catch (_: Exception) {
-            agentsFetchFailed = true
-            null
-        }
+            simpleHttpPost("$apiUrl/AgentsAndCookies/getData.php", headers = authHeaders)?.let { parseObject<AgentsCookies>(it) }
+        } catch (_: Exception) { agentsFetchFailed = true; null }
         return cachedAgents
     }
 
@@ -321,8 +297,6 @@ class AnimeDayProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
-            // CRASH FIX v15: use HttpURLConnection instead of app.get to bypass
-            // OkHttp's connection pool entirely.
             val responseText = simpleHttpGet(url, authHeaders) ?: return false
 
             // Fast path: Try availableQualities first (most common format)
@@ -342,7 +316,7 @@ class AnimeDayProvider : MainAPI() {
                                     source = serverName,
                                     name = "$serverName - $qualityStr",
                                     url = streamUrl,
-                                    type = INFER_TYPE
+                                    type = inferLinkType(streamUrl)
                                 ) {
                                     this.referer = ""
                                     this.quality = getQualityValue(qualityStr)
@@ -361,7 +335,7 @@ class AnimeDayProvider : MainAPI() {
                                 source = serverName,
                                 name = "$serverName - $quality",
                                 url = directUrl,
-                                type = INFER_TYPE
+                                type = inferLinkType(directUrl)
                             ) {
                                 this.referer = ""
                                 this.quality = getQualityValue(quality)
@@ -382,7 +356,7 @@ class AnimeDayProvider : MainAPI() {
                                         source = serverName,
                                         name = "$serverName - $vQuality",
                                         url = vUrl,
-                                        type = INFER_TYPE
+                                        type = inferLinkType(vUrl)
                                     ) {
                                         this.referer = ""
                                         this.quality = getQualityValue(vQuality)
@@ -409,7 +383,7 @@ class AnimeDayProvider : MainAPI() {
                                     source = serverName,
                                     name = "$serverName - $qualityStr",
                                     url = streamUrl,
-                                    type = INFER_TYPE
+                                    type = inferLinkType(streamUrl)
                                 ) {
                                     this.referer = ""
                                     this.quality = getQualityValue(qualityStr)
@@ -421,16 +395,8 @@ class AnimeDayProvider : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // CRASH FIX v15: removed the "Check for redirect" block that used
-            // response.url (no longer available with HttpURLConnection). This
-            // block was a fallback that passed the redirected workers.dev URL
-            // directly to the player — but workers.dev returns JSON (not video),
-            // so passing it would cause 3003 errors. Removed entirely.
             return false
         } catch (e: Exception) {
-            // CRASH FIX v15: rethrow CancellationException. Removed the raw
-            // workers.dev URL fallback (it caused 3003 errors because workers.dev
-            // returns JSON, not video).
             if (e is java.util.concurrent.CancellationException) throw e
             return false
         }
@@ -460,8 +426,6 @@ class AnimeDayProvider : MainAPI() {
                 gPhotosHeaders["Cookie"] = it
             }
 
-            // CRASH FIX v15: use HttpURLConnection instead of app.get to
-            // bypass OkHttp's connection pool entirely.
             val pageText = simpleHttpGet(url, gPhotosHeaders) ?: return false
 
             // Fix malformed percent encoding
@@ -478,7 +442,7 @@ class AnimeDayProvider : MainAPI() {
                         source = serverName,
                         name = "$serverName - Original",
                         url = videoUrl,
-                        type = INFER_TYPE
+                        type = ExtractorLinkType.VIDEO
                     ) {
                         this.referer = ""
                         this.quality = Qualities.P1080.value
@@ -487,13 +451,8 @@ class AnimeDayProvider : MainAPI() {
                 foundAny = true
             }
 
-            // CRASH FIX v15: lh3.googleusercontent.com /pw/ URLs are image-CDN
-            // endpoints; the =m22/=m37/=m18 suffixes don't produce playable
-            // video URLs. Dropped to avoid broken links.
-            // CRASH FIX v15: lh3 URLs already removed above.
             return foundAny
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
+        } catch (_: Exception) {
             return false
         }
     }
@@ -522,15 +481,9 @@ class AnimeDayProvider : MainAPI() {
 
             // Use metadata API — same as native app
             val metadataUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
-            // CRASH FIX v15: use HttpURLConnection instead of app.post to
-            // bypass OkHttp's connection pool entirely.
             val metaResponse = simpleHttpPost(
                 metadataUrl,
-                headers = mapOf(
-                    "User-Agent" to userAgent,
-                    "Cookie" to cookie,
-                    "Content-Type" to "application/x-www-form-urlencoded"
-                )
+                headers = mapOf("User-Agent" to userAgent, "Cookie" to cookie, "Content-Type" to "application/x-www-form-urlencoded")
             ) ?: return false
 
             val metadata = mapper.readTree(metaResponse)
@@ -547,7 +500,7 @@ class AnimeDayProvider : MainAPI() {
                                 source = serverName,
                                 name = "$serverName - $vName",
                                 url = vUrl,
-                                type = INFER_TYPE
+                                type = inferLinkType(vUrl)
                             ) {
                                 this.referer = ""
                                 this.quality = getQualityValue(vName)
@@ -562,15 +515,7 @@ class AnimeDayProvider : MainAPI() {
             // Try ondemandHls if videos array fails
             val hlsUrl = metadata?.get("ondemandHls")?.asText()
             if (hlsUrl != null && hlsUrl.isNotEmpty()) {
-                // CRASH FIX v15: use HttpURLConnection instead of app.get to
-                // bypass OkHttp's connection pool entirely.
-                val hlsResponse = simpleHttpGet(
-                    hlsUrl,
-                    headers = mapOf(
-                        "User-Agent" to userAgent,
-                        "Cookie" to cookie
-                    )
-                ) ?: return false
+                val hlsResponse = simpleHttpGet(hlsUrl, headers = mapOf("User-Agent" to userAgent, "Cookie" to cookie)) ?: return false
 
                 val lines = hlsResponse.lines()
                 var foundAny = false
@@ -591,7 +536,7 @@ class AnimeDayProvider : MainAPI() {
                                         source = serverName,
                                         name = "$serverName - $qualityLabel",
                                         url = streamUrl,
-                                        type = INFER_TYPE
+                                        type = ExtractorLinkType.M3U8
                                     ) {
                                         this.referer = ""
                                         this.quality = getQualityValue(qualityLabel)
@@ -604,27 +549,19 @@ class AnimeDayProvider : MainAPI() {
                 }
                 if (foundAny) return true
             }
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-        }
+        } catch (e: Exception) { if (e is java.util.concurrent.CancellationException) throw e }
 
-        // CRASH FIX v15: loadExtractor fallback REMOVED (thread-spawning).
         return false
     }
 
     /**
-     * Dailymotion extraction — try CloudStream's built-in extractor
-     * with reduced timeout.
+     * Dailymotion extraction — CRASH FIX v16: loadExtractor REMOVED.
      */
     private suspend fun extractDailymotion(
-        url: String,
-        serverName: String,
+        url: String, serverName: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        // CRASH FIX v15: loadExtractor REMOVED (thread-spawning catch-all).
-        return false
-    }
+    ): Boolean { return false }
 
     /**
      * OPTIMIZATION 6: GDPlayer Pro — pass URL directly, no extraction needed
@@ -644,18 +581,14 @@ class AnimeDayProvider : MainAPI() {
                     source = serverName,
                     name = "$serverName - GD",
                     url = url,
-                    type = INFER_TYPE
+                    type = ExtractorLinkType.VIDEO
                 ) {
                     this.referer = mainUrl
                     this.quality = Qualities.Unknown.value
                 }
             )
             return true
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-        }
-
-        // CRASH FIX v15: loadExtractor fallback REMOVED.
+        } catch (e: Exception) { if (e is java.util.concurrent.CancellationException) throw e }
         return false
     }
 
@@ -680,7 +613,7 @@ class AnimeDayProvider : MainAPI() {
                     source = serverName,
                     name = "$serverName - $quality",
                     url = cleanUrl,
-                    type = if (cleanUrl.contains(".m3u8")) INFER_TYPE else ExtractorLinkType.VIDEO
+                    type = if (cleanUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                 ) {
                     this.referer = mainUrl
                     this.quality = getQualityValue(quality)
@@ -696,7 +629,7 @@ class AnimeDayProvider : MainAPI() {
                     source = serverName,
                     name = "$serverName - تلقائي",
                     url = cleanUrl,
-                    type = INFER_TYPE
+                    type = ExtractorLinkType.VIDEO
                 ) {
                     this.referer = ""
                     this.quality = Qualities.Unknown.value
@@ -712,7 +645,7 @@ class AnimeDayProvider : MainAPI() {
                     source = serverName,
                     name = serverName,
                     url = cleanUrl,
-                    type = INFER_TYPE
+                    type = ExtractorLinkType.VIDEO
                 ) {
                     this.referer = ""
                     this.quality = Qualities.Unknown.value
@@ -746,9 +679,7 @@ class AnimeDayProvider : MainAPI() {
             return extractGooglePhotos(cleanUrl, serverName, callback)
         }
 
-        // CRASH FIX v15: loadExtractor for unknown URLs REMOVED, AND the
-        // "last resort: pass as direct link" fallback is ALSO REMOVED.
-        return false
+        return false  // CRASH FIX v16: loadExtractor + fallback REMOVED
     }
 
     // ==================== Home Page ====================
@@ -822,9 +753,6 @@ class AnimeDayProvider : MainAPI() {
             "1" to "2", "1" to "1", "2" to "2", "2" to "1"
         )
 
-        // CRASH FIX v15: SEQUENTIAL. Plus yield() at the START of each
-        // iteration to check for cancellation. Note: search still uses app.get
-        // because it's less frequently called than loadLinks.
         for ((type, classification) in searchConfigs) {
             kotlinx.coroutines.yield()
             try {
@@ -835,9 +763,7 @@ class AnimeDayProvider : MainAPI() {
                 ).text
                 val items = parseList<CartoonWithInfo>(text)
                 items.forEach { toSearchResult(it)?.let { r -> results.add(r) } }
-            } catch (e: Exception) {
-                if (e is java.util.concurrent.CancellationException) throw e
-            }
+            } catch (e: Exception) { if (e is java.util.concurrent.CancellationException) throw e }
         }
 
         return results.distinctBy { it.url }
@@ -861,8 +787,6 @@ class AnimeDayProvider : MainAPI() {
         val playlists = parseList<Playlist>(playlistsText)
         if (playlists.isEmpty()) return null
 
-        // CRASH FIX v15: SEQUENTIAL. Plus yield() at the START of each
-        // iteration to check for cancellation.
         val playlistEpisodes = mutableMapOf<String, List<Episode>>()
         var firstEpisodeInfo: Episode? = null
 
@@ -877,9 +801,7 @@ class AnimeDayProvider : MainAPI() {
                 ).text
                 val eps = parseList<Episode>(epsText)
                 playlistEpisodes[playlistId] = eps
-                if (firstEpisodeInfo == null && eps.isNotEmpty()) {
-                    firstEpisodeInfo = eps.first()
-                }
+                if (firstEpisodeInfo == null && eps.isNotEmpty()) firstEpisodeInfo = eps.first()
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
                 playlistEpisodes[playlistId] = emptyList()
@@ -973,53 +895,16 @@ class AnimeDayProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        // CRASH FIX v15: removed the coroutineScope { async { getAgents() } }
-        // pre-fetch. getAgents() is now a regular function (not suspend) using
-        // HttpURLConnection — called synchronously inside extractors when
-        // needed, cached after first call.
         var foundAny = false
-        // CRASH FIX v15 (RADICAL APPROACH: bypass OkHttp entirely):
-        //
-        // Every previous version (v1-v14) used CloudStream's app.get/app.post
-        // which uses OkHttp's shared connection pool + dispatcher. Even with
-        // sequential extraction, no timeouts, proper cancellation handling,
-        // the crash persisted because OkHttp's connection pool threads
-        // accumulate (each connection needs a pool thread, cleanup thread, and
-        // potentially async timeout watchdog threads). On phones/Android TVs
-        // with low per-process thread caps (300-500), this saturates ->
-        // pthread_create fails -> crash.
-        //
-        // Stardima works because it makes fewer requests to fewer hosts.
-        // But we can't reduce our request count further without breaking
-        // functionality. So instead, we BYPASS OkHttp entirely by using
-        // java.net.HttpURLConnection for ALL extraction HTTP requests.
-        // HttpURLConnection doesn't use a connection pool — each request is a
-        // simple blocking call, fully cleaned up by disconnect(). No pool
-        // threads, no dispatcher threads, no async timeout watchdogs.
-        //
-        // v15 = v14 structure + HttpURLConnection for extraction HTTP:
-        //   1. simpleHttpGet/simpleHttpPost helpers using HttpURLConnection
-        //   2. getAgents() uses simpleHttpPost (not suspend, not app.post)
-        //   3. extractWorkerUrl uses simpleHttpGet
-        //   4. extractGooglePhotos uses simpleHttpGet
-        //   5. extractOkRu uses simpleHttpPost + simpleHttpGet
-        //   6. search/load still use app.get/app.post (less frequently called)
-        //   7. loadLinks: sequential for-loop, yield(), CancellationException
-        //      rethrow, break after first success, buffering callback
-        //   8. No withTimeoutOrNull, no loadExtractor, no lh3 fake URLs,
-        //      no extractFromUrl last-resort fallback, no workers.dev raw-URL
-        //      fallback.
         val MAX_LINKS = 5
         val linksReturned = java.util.concurrent.atomic.AtomicInteger(0)
         val bufferingCallback: (ExtractorLink) -> Unit = { link ->
-            if (linksReturned.getAndIncrement() < MAX_LINKS) {
-                callback(link)
-            }
+            if (linksReturned.getAndIncrement() < MAX_LINKS) callback(link)
         }
 
         for ((serverName, urlAndExtraction) in videoUrls.entries) {
             kotlinx.coroutines.yield()
-            if (linksReturned.get() > 0) break  // Got links, stop
+            if (linksReturned.get() > 0) break
             val result = try {
                 val (url, needsExtraction) = urlAndExtraction
                 extractFromUrl(url, serverName, needsExtraction, subtitleCallback, bufferingCallback)
