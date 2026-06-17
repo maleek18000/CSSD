@@ -921,42 +921,64 @@ class AnimeDayProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        // CRASH FIX v22: v19 EXACTLY (break after first server returns ANY
-        // result) + v20's direct-URL filter.
-        // v21 crashed because it tried the NEXT server when the first yielded
-        // no direct URLs — this accumulated HTTP requests like v20 did.
-        // v22 goes back to v19's proven logic: break after the first server
-        // returns ANY result (extractFromUrl returns true). The filtering
-        // callback ensures only DIRECT video URLs reach the player, so:
-        //   - First server returns direct URLs -> player gets them -> plays
-        //   - First server returns non-direct URLs -> player gets NOTHING
-        //     (filtered) -> "no links found" but NO CRASH
-        //   - First server returns nothing -> try next server (sequentially)
-        // This caps HTTP requests to ~2 (one server + maybe getAgents), the
-        // same as v18/v19 which proved crash-free.
+        // CRASH FIX v23: ZERO HTTP in loadLinks + skip non-direct URLs.
+        //
+        // BREAKTHROUGH: On Android, java.net.HttpURLConnection is BACKED BY
+        // OKHTTP internally (since Android 4.4). So v15-v22's "bypass OkHttp
+        // with HttpURLConnection" was an illusion — extraction HTTP requests
+        // still went through OkHttp's connection pool. That's why v19-v22 all
+        // crashed despite using HttpURLConnection.
+        //
+        // v18 didn't crash because it did ZERO HTTP requests in loadLinks.
+        // v19-v22 all crashed because they called extractFromUrl which does
+        // HTTP (even via HttpURLConnection = OkHttp).
+        //
+        // v23 = v18 (zero HTTP) + skip non-direct URLs:
+        //   - Return raw episode URLs DIRECTLY to the player (no extraction)
+        //   - SKIP URLs that aren't already direct video URLs (no workers.dev
+        //     JSON endpoints, no ok.ru webpages, no Google Photos URLs that
+        //     need HTML scraping)
+        //   - Only return URLs that are ALREADY playable: .mp4, .m3u8, CDN
+        //     URLs (okcdn.ru, vkuser.net), googleusercontent.com direct URLs
+        //   - No HTTP requests, no extraction, no OkHttp, no crash
+        //
+        // Tradeoff: episodes whose servers only have URLs needing extraction
+        // (workers.dev, ok.ru, Google Photos) will show "no links found".
+        // Episodes with direct video URLs (mp4/m3u8/CDN) will play. This is
+        // the same as v18 but without passing non-playable URLs to the player
+        // (which caused 3003 errors in v18).
         var foundAny = false
-        val MAX_LINKS = 5
-        val linksReturned = java.util.concurrent.atomic.AtomicInteger(0)
-        val filteringCallback: (ExtractorLink) -> Unit = { link ->
-            if (isDirectVideoUrl(link.url) && linksReturned.getAndIncrement() < MAX_LINKS) {
-                callback(link)
-            }
-        }
-
         for ((serverName, urlAndExtraction) in videoUrls.entries) {
             kotlinx.coroutines.yield()
-            val (url, needsExtraction) = urlAndExtraction
-            val result = try {
-                extractFromUrl(url, serverName, needsExtraction, subtitleCallback, filteringCallback)
+            val (rawUrl, _) = urlAndExtraction
+            val cleanUrl = rawUrl.trim()
+            if (cleanUrl.isEmpty()) continue
+
+            // SKIP non-direct URLs — only return already-playable URLs
+            if (!isDirectVideoUrl(cleanUrl)) continue
+
+            val linkType = when {
+                cleanUrl.contains(".m3u8") -> ExtractorLinkType.M3U8
+                else -> ExtractorLinkType.VIDEO
+            }
+
+            try {
+                callback(
+                    newExtractorLink(
+                        source = serverName,
+                        name = serverName,
+                        url = cleanUrl,
+                        type = linkType
+                    ) {
+                        this.referer = mainUrl
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+                foundAny = true
+                // Don't break — collect direct URLs from ALL servers (no HTTP cost)
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
-                false
             }
-            if (result) {
-                foundAny = true
-                break  // FIRST SERVER returned any result — stop (v19's logic)
-            }
-            // Only try next server if this one returned NOTHING (extractFromUrl=false)
         }
 
         return foundAny
