@@ -214,10 +214,11 @@ class AnimeDayProvider : MainAPI() {
         return null
     }
 
-    // CRASH FIX v20: HttpURLConnection helpers + URL validation.
-    // v19 stopped the crash but many episodes showed 3003/source errors
-    // because the first server's URLs weren't always directly playable.
-    // v20 tries ALL servers sequentially and only returns DIRECT video URLs.
+    // CRASH FIX v21: HttpURLConnection helpers + URL validation.
+    // v18/v19 stopped the crash (minimal loadLinks). v20 tried ALL servers
+    // and crashed again. v21 = v19's first-successful-server approach +
+    // v20's direct-URL filter. Stops as soon as ONE server yields direct
+    // video URLs. If first server yields none, tries next (sequentially).
     private fun simpleHttpGet(url: String, headers: Map<String, String> = emptyMap()): String? {
         var conn: java.net.HttpURLConnection? = null
         return try {
@@ -266,9 +267,6 @@ class AnimeDayProvider : MainAPI() {
     private fun inferLinkType(url: String): ExtractorLinkType =
         if (url.contains(".m3u8") || url.contains("m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
 
-    // CRASH FIX v20: Check if a URL is a DIRECT playable video URL (not a
-    // webpage/JSON/API endpoint that would cause 3003 "parsing container" errors).
-    // Returns true for: .mp4, .m3u8, known CDN URLs, googleusercontent video-downloads.
     private fun isDirectVideoUrl(url: String): Boolean {
         val u = url.lowercase()
         return u.contains(".mp4") ||
@@ -580,7 +578,7 @@ class AnimeDayProvider : MainAPI() {
     }
 
     /**
-     * Dailymotion extraction — CRASH FIX v20: loadExtractor REMOVED.
+     * Dailymotion extraction — CRASH FIX v21: loadExtractor REMOVED.
      */
     private suspend fun extractDailymotion(
         url: String, serverName: String,
@@ -704,7 +702,7 @@ class AnimeDayProvider : MainAPI() {
             return extractGooglePhotos(cleanUrl, serverName, callback)
         }
 
-        return false  // CRASH FIX v20: loadExtractor + fallback REMOVED
+        return false  // CRASH FIX v21: loadExtractor + fallback REMOVED
     }
 
     // ==================== Home Page ====================
@@ -923,19 +921,22 @@ class AnimeDayProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        // CRASH FIX v20: TRY ALL SERVERS sequentially + FILTER DIRECT VIDEO URLs.
-        // v19 stopped the crash but many episodes showed 3003/source errors
-        // because the first server's URLs weren't always directly playable.
-        // v20 tries ALL servers sequentially and uses a FILTERING callback that
-        // only forwards DIRECT video URLs to the player (mp4, m3u8, CDN, etc.).
-        // Non-direct URLs (workers.dev JSON endpoints, ok.ru webpages, etc.)
-        // are filtered out so the player never gets a URL it can't play.
-        // Stop as soon as MAX_LINKS direct video URLs are collected.
+        // CRASH FIX v21: FIRST SERVER WITH DIRECT URLs + break when found.
+        // v18/v19 stopped the crash (minimal loadLinks). v20 tried ALL servers
+        // and crashed again (too many cumulative HTTP requests). v21 = v19's
+        // minimal approach + v20's direct-URL filter:
+        //   - Try servers SEQUENTIALLY (one at a time, not parallel)
+        //   - Use a FILTERING callback that only forwards DIRECT video URLs
+        //     (mp4, m3u8, CDN, googleusercontent) to the player
+        //   - BREAK as soon as ONE server yields at least one direct video URL
+        //   - If first server yields no direct URLs, try next (sequentially)
+        //   - Stop after MAX_LINKS direct URLs collected
+        // This caps HTTP requests to ~2 (one server + maybe getAgents) while
+        // ensuring the player only gets URLs it can actually play (no 3003).
         var foundAny = false
-        val MAX_LINKS = 8
+        val MAX_LINKS = 5
         val linksReturned = java.util.concurrent.atomic.AtomicInteger(0)
         val filteringCallback: (ExtractorLink) -> Unit = { link ->
-            // Only forward DIRECT video URLs to the player
             if (isDirectVideoUrl(link.url) && linksReturned.getAndIncrement() < MAX_LINKS) {
                 callback(link)
             }
@@ -943,16 +944,18 @@ class AnimeDayProvider : MainAPI() {
 
         for ((serverName, urlAndExtraction) in videoUrls.entries) {
             kotlinx.coroutines.yield()
-            if (linksReturned.get() >= MAX_LINKS) break
+            if (linksReturned.get() > 0) break  // Got direct URLs from a server, stop
             val (url, needsExtraction) = urlAndExtraction
-            val result = try {
+            try {
                 extractFromUrl(url, serverName, needsExtraction, subtitleCallback, filteringCallback)
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
-                false
             }
-            if (result) foundAny = true
-            // Don't break — try ALL servers to collect as many direct video URLs as possible
+            if (linksReturned.get() > 0) {
+                foundAny = true
+                break  // FIRST SERVER with direct URLs — stop
+            }
+            // If this server yielded no direct URLs, try next (sequentially)
         }
 
         return foundAny
