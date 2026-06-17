@@ -115,9 +115,21 @@ data class AgentsCookies(
     @JsonProperty("MF_Cookie") val mfCookie: String? = null
 )
 
-// Link data stores raw video URLs and jResolver flags from the episode
+// CRASH FIX: Previously this stored the full Map of all 6 video URLs and
+// jResolver flags per episode. For a long series with hundreds of episodes,
+// each episode's data field was multiple KB of JSON. CloudStream serializes
+// the entire episode list to pass to the player activity, and on phones/TVs
+// (which have less RAM and tighter Binder limits than the LDPlayer emulator)
+// this caused the app to crash the moment it tried to open the "loading links"
+// phase — sometimes even before the banner appeared.
+//
+// Now LinkData stores ONLY the playlist ID and episode ID (a few dozen bytes).
+// loadLinks() re-fetches the single playlist's episodes from the API and finds
+// the matching episode. This is one extra HTTP call (~50-200KB response, fast)
+// but eliminates the multi-MB JSON serialization that was crashing real devices.
 data class LinkData(
-    val videoUrls: Map<String, Pair<String, Boolean>>  // server name -> (raw URL, needsExtraction)
+    val playlistId: String,
+    val episodeId: String
 )
 
 // ==================== Provider ====================
@@ -925,8 +937,11 @@ class AnimeDayProvider : MainAPI() {
 
         if (isMovie) {
             val ep = firstPlaylistEps.firstOrNull()
-            val videoUrls = if (ep != null) collectVideoUrls(ep) else emptyMap()
-            val linkData = LinkData(videoUrls)
+            // CRASH FIX: Embed only playlist ID + episode ID (tiny), not all video URLs.
+            val linkData = LinkData(
+                playlistId = firstPlaylist.id ?: "",
+                episodeId = ep?.getIdString() ?: ""
+            )
 
             return newMovieLoadResponse(title, url, TvType.Movie, linkData.toJson()) {
                 this.posterUrl = poster
@@ -944,9 +959,12 @@ class AnimeDayProvider : MainAPI() {
         if (allEpisodes.isEmpty()) return null
 
         val episodes = allEpisodes.mapIndexed { idx, ep ->
-            val videoUrls = collectVideoUrls(ep)
             val pId = ep.getPlaylistIdString().ifEmpty { playlists.firstOrNull()?.id ?: "" }
-            val linkData = LinkData(videoUrls)
+            // CRASH FIX: Embed only playlist ID + episode ID (tiny), not all video URLs.
+            val linkData = LinkData(
+                playlistId = pId,
+                episodeId = ep.getIdString()
+            )
 
             newEpisode(linkData.toJson()) {
                 this.name = ep.title ?: "الحلقة ${idx + 1}"
@@ -1005,7 +1023,27 @@ class AnimeDayProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val linkData = tryParseJson<LinkData>(data) ?: return false
-        val videoUrls = linkData.videoUrls
+        if (linkData.playlistId.isEmpty() || linkData.episodeId.isEmpty()) return false
+
+        // CRASH FIX: Re-fetch the single playlist's episodes from the API and find
+        // the matching episode by ID. Previously, all 6 video URLs for every episode
+        // were embedded in the episode data field, which made CloudStream serialize
+        // multi-MB JSON when passing the episode list to the player activity —
+        // crashing on phones/Android TVs (less RAM than LDPlayer emulator).
+        // Now we store only IDs and fetch the URLs here, one HTTP call per play.
+        val videoUrls: Map<String, Pair<String, Boolean>> = try {
+            withTimeoutOrNull(8000L) {
+                val epsText = app.post(
+                    "$apiUrl/episodeWithInfo/readPaging.php",
+                    headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
+                    data = mapOf("playlist_id" to linkData.playlistId)
+                ).text
+                val eps = parseList<Episode>(epsText)
+                eps.firstOrNull { it.getIdString() == linkData.episodeId }
+            }?.let { ep -> collectVideoUrls(ep) } ?: emptyMap()
+        } catch (_: Throwable) {
+            emptyMap()
+        }
         if (videoUrls.isEmpty()) return false
 
         // Pre-fetch agents/cookies in background (won't block if already fetched)
