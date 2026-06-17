@@ -10,7 +10,6 @@ import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.withTimeoutOrNull
 
 // ==================== Data Classes ====================
 
@@ -224,25 +223,17 @@ class AppsAnimeProvider : MainAPI() {
     }
 
     /**
-     * Cached agents/cookies — fetched lazily only when needed (Google Photos / ok.ru).
-     * Not needed for workers.dev URLs which only use Basic Auth.
+     * Fetch agents and cookies from the API.
+     * These are needed for Google Photos and ok.ru extraction.
      */
-    private var cachedAgents: AgentsCookies? = null
-    private var agentsFetched = false
-
-    private suspend fun getAgents(): AgentsCookies? {
-        if (agentsFetched) return cachedAgents
-        agentsFetched = true
-        cachedAgents = try {
-            withTimeoutOrNull(8000L) {
-                val text = app.post(
-                    "$apiUrl/AgentsAndCookies/getData.php",
-                    headers = authHeaders
-                ).text
-                parseObject<AgentsCookies>(text)
-            }
+    private suspend fun fetchAgentsAndCookies(): AgentsCookies? {
+        return try {
+            val text = app.post(
+                "$apiUrl/AgentsAndCookies/getData.php",
+                headers = authHeaders
+            ).text
+            parseObject<AgentsCookies>(text)
         } catch (_: Exception) { null }
-        return cachedAgents
     }
 
     // ==================== Video Extraction ====================
@@ -264,12 +255,8 @@ class AppsAnimeProvider : MainAPI() {
         serverName: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Worker URLs only need Basic Auth, no agents/cookies needed
         try {
-            val response = withTimeoutOrNull(12000L) {
-                app.get(url, headers = authHeaders)
-            } ?: return false
-
+            val response = app.get(url, headers = authHeaders)
             val responseText = response.text
 
             // Try parsing as JSON object with availableQualities (test-stream format)
@@ -294,50 +281,6 @@ class AppsAnimeProvider : MainAPI() {
                     }
                     return true
                 }
-
-                // Try JSON object with "videos" or "url" field
-                try {
-                    val node = mapper.readTree(responseText)
-                    // Check for "url" field directly
-                    node?.get("url")?.asText()?.takeIf { it.isNotEmpty() }?.let { directUrl ->
-                        val quality = getQualityFromUrl(directUrl)
-                        callback(
-                            newExtractorLink(
-                                source = serverName,
-                                name = "$serverName - $quality",
-                                url = directUrl,
-                                type = INFER_TYPE
-                            ) {
-                                this.referer = ""
-                                this.quality = getQualityValue(quality)
-                            }
-                        )
-                        return true
-                    }
-                    // Check for "videos" array
-                    node?.get("videos")?.let { videosNode ->
-                        if (videosNode.isArray) {
-                            var found = false
-                            for (v in videosNode) {
-                                val vUrl = v.get("url")?.asText() ?: continue
-                                val vQuality = v.get("quality")?.asText() ?: getQualityFromUrl(vUrl)
-                                callback(
-                                    newExtractorLink(
-                                        source = serverName,
-                                        name = "$serverName - $vQuality",
-                                        url = vUrl,
-                                        type = INFER_TYPE
-                                    ) {
-                                        this.referer = ""
-                                        this.quality = getQualityValue(vQuality)
-                                    }
-                                )
-                                found = true
-                            }
-                            if (found) return true
-                        }
-                    }
-                } catch (_: Exception) {}
             }
 
             // Try parsing as JSON array [{url, quality}, ...]
@@ -369,6 +312,8 @@ class AppsAnimeProvider : MainAPI() {
             // (cdnlink/link workers redirect to CDN URLs)
             val finalUrl = response.url
             if (finalUrl != url && finalUrl.isNotEmpty()) {
+                // The worker redirected to a CDN URL (okcdn.ru/vkuser.net)
+                // These URLs should work from the user's device
                 callback(
                     newExtractorLink(
                         source = serverName,
@@ -385,8 +330,9 @@ class AppsAnimeProvider : MainAPI() {
 
             return false
         } catch (e: Exception) {
-            // If app.get() fails, pass the worker URL directly with auth headers
-            // so the player can resolve it from the user's device
+            // If app.get() fails (e.g., CDN returns 400 from server),
+            // pass the worker URL directly with auth headers so the player can resolve it
+            // from the user's device where the IP should match
             try {
                 callback(
                     newExtractorLink(
@@ -420,18 +366,17 @@ class AppsAnimeProvider : MainAPI() {
     private suspend fun extractGooglePhotos(
         url: String,
         serverName: String,
+        agents: AgentsCookies?,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Try CloudStream's built-in extractor first (fast path)
+        // First, try CloudStream's built-in extractor
         try {
-            withTimeoutOrNull(10000L) {
-                loadExtractor(url, mainUrl, subtitleCallback = { }, callback = callback)
-            }?.let { return true }
+            loadExtractor(url, mainUrl, subtitleCallback = { }, callback = callback)
+            return true
         } catch (_: Exception) {}
 
-        // Fallback: Custom HTML extraction with timeout
+        // Fallback: Custom HTML extraction (mirrors APK's bo0.java logic)
         try {
-            val agents = getAgents()
             val gPhotosHeaders = mutableMapOf<String, String>()
             val agent = agents?.gPhotosAgent?.takeIf { it.isNotEmpty() }
                 ?: "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Mobile Safari/537.36"
@@ -440,9 +385,7 @@ class AppsAnimeProvider : MainAPI() {
                 gPhotosHeaders["Cookie"] = it
             }
 
-            val pageText = withTimeoutOrNull(10000L) {
-                app.get(url, headers = gPhotosHeaders).text
-            } ?: return false
+            val pageText = app.get(url, headers = gPhotosHeaders).text
 
             // Fix malformed percent encoding (from APK's bo0.d pattern)
             val fixed = Regex("%(?![0-9a-fA-F]{2})").replace(pageText) { "%25" }
@@ -471,6 +414,7 @@ class AppsAnimeProvider : MainAPI() {
             var lh3BaseUrl: String? = null
             for (match in lh3Pattern.findAll(decoded)) {
                 val foundUrl = match.value
+                // Prefer URLs without quality suffixes
                 if (!foundUrl.contains("=s") && !foundUrl.contains("=w") &&
                     !foundUrl.contains("=d") && !foundUrl.contains("=m") && !foundUrl.contains("=h")) {
                     lh3BaseUrl = foundUrl
@@ -561,19 +505,18 @@ class AppsAnimeProvider : MainAPI() {
     private suspend fun extractOkRu(
         url: String,
         serverName: String,
+        agents: AgentsCookies?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Try CloudStream's built-in ok.ru extractor (fast path)
+        // Try CloudStream's built-in ok.ru extractor
         try {
-            withTimeoutOrNull(10000L) {
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
-            }?.let { return true }
+            loadExtractor(url, mainUrl, subtitleCallback, callback)
+            return true
         } catch (_: Exception) {}
 
-        // Fallback: Use ok.ru metadata API with timeout
+        // Fallback: Use ok.ru metadata API (as in the APK)
         try {
-            val agents = getAgents()
             // Extract video ID from URL
             val videoId = Regex("""ok\.ru/video(?:embed)?/(\d+)""").find(url)?.groupValues?.get(1)
                 ?: return false
@@ -586,33 +529,29 @@ class AppsAnimeProvider : MainAPI() {
 
             // POST to ok.ru metadata API
             val metadataUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
-            val metaResponse = withTimeoutOrNull(10000L) {
-                app.post(
-                    metadataUrl,
+            val metaResponse = app.post(
+                metadataUrl,
+                headers = mapOf(
+                    "User-Agent" to userAgent,
+                    "Cookie" to cookie,
+                    "Content-Type" to "application/x-www-form-urlencoded"
+                ),
+                data = mapOf("" to "")
+            ).text
+
+            // Parse the response to get HLS manifest URL
+            val metadata = mapper.readTree(metaResponse)
+            val hlsUrl = metadata?.get("ondemandHls")?.asText()
+
+            if (hlsUrl != null && hlsUrl.isNotEmpty()) {
+                // Fetch the HLS manifest and parse quality variants
+                val hlsResponse = app.get(
+                    hlsUrl,
                     headers = mapOf(
                         "User-Agent" to userAgent,
-                        "Cookie" to cookie,
-                        "Content-Type" to "application/x-www-form-urlencoded"
-                    ),
-                    data = mapOf("" to "")
+                        "Cookie" to cookie
+                    )
                 ).text
-            } ?: return false
-
-            // Parse the response to get video URLs
-            val metadata = mapper.readTree(metaResponse)
-
-            // Try ondemandHls first
-            val hlsUrl = metadata?.get("ondemandHls")?.asText()
-            if (hlsUrl != null && hlsUrl.isNotEmpty()) {
-                val hlsResponse = withTimeoutOrNull(10000L) {
-                    app.get(
-                        hlsUrl,
-                        headers = mapOf(
-                            "User-Agent" to userAgent,
-                            "Cookie" to cookie
-                        )
-                    ).text
-                } ?: return false
 
                 // Parse HLS manifest
                 val lines = hlsResponse.lines()
@@ -621,6 +560,7 @@ class AppsAnimeProvider : MainAPI() {
                     val line = lines[i]
                     if (line.startsWith("#EXT-X-STREAM-INF:")) {
                         val resolution = Regex("RESOLUTION=(\\d+x\\d+)").find(line)?.groupValues?.get(1)
+                        val bandwidth = Regex("BANDWIDTH=(\\d+)").find(line)?.groupValues?.get(1)
                         // Next line is the URL
                         if (i + 1 < lines.size) {
                             val streamUrl = lines[i + 1].trim()
@@ -628,8 +568,8 @@ class AppsAnimeProvider : MainAPI() {
                                 val qualityLabel = resolution?.let { res ->
                                     val height = res.substringAfter("x")
                                     "${height}p"
-                                } ?: "Auto"
-
+                                } ?: bandwidth?.let { "Auto" } ?: "Auto"
+                                
                                 callback(
                                     newExtractorLink(
                                         source = serverName,
@@ -646,31 +586,7 @@ class AppsAnimeProvider : MainAPI() {
                         }
                     }
                 }
-                if (foundAny) return true
-            }
-
-            // Try "videos" array from metadata (ok.ru returns direct URLs too)
-            metadata?.get("videos")?.let { videosNode ->
-                if (videosNode.isArray) {
-                    var foundAny = false
-                    for (v in videosNode) {
-                        val vUrl = v.get("url")?.asText() ?: continue
-                        val vName = v.get("name")?.asText() ?: "Auto"
-                        callback(
-                            newExtractorLink(
-                                source = serverName,
-                                name = "$serverName - $vName",
-                                url = vUrl,
-                                type = INFER_TYPE
-                            ) {
-                                this.referer = ""
-                                this.quality = getQualityValue(vName)
-                            }
-                        )
-                        foundAny = true
-                    }
-                    if (foundAny) return true
-                }
+                return foundAny
             }
         } catch (_: Exception) {}
 
@@ -685,17 +601,29 @@ class AppsAnimeProvider : MainAPI() {
         url: String,
         serverName: String,
         needsExtraction: Boolean,
+        agents: AgentsCookies?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val cleanUrl = url.trim()
 
-        // 1. Workers.dev URLs - fastest path, only needs Basic Auth
+        // 1. Workers.dev URLs - ALL require Basic Auth
+        // This includes: test-stream, cdnlink, link, linkcdn, multiplecdnqualities, etc.
         if (cleanUrl.contains(".workers.dev/")) {
             return extractWorkerUrl(cleanUrl, serverName, callback)
         }
 
-        // 2. Direct video URLs (mp4, m3u8) — instant, no HTTP needed
+        // 2. Google Photos URLs
+        if (cleanUrl.contains("photos.google.com")) {
+            return extractGooglePhotos(cleanUrl, serverName, agents, callback)
+        }
+
+        // 3. ok.ru video URLs
+        if (cleanUrl.contains("ok.ru/video") || cleanUrl.contains("ok.ru/videoembed")) {
+            return extractOkRu(cleanUrl, serverName, agents, subtitleCallback, callback)
+        }
+
+        // 4. Direct video URLs (mp4, m3u8)
         if (cleanUrl.contains(".mp4") || cleanUrl.contains(".m3u8")) {
             val quality = getQualityFromUrl(cleanUrl)
             callback(
@@ -712,7 +640,7 @@ class AppsAnimeProvider : MainAPI() {
             return true
         }
 
-        // 3. CDN URLs (okcdn.ru, vkuser.net) - pass directly
+        // 5. CDN URLs (okcdn.ru, vkuser.net) - pass directly, they should work from user's device
         if (cleanUrl.contains("okcdn.ru") || cleanUrl.contains("vkuser.net")) {
             callback(
                 newExtractorLink(
@@ -726,16 +654,6 @@ class AppsAnimeProvider : MainAPI() {
                 }
             )
             return true
-        }
-
-        // 4. ok.ru video URLs
-        if (cleanUrl.contains("ok.ru/video") || cleanUrl.contains("ok.ru/videoembed")) {
-            return extractOkRu(cleanUrl, serverName, subtitleCallback, callback)
-        }
-
-        // 5. Google Photos URLs — slowest, try last
-        if (cleanUrl.contains("photos.google.com")) {
-            return extractGooglePhotos(cleanUrl, serverName, callback)
         }
 
         // 6. Google CDN URLs (lh3.googleusercontent.com)
@@ -754,11 +672,10 @@ class AppsAnimeProvider : MainAPI() {
             return true
         }
 
-        // 7. Unknown URL - try CloudStream's built-in extractor
+        // 7. Unknown URL - try CloudStream's built-in extractor first, then direct link
         try {
-            withTimeoutOrNull(8000L) {
-                loadExtractor(cleanUrl, mainUrl, subtitleCallback, callback)
-            }?.let { return true }
+            loadExtractor(cleanUrl, mainUrl, subtitleCallback, callback)
+            return true
         } catch (_: Exception) {}
 
         // 8. Last resort: pass as direct link
@@ -980,20 +897,19 @@ class AppsAnimeProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
+        // Fetch agents and cookies once for all extractions
+        val agents = fetchAgentsAndCookies()
+
         var foundAny = false
         coroutineScope {
             videoUrls.entries.map { (serverName, urlAndExtraction) ->
                 async {
-                    // Each server gets max 15s to resolve, preventing one slow server from blocking everything
-                    val result = withTimeoutOrNull(15000L) {
-                        try {
-                            val (url, needsExtraction) = urlAndExtraction
-                            extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
-                        } catch (_: Exception) {
-                            false
+                    try {
+                        val (url, needsExtraction) = urlAndExtraction
+                        if (extractFromUrl(url, serverName, needsExtraction, agents, subtitleCallback, callback)) {
+                            foundAny = true
                         }
-                    } ?: false
-                    if (result) foundAny = true
+                    } catch (_: Exception) {}
                 }
             }.forEach { it.await() }
         }
