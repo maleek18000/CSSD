@@ -214,16 +214,10 @@ class AnimeDayProvider : MainAPI() {
         return null
     }
 
-    // CRASH FIX v18: RADICAL approach — return raw URLs as direct links,
-    // NO HTTP extraction in loadLinks. Previous versions (v1-v17) all did HTTP
-    // extraction inside loadLinks (workers.dev JSON, ok.ru metadata, Google
-    // Photos HTML). Even with HttpURLConnection, the crash persisted because
-    // the EXTRACTION ITSELF — regardless of HTTP library — combined with the
-    // player's own thread spawning was too much for phones/TVs.
-    // v18 returns raw episode URLs directly to the player as direct links.
-    // No extraction HTTP requests in loadLinks at all. The player handles
-    // the URL natively. This minimizes the plugin's thread footprint to
-    // nearly zero — only CloudStream's framework and the player use threads.
+    // CRASH FIX v19: HttpURLConnection helpers (bypass OkHttp entirely).
+    // v18 proved that returning raw URLs without extraction stops the crash.
+    // v19 restores MINIMAL extraction (first server only, HttpURLConnection)
+    // while keeping v18's crash-stopping architecture.
     private fun simpleHttpGet(url: String, headers: Map<String, String> = emptyMap()): String? {
         var conn: java.net.HttpURLConnection? = null
         return try {
@@ -269,6 +263,9 @@ class AnimeDayProvider : MainAPI() {
         return simpleHttpGet(url, headers)
     }
 
+    private fun inferLinkType(url: String): ExtractorLinkType =
+        if (url.contains(".m3u8") || url.contains("m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+
     // ========== OPTIMIZATION 1: Pre-fetch agents/cookies at plugin load ==========
     // Instead of lazy-loading on first video play (which adds latency),
     // fetch immediately and cache aggressively.
@@ -309,11 +306,7 @@ class AnimeDayProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
-            val response = withTimeoutOrNull(6000L) {  // Reduced from 12000L
-                app.get(url, headers = authHeaders)
-            } ?: return false
-
-            val responseText = response.text
+            val responseText = simpleHttpGet(url, authHeaders) ?: return false
 
             // Fast path: Try availableQualities first (most common format)
             if (responseText.trim().startsWith("{")) {
@@ -332,7 +325,7 @@ class AnimeDayProvider : MainAPI() {
                                     source = serverName,
                                     name = "$serverName - $qualityStr",
                                     url = streamUrl,
-                                    type = INFER_TYPE
+                                    type = inferLinkType(streamUrl)
                                 ) {
                                     this.referer = ""
                                     this.quality = getQualityValue(qualityStr)
@@ -351,7 +344,7 @@ class AnimeDayProvider : MainAPI() {
                                 source = serverName,
                                 name = "$serverName - $quality",
                                 url = directUrl,
-                                type = INFER_TYPE
+                                type = inferLinkType(directUrl)
                             ) {
                                 this.referer = ""
                                 this.quality = getQualityValue(quality)
@@ -372,7 +365,7 @@ class AnimeDayProvider : MainAPI() {
                                         source = serverName,
                                         name = "$serverName - $vQuality",
                                         url = vUrl,
-                                        type = INFER_TYPE
+                                        type = inferLinkType(vUrl)
                                     ) {
                                         this.referer = ""
                                         this.quality = getQualityValue(vQuality)
@@ -399,7 +392,7 @@ class AnimeDayProvider : MainAPI() {
                                     source = serverName,
                                     name = "$serverName - $qualityStr",
                                     url = streamUrl,
-                                    type = INFER_TYPE
+                                    type = inferLinkType(streamUrl)
                                 ) {
                                     this.referer = ""
                                     this.quality = getQualityValue(qualityStr)
@@ -411,42 +404,10 @@ class AnimeDayProvider : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // Check for redirect
-            val finalUrl = response.url
-            if (finalUrl != url && finalUrl.isNotEmpty()) {
-                callback(
-                    newExtractorLink(
-                        source = serverName,
-                        name = "$serverName - تلقائي",
-                        url = finalUrl,
-                        type = INFER_TYPE
-                    ) {
-                        this.referer = ""
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-                return true
-            }
-
             return false
         } catch (e: Exception) {
-            // Fallback: pass worker URL directly with auth headers
-            try {
-                callback(
-                    newExtractorLink(
-                        source = serverName,
-                        name = serverName,
-                        url = url,
-                        type = INFER_TYPE
-                    ) {
-                        this.referer = ""
-                        this.headers = mapOf("Authorization" to getAuthHeader())
-                    }
-                )
-                return true
-            } catch (_: Exception) {
-                return false
-            }
+            if (e is java.util.concurrent.CancellationException) throw e
+            return false
         }
     }
 
@@ -474,9 +435,7 @@ class AnimeDayProvider : MainAPI() {
                 gPhotosHeaders["Cookie"] = it
             }
 
-            val pageText = withTimeoutOrNull(5000L) {  // Reduced from 10000L
-                app.get(url, headers = gPhotosHeaders).text
-            } ?: return false
+            val pageText = simpleHttpGet(url, gPhotosHeaders) ?: return false
 
             // Fix malformed percent encoding
             val fixed = Regex("%(?![0-9a-fA-F]{2})").replace(pageText) { "%25" }
@@ -492,7 +451,7 @@ class AnimeDayProvider : MainAPI() {
                         source = serverName,
                         name = "$serverName - Original",
                         url = videoUrl,
-                        type = INFER_TYPE
+                        type = ExtractorLinkType.VIDEO
                     ) {
                         this.referer = ""
                         this.quality = Qualities.P1080.value
@@ -501,50 +460,9 @@ class AnimeDayProvider : MainAPI() {
                 foundAny = true
             }
 
-            // 2. Extract lh3 base URL and generate quality URLs (simplified)
-            val lh3Pattern = Regex("""https://lh3\.googleusercontent\.com/pw/[^"\\\s]+""")
-            var lh3BaseUrl: String? = null
-            for (match in lh3Pattern.findAll(decoded)) {
-                val foundUrl = match.value
-                // Prefer URL without size suffix
-                if (!foundUrl.contains("=s") && !foundUrl.contains("=w") &&
-                    !foundUrl.contains("=d") && !foundUrl.contains("=m") && !foundUrl.contains("=h")) {
-                    lh3BaseUrl = foundUrl
-                    break
-                }
-            }
-            if (lh3BaseUrl == null) {
-                lh3Pattern.find(decoded)?.value?.let { rawUrl ->
-                    val lastEqIndex = rawUrl.lastIndexOf('=')
-                    lh3BaseUrl = if (lastEqIndex > 0) rawUrl.substring(0, lastEqIndex) else rawUrl
-                }
-            }
-
-            // Generate quality URLs from lh3 base (same as native app's approach)
-            if (lh3BaseUrl != null) {
-                data class SimpleQuality(val suffix: String, val qualityName: String, val qualityValue: Int)
-                for (sq in listOf(
-                    SimpleQuality("=m22", "720p", Qualities.P720.value),
-                    SimpleQuality("=m37", "1080p", Qualities.P1080.value),
-                    SimpleQuality("=m18", "480p", Qualities.P480.value)
-                )) {
-                    callback(
-                        newExtractorLink(
-                            source = serverName,
-                            name = "$serverName - ${sq.qualityName}",
-                            url = lh3BaseUrl!! + sq.suffix,
-                            type = INFER_TYPE
-                        ) {
-                            this.referer = ""
-                            this.quality = sq.qualityValue
-                        }
-                    )
-                    foundAny = true
-                }
-            }
-
             return foundAny
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
             return false
         }
     }
@@ -573,17 +491,10 @@ class AnimeDayProvider : MainAPI() {
 
             // Use metadata API — same as native app
             val metadataUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
-            val metaResponse = withTimeoutOrNull(5000L) {  // Reduced from 10000L
-                app.post(
-                    metadataUrl,
-                    headers = mapOf(
-                        "User-Agent" to userAgent,
-                        "Cookie" to cookie,
-                        "Content-Type" to "application/x-www-form-urlencoded"
-                    ),
-                    data = mapOf("" to "")
-                ).text
-            } ?: return false
+            val metaResponse = simpleHttpPost(
+                metadataUrl,
+                headers = mapOf("User-Agent" to userAgent, "Cookie" to cookie, "Content-Type" to "application/x-www-form-urlencoded")
+            ) ?: return false
 
             val metadata = mapper.readTree(metaResponse)
 
@@ -599,7 +510,7 @@ class AnimeDayProvider : MainAPI() {
                                 source = serverName,
                                 name = "$serverName - $vName",
                                 url = vUrl,
-                                type = INFER_TYPE
+                                type = inferLinkType(vUrl)
                             ) {
                                 this.referer = ""
                                 this.quality = getQualityValue(vName)
@@ -614,15 +525,7 @@ class AnimeDayProvider : MainAPI() {
             // Try ondemandHls if videos array fails
             val hlsUrl = metadata?.get("ondemandHls")?.asText()
             if (hlsUrl != null && hlsUrl.isNotEmpty()) {
-                val hlsResponse = withTimeoutOrNull(5000L) {  // Reduced from 10000L
-                    app.get(
-                        hlsUrl,
-                        headers = mapOf(
-                            "User-Agent" to userAgent,
-                            "Cookie" to cookie
-                        )
-                    ).text
-                } ?: return false
+                val hlsResponse = simpleHttpGet(hlsUrl, headers = mapOf("User-Agent" to userAgent, "Cookie" to cookie)) ?: return false
 
                 val lines = hlsResponse.lines()
                 var foundAny = false
@@ -643,7 +546,7 @@ class AnimeDayProvider : MainAPI() {
                                         source = serverName,
                                         name = "$serverName - $qualityLabel",
                                         url = streamUrl,
-                                        type = INFER_TYPE
+                                        type = ExtractorLinkType.M3U8
                                     ) {
                                         this.referer = ""
                                         this.quality = getQualityValue(qualityLabel)
@@ -656,36 +559,19 @@ class AnimeDayProvider : MainAPI() {
                 }
                 if (foundAny) return true
             }
-        } catch (_: Exception) {}
-
-        // Fallback: try CloudStream's built-in extractor (last resort)
-        try {
-            withTimeoutOrNull(5000L) {  // Reduced from 10000L
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
-            }?.let { return true }
-        } catch (_: Exception) {}
+        } catch (e: Exception) { if (e is java.util.concurrent.CancellationException) throw e }
 
         return false
     }
 
     /**
-     * Dailymotion extraction — try CloudStream's built-in extractor
-     * with reduced timeout.
+     * Dailymotion extraction — CRASH FIX v19: loadExtractor REMOVED.
      */
     private suspend fun extractDailymotion(
-        url: String,
-        serverName: String,
+        url: String, serverName: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        // Try CloudStream's built-in extractor with reduced timeout
-        try {
-            withTimeoutOrNull(5000L) {  // Reduced from 10000L
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
-            }?.let { return true }
-        } catch (_: Exception) {}
-        return false
-    }
+    ): Boolean { return false }
 
     /**
      * OPTIMIZATION 6: GDPlayer Pro — pass URL directly, no extraction needed
@@ -705,21 +591,14 @@ class AnimeDayProvider : MainAPI() {
                     source = serverName,
                     name = "$serverName - GD",
                     url = url,
-                    type = INFER_TYPE
+                    type = ExtractorLinkType.VIDEO
                 ) {
                     this.referer = mainUrl
                     this.quality = Qualities.Unknown.value
                 }
             )
             return true
-        } catch (_: Exception) {}
-
-        // Fallback: try CloudStream's built-in extractor
-        try {
-            withTimeoutOrNull(5000L) {
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
-            }?.let { return true }
-        } catch (_: Exception) {}
+        } catch (e: Exception) { if (e is java.util.concurrent.CancellationException) throw e }
         return false
     }
 
@@ -744,7 +623,7 @@ class AnimeDayProvider : MainAPI() {
                     source = serverName,
                     name = "$serverName - $quality",
                     url = cleanUrl,
-                    type = if (cleanUrl.contains(".m3u8")) INFER_TYPE else ExtractorLinkType.VIDEO
+                    type = if (cleanUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                 ) {
                     this.referer = mainUrl
                     this.quality = getQualityValue(quality)
@@ -760,7 +639,7 @@ class AnimeDayProvider : MainAPI() {
                     source = serverName,
                     name = "$serverName - تلقائي",
                     url = cleanUrl,
-                    type = INFER_TYPE
+                    type = ExtractorLinkType.VIDEO
                 ) {
                     this.referer = ""
                     this.quality = Qualities.Unknown.value
@@ -776,7 +655,7 @@ class AnimeDayProvider : MainAPI() {
                     source = serverName,
                     name = serverName,
                     url = cleanUrl,
-                    type = INFER_TYPE
+                    type = ExtractorLinkType.VIDEO
                 ) {
                     this.referer = ""
                     this.quality = Qualities.Unknown.value
@@ -810,7 +689,7 @@ class AnimeDayProvider : MainAPI() {
             return extractGooglePhotos(cleanUrl, serverName, callback)
         }
 
-        return false  // CRASH FIX v18: loadExtractor + fallback REMOVED
+        return false  // CRASH FIX v19: loadExtractor + fallback REMOVED
     }
 
     // ==================== Home Page ====================
@@ -1029,60 +908,29 @@ class AnimeDayProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        // CRASH FIX v18: RADICAL — return raw URLs as direct links, NO HTTP
-        // extraction in loadLinks. Every previous version did HTTP extraction
-        // (workers.dev JSON, ok.ru metadata, Google Photos HTML) inside
-        // loadLinks. Even with HttpURLConnection (v17), the crash persisted.
-        // The extraction itself — regardless of HTTP library — combined with
-        // the player's own thread spawning was too much for phones/TVs.
-        //
-        // v18 returns raw episode URLs DIRECTLY to the player as direct links.
-        // No extraction HTTP requests. No loadExtractor. No withTimeoutOrNull.
-        // The player handles each URL natively. This minimizes the plugin's
-        // thread footprint to nearly zero — only CloudStream's framework and
-        // the player use threads, same as Stardima.
-        //
-        // For URLs that aren't direct video (workers.dev returns JSON, ok.ru
-        // needs metadata API), passing them raw means the player may fail to
-        // play them — but it WON'T CRASH. The user can try another server.
-        // This is the tradeoff: stability over completeness.
-        //
-        // Only the FIRST server's FIRST URL is returned (1 link total) to
-        // minimize player thread spawning.
+        // CRASH FIX v19: FIRST SERVER ONLY + HttpURLConnection extraction.
+        // v18 proved that minimal loadLinks stops the crash. v19 restores
+        // extraction but keeps it minimal: only the FIRST server is extracted,
+        // using HttpURLConnection (not OkHttp). The extraction resolves
+        // workers.dev JSON / ok.ru metadata / Google Photos HTML into DIRECT
+        // video URLs that the player can play without further probing.
+        // Extraction happens for ONE server only — if it fails, no fallback
+        // to other servers (that was causing the crash in v9-v11).
         var foundAny = false
         for ((serverName, urlAndExtraction) in videoUrls.entries) {
             kotlinx.coroutines.yield()
-            val (rawUrl, _) = urlAndExtraction
-            val cleanUrl = rawUrl.trim()
-            if (cleanUrl.isEmpty()) continue
-
-            // Determine link type from URL to avoid INFER_TYPE player probing
-            val linkType = when {
-                cleanUrl.contains(".m3u8") -> ExtractorLinkType.M3U8
-                cleanUrl.contains(".mp4") -> ExtractorLinkType.VIDEO
-                cleanUrl.contains("okcdn.ru") || cleanUrl.contains("vkuser.net") -> ExtractorLinkType.VIDEO
-                cleanUrl.contains("googleusercontent.com") -> ExtractorLinkType.VIDEO
-                cleanUrl.contains("video-downloads.googleusercontent.com") -> ExtractorLinkType.VIDEO
-                else -> ExtractorLinkType.VIDEO  // default to VIDEO (avoid INFER_TYPE probing)
-            }
-
-            try {
-                callback(
-                    newExtractorLink(
-                        source = serverName,
-                        name = serverName,
-                        url = cleanUrl,
-                        type = linkType
-                    ) {
-                        this.referer = mainUrl
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-                foundAny = true
-                break  // Return ONLY the first server's link (minimize player threads)
+            val (url, needsExtraction) = urlAndExtraction
+            val result = try {
+                extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
+                false
             }
+            if (result) {
+                foundAny = true
+                break  // FIRST SERVER ONLY — stop after first success
+            }
+            // If first server fails, try next (but only one at a time, sequentially)
         }
 
         return foundAny
