@@ -386,11 +386,23 @@ class AnimeDayProvider : MainAPI() {
 
             return false
         } catch (e: Exception) {
-            // CRASH FIX: Do NOT pass the worker URL directly as a video link.
-            // The worker URL returns JSON (not video). ExoPlayer on phones/Android
-            // TVs crashes when it receives non-video content. The LDPlayer emulator
-            // tolerates it. Just return false so other servers can be tried.
-            return false
+            // Fallback: pass worker URL directly with auth headers
+            try {
+                callback(
+                    newExtractorLink(
+                        source = serverName,
+                        name = serverName,
+                        url = url,
+                        type = INFER_TYPE
+                    ) {
+                        this.referer = ""
+                        this.headers = mapOf("Authorization" to getAuthHeader())
+                    }
+                )
+                return true
+            } catch (_: Exception) {
+                return false
+            }
         }
     }
 
@@ -632,9 +644,9 @@ class AnimeDayProvider : MainAPI() {
     }
 
     /**
-     * CRASH FIX: Use loadExtractor instead of passing GDPlayer HTML page URL directly.
-     * The GDPlayer URL is an HTML embed page, not a video file. ExoPlayer on
-     * phones/Android TVs crashes when it tries to parse HTML as video.
+     * OPTIMIZATION 6: GDPlayer Pro — pass URL directly, no extraction needed
+     * The native app adds GDPlayer URLs directly as "سيرفر : GD" without
+     * any HTTP extraction. This is instant.
      */
     private suspend fun extractGdPlayerPro(
         url: String,
@@ -642,8 +654,25 @@ class AnimeDayProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // Pass directly — same as native app (instant, no HTTP request)
         try {
-            withTimeoutOrNull(8000L) {
+            callback(
+                newExtractorLink(
+                    source = serverName,
+                    name = "$serverName - GD",
+                    url = url,
+                    type = INFER_TYPE
+                ) {
+                    this.referer = mainUrl
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+            return true
+        } catch (_: Exception) {}
+
+        // Fallback: try CloudStream's built-in extractor
+        try {
+            withTimeoutOrNull(5000L) {
                 loadExtractor(url, mainUrl, subtitleCallback, callback)
             }?.let { return true }
         } catch (_: Exception) {}
@@ -744,9 +773,22 @@ class AnimeDayProvider : MainAPI() {
             }?.let { return true }
         } catch (_: Exception) {}
 
-        // CRASH FIX: Do NOT pass unknown URLs directly as video links.
-        // If loadExtractor failed, ExoPlayer will crash too. Return false.
-        return false
+        // 10. Last resort: pass as direct link
+        try {
+            callback(
+                newExtractorLink(
+                    source = serverName,
+                    name = serverName,
+                    url = cleanUrl,
+                    type = INFER_TYPE
+                ) {
+                    this.referer = ""
+                }
+            )
+            return true
+        } catch (_: Exception) {
+            return false
+        }
     }
 
     // ==================== Home Page ====================
@@ -977,14 +1019,15 @@ class AnimeDayProvider : MainAPI() {
             coroutineScope { async { getAgents() } }
         } catch (_: Throwable) {}
 
-        // CRASH FIX: Limit concurrent extractions to 3 (not 6 in parallel).
+        // CRASH FIX: Limit concurrent extractions to 2 (not 6 in parallel).
         // On phones/Android TVs (1-2GB RAM), 6 parallel extractions each
-        // downloading multi-MB HTML (Google Photos pages can be 5-10MB each)
-        // causes OutOfMemoryError which crashes CloudStream at the "loading
-        // links" phase. The LDPlayer emulator (4-8GB RAM) survives.
-        // Also wrap everything in try-catch(Throwable) as a safety net so
-        // no exception (including OOM) can crash the app.
-        val semaphore = Semaphore(3)
+        // downloading multi-MB HTML (Google Photos pages can be 5-10MB each,
+        // with 3 string copies in extractGooglePhotos) causes OutOfMemoryError.
+        // OOM is a Throwable/Error, NOT an Exception — the old code only caught
+        // Exception, so OOM propagated up and crashed CloudStream at the
+        // "skip loading links (5)" phase. The LDPlayer emulator (4-8GB RAM)
+        // survived. Now we catch Throwable and limit concurrency.
+        val semaphore = Semaphore(2)
         var foundAny = false
 
         try {
@@ -997,20 +1040,20 @@ class AnimeDayProvider : MainAPI() {
                                     try {
                                         val (url, needsExtraction) = urlAndExtraction
                                         extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
-                                    } catch (_: Exception) {
+                                    } catch (_: Throwable) {
                                         false
                                     }
                                 } ?: false
                                 if (result) foundAny = true
                             }
                         } catch (_: Throwable) {
-                            // Swallow any error from a single extraction
+                            // Swallow OOM and any other error from a single extraction
                         }
                     }
                 }.forEach { it.await() }
             }
         } catch (_: Throwable) {
-            // Final safety net
+            // Final safety net — never let loadLinks crash the app
         }
 
         return foundAny
