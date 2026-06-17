@@ -860,21 +860,29 @@ class AnimeDayProvider : MainAPI() {
             "1" to "2", "1" to "1", "2" to "2", "2" to "1"
         )
 
-        // OPTIMIZATION 8: Parallel search across all configs
-        coroutineScope {
-            searchConfigs.map { (type, classification) ->
-                async {
-                    try {
-                        val text = app.get(
-                            "$apiUrl/cartoon_with_info/searchCartoon.php",
-                            params = mapOf("search" to query, "type" to type, "classification" to classification),
-                            headers = authHeaders
-                        ).text
-                        val items = parseList<CartoonWithInfo>(text)
-                        items.forEach { toSearchResult(it)?.let { r -> results.add(r) } }
-                    } catch (_: Exception) {}
-                }
-            }.forEach { it.await() }
+        // CRASH FIX v5: previously fired 4 parallel `async` HTTP requests via
+        // `coroutineScope { map { async { app.get(...) } } }`. Each `app.get`
+        // spawns an OkHttp dispatcher thread + async-timeout watchdog thread +
+        // connection-pool thread (~3 native threads per request) = 12 native
+        // threads just for search. Combined with CloudStream's background thread
+        // pressure, this tipped low-end phones/Android TVs past their
+        // per-process pthread cap (often 300-500) -> pthread_create(1040kb
+        // stack) failed -> OOM -> crash. LDPlayer survives because its desktop
+        // host has a thread cap in the thousands.
+        //
+        // Fix: process the 4 search configs SEQUENTIALLY. Slower by ~3x but
+        // keeps native thread count bounded. With 4 sequential calls × 3s
+        // each = ~12s worst case, well within CloudStream's search timeout.
+        for ((type, classification) in searchConfigs) {
+            try {
+                val text = app.get(
+                    "$apiUrl/cartoon_with_info/searchCartoon.php",
+                    params = mapOf("search" to query, "type" to type, "classification" to classification),
+                    headers = authHeaders
+                ).text
+                val items = parseList<CartoonWithInfo>(text)
+                items.forEach { toSearchResult(it)?.let { r -> results.add(r) } }
+            } catch (_: Exception) {}
         }
 
         return results.distinctBy { it.url }
@@ -898,30 +906,43 @@ class AnimeDayProvider : MainAPI() {
         val playlists = parseList<Playlist>(playlistsText)
         if (playlists.isEmpty()) return null
 
-        // Fetch episodes for ALL playlists in parallel
+        // CRASH FIX v5: previously fetched episodes for ALL playlists in
+        // parallel via `coroutineScope { playlists.map { async { app.post(...) } } }`.
+        // For long-running anime with 5-10 seasons/playlists that's 5-10
+        // parallel `app.post` calls, each spawning an OkHttp dispatcher thread
+        // + async-timeout watchdog + connection-pool thread (~3 native threads
+        // per request) = 15-30 native threads just for episode listing.
+        // Combined with CloudStream's framework threads (image loaders, HTTP
+        // cache, player preload) this tipped low-end phones/Android TVs past
+        // their per-process pthread cap (often 300-500, lower on TV boxes) ->
+        // pthread_create(1040kb stack) failed -> OOM -> crash. The user
+        // reports the crash happening "before the skip-loading-links banner
+        // appears" — that's exactly this load() phase, NOT loadLinks().
+        // LDPlayer survives because its desktop host has a thread cap in the
+        // thousands.
+        //
+        // Fix: fetch episodes for each playlist SEQUENTIALLY. Slower by N x
+        // but keeps native thread count bounded. Typical case: 1-3 playlists
+        // x ~0.5s each = 1.5s worst case — imperceptible. Worst case (10
+        // seasons) = ~5s, still well within CloudStream's load timeout.
         val playlistEpisodes = mutableMapOf<String, List<Episode>>()
         var firstEpisodeInfo: Episode? = null
 
-        coroutineScope {
-            playlists.map { playlist ->
-                val playlistId = playlist.id ?: return@map null
-                async {
-                    try {
-                        val epsText = app.post(
-                            "$apiUrl/episodeWithInfo/readPaging.php",
-                            headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
-                            data = mapOf("playlist_id" to playlistId)
-                        ).text
-                        parseList<Episode>(epsText) to playlistId
-                    } catch (_: Exception) {
-                        emptyList<Episode>() to playlistId
-                    }
-                }
-            }.filterNotNull().map { it.await() }.forEach { (eps, playlistId) ->
+        for (playlist in playlists) {
+            val playlistId = playlist.id ?: continue
+            try {
+                val epsText = app.post(
+                    "$apiUrl/episodeWithInfo/readPaging.php",
+                    headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
+                    data = mapOf("playlist_id" to playlistId)
+                ).text
+                val eps = parseList<Episode>(epsText)
                 playlistEpisodes[playlistId] = eps
                 if (firstEpisodeInfo == null && eps.isNotEmpty()) {
                     firstEpisodeInfo = eps.first()
                 }
+            } catch (_: Exception) {
+                playlistEpisodes[playlistId] = emptyList()
             }
         }
 
@@ -1018,48 +1039,38 @@ class AnimeDayProvider : MainAPI() {
         }
 
         var foundAny = false
-        // CRASH FIX v4 (pthread_create(1040kb stack) failed; trace includes
-        // okhttp async-timeout / Http1xStream, MediaHTTPConnection.readAt,
-        // Binder.execTransact, ThreadPoolExecutor.java:975):
-        //
-        // v1 (sequential), v2 (sequential + per-iter coroutineScope + delay),
-        // and v3 (v2 + removed loadExtractor fallbacks + removed fake lh3
-        // URLs) all STILL CRASHED. Root cause they all missed: the crash is
-        // NOT primarily in extraction — it's in the PLAYER PROBING phase.
-        //
-        // After loadLinks returns, CloudStream hands every ExtractorLink to
-        // the player, which probes EACH in parallel via
+        // CRASH FIX v5: previously fired up to 6 parallel `async` extractions
+        // via `coroutineScope { map { async { extractFromUrl(...) } } }`. Each
+        // extractFromUrl does 1-2 `app.get/post` calls (workers.dev JSON,
+        // ok.ru metadata, Google Photos HTML), each spawning an OkHttp
+        // dispatcher thread + async-timeout watchdog + connection-pool thread
+        // (~3 native threads per HTTP call). 6 parallel extractions × 2 HTTP
+        // calls × 3 threads = ~36 native threads just for extraction. Then
+        // the player probes EVERY returned link in parallel via
         // MediaHTTPConnection.readAt + Binder.execTransact + OkHttp async
-        // calls. Each probe spawns ~3 native threads (media thread + binder
-        // thread + okhttp watchdog). The original code returned 20-30 links
-        // (workers.dev × 3-5 qualities, ok.ru × 5+ qualities, Google Photos
-        // × 4, etc. across 6 servers) = 60-90+ probe threads at once. On
-        // phones/Android TVs the per-process pthread cap (often 300-500,
-        // lower on TV boxes) gets exhausted -> pthread_create fails -> OOM
-        // -> crash. LDPlayer survives because its desktop host has a
-        // per-process thread cap in the thousands.
+        // (3 native threads per probe). The original code returned 20-30
+        // links = 60-90+ probe threads. Total: 100+ native threads ->
+        // pthread_create(1040kb stack) failed -> OOM -> crash on phones/TVs.
+        // LDPlayer survives because its desktop host has a thread cap in
+        // the thousands.
         //
-        // v4 fix (confined to loadLinks only — no other file changes):
-        //   1. BUFFERING CALLBACK: wrap the real callback with a counter so
-        //      at most MAX_LINKS links are ever forwarded to the player.
-        //      This caps player-probing threads at MAX_LINKS × 3 = 15
-        //      native threads, well within the per-process pthread cap.
-        //      Extra links extracted beyond MAX_LINKS are silently dropped.
-        //   2. SEQUENTIAL for-loop (one server at a time) so extraction
-        //      threads don't compound with player-probe threads.
-        //   3. Per-iteration coroutineScope so child coroutines spawned
-        //      inside extractFromUrl are cancelled and their Dispatchers.IO
-        //      threads returned before the next server starts.
-        //   4. yield() + delay(500ms) between iterations to let the JVM
-        //      actually pthread_join finished native worker threads.
-        //   5. BREAK early once MAX_LINKS is reached — don't process
-        //      remaining servers unnecessarily.
-        //   6. Per-server timeout 8s -> 5s so a stuck server doesn't hold
-        //      its thread for too long.
-        // AtomicInteger is used (fully-qualified, no import added) because
+        // v5 fix (confined to loadLinks only):
+        //   1. BUFFERING CALLBACK: at most MAX_LINKS links are forwarded to
+        //      the player, capping player-probe threads at MAX_LINKS × 3.
+        //   2. SEQUENTIAL for-loop (one server at a time) so OkHttp dispatcher
+        //      threads don't pile up across servers.
+        //   3. Per-iteration coroutineScope so any child coroutines spawned
+        //      inside extractFromUrl are cancelled before next iteration.
+        //   4. yield() + delay(500ms) between iterations to let OkHttp's
+        //      dispatcher + connection pool + async-timeout watchdog threads
+        //      actually return to their pools before the next iteration.
+        //   5. BREAK early once MAX_LINKS is reached.
+        //   6. Per-server timeout 8s -> 5s so a stuck request doesn't hold
+        //      its threads for too long.
+        // AtomicInteger (fully-qualified, no import added) is used because
         // the buffering callback may be invoked from Dispatchers.IO threads
         // inside extractFromUrl, and we need thread-safe counting.
-        val MAX_LINKS = 1
+        val MAX_LINKS = 5
         val linksReturned = java.util.concurrent.atomic.AtomicInteger(0)
         val bufferingCallback: (ExtractorLink) -> Unit = { link ->
             if (linksReturned.getAndIncrement() < MAX_LINKS) {
@@ -1080,10 +1091,10 @@ class AnimeDayProvider : MainAPI() {
                 } ?: false
             }
             if (result) foundAny = true
-            // Let Dispatchers.IO / OkHttp dispatcher / player-probe threads
-            // release finished worker threads before the next iteration
-            // tries to spawn new ones. Fully-qualified to avoid touching
-            // the import block.
+            // Let OkHttp dispatcher / connection pool / async-timeout
+            // watchdog threads return to their pools before the next
+            // iteration tries to spawn new ones. Fully-qualified to avoid
+            // touching the import block.
             kotlinx.coroutines.yield()
             kotlinx.coroutines.delay(500)
         }
