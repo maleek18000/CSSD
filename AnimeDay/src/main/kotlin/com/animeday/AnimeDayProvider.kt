@@ -272,7 +272,7 @@ class AnimeDayProvider : MainAPI() {
                 M3u8Helper.generateM3u8(
                     source = source,
                     streamUrl = url,
-                    referer = referer.ifEmpty { null },
+                    referer = referer,
                     name = name
                 ).forEach { callback(it) }
             } catch (_: Exception) {
