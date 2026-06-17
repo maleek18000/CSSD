@@ -10,9 +10,11 @@ import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 
 // ==================== Data Classes ====================
 
@@ -222,24 +224,29 @@ class AnimeDayProvider : MainAPI() {
     private var cachedAgents: AgentsCookies? = null
     private var agentsFetched = false
     private var agentsFetchFailed = false
+    private val agentsMutex = Mutex()
 
     private suspend fun getAgents(): AgentsCookies? {
-        if (agentsFetched) return cachedAgents
-        if (agentsFetchFailed) return null  // Don't retry if it failed before
-        agentsFetched = true
-        cachedAgents = try {
-            withTimeoutOrNull(5000L) {  // Reduced from 8000L
-                val text = app.post(
-                    "$apiUrl/AgentsAndCookies/getData.php",
-                    headers = authHeaders
-                ).text
-                parseObject<AgentsCookies>(text)
+        // Thread-safe: only one coroutine fetches, others wait and reuse the result.
+        // Prevents 6x duplicate HTTP fetches when loadLinks runs servers in parallel.
+        agentsMutex.withLock {
+            if (agentsFetched) return cachedAgents
+            if (agentsFetchFailed) return null  // Don't retry if it failed before
+            agentsFetched = true
+            cachedAgents = try {
+                withTimeoutOrNull(5000L) {  // Reduced from 8000L
+                    val text = app.post(
+                        "$apiUrl/AgentsAndCookies/getData.php",
+                        headers = authHeaders
+                    ).text
+                    parseObject<AgentsCookies>(text)
+                }
+            } catch (_: Throwable) {
+                agentsFetchFailed = true
+                null
             }
-        } catch (_: Exception) {
-            agentsFetchFailed = true
-            null
+            return cachedAgents
         }
-        return cachedAgents
     }
 
     // ========== OPTIMIZATION 2: URL resolution cache ==========
@@ -1014,46 +1021,43 @@ class AnimeDayProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        // Pre-fetch agents/cookies in background (won't block if already fetched)
+        // Pre-fetch agents/cookies in background (won't block if already fetched).
+        // Wrapped in try-catch(Throwable) so a failure here can never crash the app.
         try {
-            coroutineScope { async { getAgents() } }
+            coroutineScope {
+                async { getAgents() }
+            }
         } catch (_: Throwable) {}
 
-        // CRASH FIX: Limit concurrent extractions to 2 (not 6 in parallel).
-        // On phones/Android TVs (1-2GB RAM), 6 parallel extractions each
-        // downloading multi-MB HTML (Google Photos pages can be 5-10MB each,
-        // with 3 string copies in extractGooglePhotos) causes OutOfMemoryError.
-        // OOM is a Throwable/Error, NOT an Exception — the old code only caught
-        // Exception, so OOM propagated up and crashed CloudStream at the
-        // "skip loading links (5)" phase. The LDPlayer emulator (4-8GB RAM)
-        // survived. Now we catch Throwable and limit concurrency.
-        val semaphore = Semaphore(2)
         var foundAny = false
-
+        // Limit parallel extractions to 2 at a time. On phones/Android TVs with
+        // 1-2GB RAM, launching all 6 servers in parallel causes OutOfMemoryError
+        // (which is an Error, not an Exception) and kills the app. The LDPlayer
+        // emulator (4-8GB RAM) tolerates this; real devices do not.
+        val semaphore = Semaphore(2)
         try {
             coroutineScope {
                 videoUrls.entries.map { (serverName, urlAndExtraction) ->
                     async {
-                        try {
-                            semaphore.withPermit {
-                                val result = withTimeoutOrNull(8000L) {
-                                    try {
-                                        val (url, needsExtraction) = urlAndExtraction
-                                        extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
-                                    } catch (_: Throwable) {
-                                        false
-                                    }
-                                } ?: false
-                                if (result) foundAny = true
-                            }
-                        } catch (_: Throwable) {
-                            // Swallow OOM and any other error from a single extraction
+                        semaphore.withPermit {
+                            val result = withTimeoutOrNull(8000L) {  // Reduced from 15000L
+                                try {
+                                    val (url, needsExtraction) = urlAndExtraction
+                                    extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
+                                } catch (_: Throwable) {
+                                    // Catch Throwable (not Exception) so OutOfMemoryError,
+                                    // StackOverflowError, etc. don't crash the app.
+                                    false
+                                }
+                            } ?: false
+                            if (result) foundAny = true
                         }
                     }
                 }.forEach { it.await() }
             }
         } catch (_: Throwable) {
-            // Final safety net — never let loadLinks crash the app
+            // Last-resort safety net: never let loadLinks propagate an Error up
+            // to CloudStream — that would shut down the app on phones/Android TVs.
         }
 
         return foundAny
