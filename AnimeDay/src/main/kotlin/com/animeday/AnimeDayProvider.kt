@@ -10,12 +10,7 @@ import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
-import java.util.concurrent.atomic.AtomicBoolean
 
 // ==================== Data Classes ====================
 
@@ -115,21 +110,9 @@ data class AgentsCookies(
     @JsonProperty("MF_Cookie") val mfCookie: String? = null
 )
 
-// CRASH FIX: Previously this stored the full Map of all 6 video URLs and
-// jResolver flags per episode. For a long series with hundreds of episodes,
-// each episode's data field was multiple KB of JSON. CloudStream serializes
-// the entire episode list to pass to the player activity, and on phones/TVs
-// (which have less RAM and tighter Binder limits than the LDPlayer emulator)
-// this caused the app to crash the moment it tried to open the "loading links"
-// phase — sometimes even before the banner appeared.
-//
-// Now LinkData stores ONLY the playlist ID and episode ID (a few dozen bytes).
-// loadLinks() re-fetches the single playlist's episodes from the API and finds
-// the matching episode. This is one extra HTTP call (~50-200KB response, fast)
-// but eliminates the multi-MB JSON serialization that was crashing real devices.
+// Link data stores raw video URLs and jResolver flags from the episode
 data class LinkData(
-    val playlistId: String,
-    val episodeId: String
+    val videoUrls: Map<String, Pair<String, Boolean>>  // server name -> (raw URL, needsExtraction)
 )
 
 // ==================== Provider ====================
@@ -234,42 +217,27 @@ class AnimeDayProvider : MainAPI() {
     // ========== OPTIMIZATION 1: Pre-fetch agents/cookies at plugin load ==========
     // Instead of lazy-loading on first video play (which adds latency),
     // fetch immediately and cache aggressively.
-    //
-    // CRASH FIX: Made shared state @Volatile and guarded with a coroutine-safe Mutex.
-    // On phones/Android TVs (ARM, weaker memory model than x86 emulators),
-    // parallel coroutines could race here and cause inconsistent state.
-    // Note: Must use kotlinx.coroutines.sync.Mutex (NOT synchronized) because
-    // the fetch is a suspend function and Kotlin forbids suspend calls inside
-    // a synchronized block.
-    @Volatile private var cachedAgents: AgentsCookies? = null
-    @Volatile private var agentsFetched = false
-    @Volatile private var agentsFetchFailed = false
-    private val agentsMutex = Mutex()
+    private var cachedAgents: AgentsCookies? = null
+    private var agentsFetched = false
+    private var agentsFetchFailed = false
 
     private suspend fun getAgents(): AgentsCookies? {
         if (agentsFetched) return cachedAgents
         if (agentsFetchFailed) return null  // Don't retry if it failed before
-        return agentsMutex.withLock {
-            // Double-check after acquiring lock
-            if (agentsFetched) return@withLock cachedAgents
-            if (agentsFetchFailed) return@withLock null
-            agentsFetched = true
-            cachedAgents = try {
-                withTimeoutOrNull(5000L) {  // Reduced from 8000L
-                    val text = app.post(
-                        "$apiUrl/AgentsAndCookies/getData.php",
-                        headers = authHeaders
-                    ).text
-                    parseObject<AgentsCookies>(text)
-                }
-            } catch (_: Exception) {
-                null
+        agentsFetched = true
+        cachedAgents = try {
+            withTimeoutOrNull(5000L) {  // Reduced from 8000L
+                val text = app.post(
+                    "$apiUrl/AgentsAndCookies/getData.php",
+                    headers = authHeaders
+                ).text
+                parseObject<AgentsCookies>(text)
             }
-            if (cachedAgents == null) {
-                agentsFetchFailed = true
-            }
-            cachedAgents
+        } catch (_: Exception) {
+            agentsFetchFailed = true
+            null
         }
+        return cachedAgents
     }
 
     // ========== OPTIMIZATION 2: URL resolution cache ==========
@@ -282,6 +250,48 @@ class AnimeDayProvider : MainAPI() {
     }
 
     // ==================== Video Extraction (OPTIMIZED) ====================
+
+    /**
+     * CRASH FIX: Helper that checks if a URL is an m3u8/HLS stream and uses
+     * M3u8Helper.generateM3u8 for proper HLS handling. ExoPlayer on phones/
+     * Android TVs crashes when m3u8 URLs are passed via INFER_TYPE because
+     * it doesn't properly handle HLS playlists (relative URLs, variant
+     * playlists, key requests). The LDPlayer emulator tolerates it.
+     * This is the same pattern used by StardimaProvider which doesn't crash.
+     */
+    private suspend fun emitLink(
+        source: String,
+        name: String,
+        url: String,
+        referer: String,
+        quality: Int,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        if (url.contains(".m3u8")) {
+            try {
+                M3u8Helper.generateM3u8(
+                    source = source,
+                    streamUrl = url,
+                    referer = referer.ifEmpty { null },
+                    name = name
+                ).forEach { callback(it) }
+            } catch (_: Exception) {
+                callback(
+                    newExtractorLink(source = source, name = name, url = url, type = INFER_TYPE) {
+                        this.referer = referer
+                        this.quality = quality
+                    }
+                )
+            }
+        } else {
+            callback(
+                newExtractorLink(source = source, name = name, url = url, type = INFER_TYPE) {
+                    this.referer = referer
+                    this.quality = quality
+                }
+            )
+        }
+    }
 
     /**
      * OPTIMIZATION 3: Streamlined workers.dev extraction
@@ -313,17 +323,7 @@ class AnimeDayProvider : MainAPI() {
                         for (q in qualities) {
                             val qualityStr = q.get("quality")?.asText() ?: continue
                             val streamUrl = q.get("url")?.asText() ?: continue
-                            callback(
-                                newExtractorLink(
-                                    source = serverName,
-                                    name = "$serverName - $qualityStr",
-                                    url = streamUrl,
-                                    type = INFER_TYPE
-                                ) {
-                                    this.referer = ""
-                                    this.quality = getQualityValue(qualityStr)
-                                }
-                            )
+                            emitLink(serverName, "$serverName - $qualityStr", streamUrl, "", getQualityValue(qualityStr), callback)
                             found = true
                         }
                         if (found) return true
@@ -332,17 +332,7 @@ class AnimeDayProvider : MainAPI() {
                     // Try single "url" field
                     node?.get("url")?.asText()?.takeIf { it.isNotEmpty() }?.let { directUrl ->
                         val quality = getQualityFromUrl(directUrl)
-                        callback(
-                            newExtractorLink(
-                                source = serverName,
-                                name = "$serverName - $quality",
-                                url = directUrl,
-                                type = INFER_TYPE
-                            ) {
-                                this.referer = ""
-                                this.quality = getQualityValue(quality)
-                            }
-                        )
+                        emitLink(serverName, "$serverName - $quality", directUrl, "", getQualityValue(quality), callback)
                         return true
                     }
 
@@ -353,17 +343,7 @@ class AnimeDayProvider : MainAPI() {
                             for (v in videosNode) {
                                 val vUrl = v.get("url")?.asText() ?: continue
                                 val vQuality = v.get("quality")?.asText() ?: getQualityFromUrl(vUrl)
-                                callback(
-                                    newExtractorLink(
-                                        source = serverName,
-                                        name = "$serverName - $vQuality",
-                                        url = vUrl,
-                                        type = INFER_TYPE
-                                    ) {
-                                        this.referer = ""
-                                        this.quality = getQualityValue(vQuality)
-                                    }
-                                )
+                                emitLink(serverName, "$serverName - $vQuality", vUrl, "", getQualityValue(vQuality), callback)
                                 found = true
                             }
                             if (found) return true
@@ -380,17 +360,7 @@ class AnimeDayProvider : MainAPI() {
                         for (q in qualityList) {
                             val qualityStr = q.quality ?: continue
                             val streamUrl = q.url ?: continue
-                            callback(
-                                newExtractorLink(
-                                    source = serverName,
-                                    name = "$serverName - $qualityStr",
-                                    url = streamUrl,
-                                    type = INFER_TYPE
-                                ) {
-                                    this.referer = ""
-                                    this.quality = getQualityValue(qualityStr)
-                                }
-                            )
+                            emitLink(serverName, "$serverName - $qualityStr", streamUrl, "", getQualityValue(qualityStr), callback)
                         }
                         return true
                     }
@@ -416,11 +386,23 @@ class AnimeDayProvider : MainAPI() {
 
             return false
         } catch (e: Exception) {
-            // CRASH FIX: Do NOT pass the worker URL directly as a video link.
-            // The worker URL returns JSON (not video), and passing a custom
-            // Authorization header to ExoPlayer causes crashes on phones/Android
-            // TVs. Just return false so loadLinks can try other servers.
-            return false
+            // Fallback: pass worker URL directly with auth headers
+            try {
+                callback(
+                    newExtractorLink(
+                        source = serverName,
+                        name = serverName,
+                        url = url,
+                        type = INFER_TYPE
+                    ) {
+                        this.referer = ""
+                        this.headers = mapOf("Authorization" to getAuthHeader())
+                    }
+                )
+                return true
+            } catch (_: Exception) {
+                return false
+            }
         }
     }
 
@@ -568,17 +550,7 @@ class AnimeDayProvider : MainAPI() {
                     for (v in videosNode) {
                         val vUrl = v.get("url")?.asText() ?: continue
                         val vName = v.get("name")?.asText() ?: "Auto"
-                        callback(
-                            newExtractorLink(
-                                source = serverName,
-                                name = "$serverName - $vName",
-                                url = vUrl,
-                                type = INFER_TYPE
-                            ) {
-                                this.referer = ""
-                                this.quality = getQualityValue(vName)
-                            }
-                        )
+                        emitLink(serverName, "$serverName - $vName", vUrl, "", getQualityValue(vName), callback)
                         foundAny = true
                     }
                     if (foundAny) return true
@@ -607,22 +579,19 @@ class AnimeDayProvider : MainAPI() {
                         if (i + 1 < lines.size) {
                             val streamUrl = lines[i + 1].trim()
                             if (streamUrl.isNotEmpty() && !streamUrl.startsWith("#")) {
+                                // CRASH FIX: Resolve relative URLs against the HLS playlist URL.
+                                val absoluteUrl = try {
+                                    java.net.URL(java.net.URL(hlsUrl), streamUrl).toString()
+                                } catch (_: Exception) {
+                                    streamUrl
+                                }
+
                                 val qualityLabel = resolution?.let { res ->
                                     val height = res.substringAfter("x")
                                     "${height}p"
                                 } ?: "Auto"
 
-                                callback(
-                                    newExtractorLink(
-                                        source = serverName,
-                                        name = "$serverName - $qualityLabel",
-                                        url = streamUrl,
-                                        type = INFER_TYPE
-                                    ) {
-                                        this.referer = ""
-                                        this.quality = getQualityValue(qualityLabel)
-                                    }
-                                )
+                                emitLink(serverName, "$serverName - $qualityLabel", absoluteUrl, "", getQualityValue(qualityLabel), callback)
                                 foundAny = true
                             }
                         }
@@ -662,14 +631,9 @@ class AnimeDayProvider : MainAPI() {
     }
 
     /**
-     * OPTIMIZATION 6: GDPlayer Pro — use CloudStream's built-in extractor.
-     *
-     * CRASH FIX: Previously this passed the GDPlayer HTML page URL directly as a
-     * video link with INFER_TYPE. On phones/Android TVs, ExoPlayer crashes when
-     * it tries to parse an HTML page as video (the LDPlayer emulator's more
-     * lenient decoder tolerates it). The native Anime Day app has its own
-     * GDPlayer WebView handler — CloudStream does not. Use loadExtractor so
-     * CloudStream's extractor registry handles it properly.
+     * OPTIMIZATION 6: GDPlayer Pro — pass URL directly, no extraction needed
+     * The native app adds GDPlayer URLs directly as "سيرفر : GD" without
+     * any HTTP extraction. This is instant.
      */
     private suspend fun extractGdPlayerPro(
         url: String,
@@ -677,9 +641,25 @@ class AnimeDayProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Use CloudStream's built-in extractor (handles GDPlayer properly)
+        // Pass directly — same as native app (instant, no HTTP request)
         try {
-            withTimeoutOrNull(8000L) {
+            callback(
+                newExtractorLink(
+                    source = serverName,
+                    name = "$serverName - GD",
+                    url = url,
+                    type = INFER_TYPE
+                ) {
+                    this.referer = mainUrl
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+            return true
+        } catch (_: Exception) {}
+
+        // Fallback: try CloudStream's built-in extractor
+        try {
+            withTimeoutOrNull(5000L) {
                 loadExtractor(url, mainUrl, subtitleCallback, callback)
             }?.let { return true }
         } catch (_: Exception) {}
@@ -700,19 +680,48 @@ class AnimeDayProvider : MainAPI() {
         val cleanUrl = url.trim()
 
         // 1. Direct video URLs (mp4, m3u8) — INSTANT, no HTTP needed
+        // CRASH FIX: For m3u8 URLs, use M3u8Helper.generateM3u8 instead of INFER_TYPE.
+        // ExoPlayer on phones/Android TVs crashes on m3u8 URLs passed via INFER_TYPE
+        // because it doesn't properly handle HLS playlists (relative URLs, variant
+        // playlists, key requests). The LDPlayer emulator tolerates it. This is the
+        // same pattern used by StardimaProvider which doesn't crash.
         if (cleanUrl.contains(".mp4") || cleanUrl.contains(".m3u8")) {
             val quality = getQualityFromUrl(cleanUrl)
-            callback(
-                newExtractorLink(
-                    source = serverName,
-                    name = "$serverName - $quality",
-                    url = cleanUrl,
-                    type = if (cleanUrl.contains(".m3u8")) INFER_TYPE else ExtractorLinkType.VIDEO
-                ) {
-                    this.referer = mainUrl
-                    this.quality = getQualityValue(quality)
+            if (cleanUrl.contains(".m3u8")) {
+                try {
+                    M3u8Helper.generateM3u8(
+                        source = serverName,
+                        streamUrl = cleanUrl,
+                        referer = mainUrl,
+                        name = "$serverName - $quality"
+                    ).forEach { callback(it) }
+                } catch (_: Exception) {
+                    // Fallback: direct link if M3u8Helper fails
+                    callback(
+                        newExtractorLink(
+                            source = serverName,
+                            name = "$serverName - $quality",
+                            url = cleanUrl,
+                            type = INFER_TYPE
+                        ) {
+                            this.referer = mainUrl
+                            this.quality = getQualityValue(quality)
+                        }
+                    )
                 }
-            )
+            } else {
+                callback(
+                    newExtractorLink(
+                        source = serverName,
+                        name = "$serverName - $quality",
+                        url = cleanUrl,
+                        type = ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = mainUrl
+                        this.quality = getQualityValue(quality)
+                    }
+                )
+            }
             return true
         }
 
@@ -780,12 +789,22 @@ class AnimeDayProvider : MainAPI() {
             }?.let { return true }
         } catch (_: Exception) {}
 
-        // CRASH FIX: Previously this had a "last resort" fallback that passed the
-        // unknown URL directly as a video link with INFER_TYPE. If loadExtractor
-        // already failed on this URL, passing it to ExoPlayer will crash on
-        // phones/Android TVs (the LDPlayer emulator tolerates it). Return false
-        // instead so loadLinks can try other servers.
-        return false
+        // 10. Last resort: pass as direct link
+        try {
+            callback(
+                newExtractorLink(
+                    source = serverName,
+                    name = serverName,
+                    url = cleanUrl,
+                    type = INFER_TYPE
+                ) {
+                    this.referer = ""
+                }
+            )
+            return true
+        } catch (_: Exception) {
+            return false
+        }
     }
 
     // ==================== Home Page ====================
@@ -937,11 +956,8 @@ class AnimeDayProvider : MainAPI() {
 
         if (isMovie) {
             val ep = firstPlaylistEps.firstOrNull()
-            // CRASH FIX: Embed only playlist ID + episode ID (tiny), not all video URLs.
-            val linkData = LinkData(
-                playlistId = firstPlaylist.id ?: "",
-                episodeId = ep?.getIdString() ?: ""
-            )
+            val videoUrls = if (ep != null) collectVideoUrls(ep) else emptyMap()
+            val linkData = LinkData(videoUrls)
 
             return newMovieLoadResponse(title, url, TvType.Movie, linkData.toJson()) {
                 this.posterUrl = poster
@@ -959,12 +975,9 @@ class AnimeDayProvider : MainAPI() {
         if (allEpisodes.isEmpty()) return null
 
         val episodes = allEpisodes.mapIndexed { idx, ep ->
+            val videoUrls = collectVideoUrls(ep)
             val pId = ep.getPlaylistIdString().ifEmpty { playlists.firstOrNull()?.id ?: "" }
-            // CRASH FIX: Embed only playlist ID + episode ID (tiny), not all video URLs.
-            val linkData = LinkData(
-                playlistId = pId,
-                episodeId = ep.getIdString()
-            )
+            val linkData = LinkData(videoUrls)
 
             newEpisode(linkData.toJson()) {
                 this.name = ep.title ?: "الحلقة ${idx + 1}"
@@ -1006,15 +1019,6 @@ class AnimeDayProvider : MainAPI() {
      * OPTIMIZATION 10: Reduced per-server timeout from 15s to 8s
      * The native app uses 10s timeout for all HTTP operations.
      * Also pre-fetches agents/cookies in the background.
-     *
-     * CRASH FIX: Limit concurrent extractions to 3 (instead of unbounded parallel)
-     * to avoid OOM on phones/Android TVs. Emulators have plenty of RAM, but real
-     * devices often have only 1-2GB. With 6 servers in parallel, each downloading
-     * multi-MB HTML (Google Photos pages can be 5-10MB each), peak memory can
-     * easily exceed the device heap and crash CloudStream.
-     *
-     * Also added a top-level try-catch as a safety net so any unexpected exception
-     * (including OutOfMemoryError) is swallowed instead of crashing the app.
      */
     override suspend fun loadLinks(
         data: String,
@@ -1023,70 +1027,32 @@ class AnimeDayProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val linkData = tryParseJson<LinkData>(data) ?: return false
-        if (linkData.playlistId.isEmpty() || linkData.episodeId.isEmpty()) return false
-
-        // CRASH FIX: Re-fetch the single playlist's episodes from the API and find
-        // the matching episode by ID. Previously, all 6 video URLs for every episode
-        // were embedded in the episode data field, which made CloudStream serialize
-        // multi-MB JSON when passing the episode list to the player activity —
-        // crashing on phones/Android TVs (less RAM than LDPlayer emulator).
-        // Now we store only IDs and fetch the URLs here, one HTTP call per play.
-        val videoUrls: Map<String, Pair<String, Boolean>> = try {
-            withTimeoutOrNull(8000L) {
-                val epsText = app.post(
-                    "$apiUrl/episodeWithInfo/readPaging.php",
-                    headers = authHeaders + mapOf("Content-Type" to "application/x-www-form-urlencoded"),
-                    data = mapOf("playlist_id" to linkData.playlistId)
-                ).text
-                val eps = parseList<Episode>(epsText)
-                eps.firstOrNull { it.getIdString() == linkData.episodeId }
-            }?.let { ep -> collectVideoUrls(ep) } ?: emptyMap()
-        } catch (_: Throwable) {
-            emptyMap()
-        }
+        val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
         // Pre-fetch agents/cookies in background (won't block if already fetched)
-        try {
-            coroutineScope { async { getAgents() } }
-        } catch (_: Throwable) {
-            // Never let agents fetch crash the app
+        coroutineScope {
+            async { getAgents() }
         }
 
-        val foundAny = AtomicBoolean(false)
-        // Limit concurrent extractions to avoid OOM on memory-constrained devices.
-        // 3 permits balances speed (still 3x parallel) against memory safety.
-        val semaphore = Semaphore(3)
-
-        try {
-            coroutineScope {
-                videoUrls.entries.map { (serverName, urlAndExtraction) ->
-                    async {
+        var foundAny = false
+        coroutineScope {
+            videoUrls.entries.map { (serverName, urlAndExtraction) ->
+                async {
+                    val result = withTimeoutOrNull(8000L) {  // Reduced from 15000L
                         try {
-                            semaphore.withPermit {
-                                val result = withTimeoutOrNull(8000L) {  // Reduced from 15000L
-                                    try {
-                                        val (url, needsExtraction) = urlAndExtraction
-                                        extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
-                                    } catch (_: Exception) {
-                                        false
-                                    }
-                                } ?: false
-                                if (result) foundAny.set(true)
-                            }
-                        } catch (_: Throwable) {
-                            // Swallow any error (including OOM) from a single extraction
-                            // so it doesn't crash the whole app or cancel sibling extractions.
+                            val (url, needsExtraction) = urlAndExtraction
+                            extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
+                        } catch (_: Exception) {
+                            false
                         }
-                    }
-                }.forEach { it.await() }
-            }
-        } catch (_: Throwable) {
-            // Final safety net: if coroutineScope itself throws (e.g., OOM, cancellation),
-            // return whatever we have so far instead of crashing CloudStream.
+                    } ?: false
+                    if (result) foundAny = true
+                }
+            }.forEach { it.await() }
         }
 
-        return foundAny.get()
+        return foundAny
     }
 
     private fun getQualityFromUrl(url: String): String = when {
