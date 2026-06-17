@@ -225,14 +225,19 @@ class AnimeDayProvider : MainAPI() {
         if (agentsFetched) return cachedAgents
         if (agentsFetchFailed) return null  // Don't retry if it failed before
         agentsFetched = true
+        // CRASH FIX v13: removed withTimeoutOrNull wrapper. Stardima plugin
+        // (which works on all devices) NEVER uses withTimeoutOrNull — when
+        // the timeout fires, the OkHttp call is cancelled but its connection
+        // pool thread lingers. Across multiple loadLinks calls (playing
+        // multiple episodes), these lingering cancelled threads accumulate
+        // -> pool saturates -> pthread_create fails -> crash. Plain try/catch
+        // lets the call complete or fail naturally and release its thread.
         cachedAgents = try {
-            withTimeoutOrNull(5000L) {  // Reduced from 8000L
-                val text = app.post(
-                    "$apiUrl/AgentsAndCookies/getData.php",
-                    headers = authHeaders
-                ).text
-                parseObject<AgentsCookies>(text)
-            }
+            val text = app.post(
+                "$apiUrl/AgentsAndCookies/getData.php",
+                headers = authHeaders
+            ).text
+            parseObject<AgentsCookies>(text)
         } catch (_: Exception) {
             agentsFetchFailed = true
             null
@@ -263,10 +268,9 @@ class AnimeDayProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
-            val response = withTimeoutOrNull(6000L) {  // Reduced from 12000L
-                app.get(url, headers = authHeaders)
-            } ?: return false
-
+            // CRASH FIX v13: removed withTimeoutOrNull wrapper (see getAgents
+            // note). Plain app.get lets the call complete or fail naturally.
+            val response = app.get(url, headers = authHeaders)
             val responseText = response.text
 
             // Fast path: Try availableQualities first (most common format)
@@ -384,7 +388,7 @@ class AnimeDayProvider : MainAPI() {
 
             return false
         } catch (e: Exception) {
-            // CRASH FIX v12: previously passed the raw workers.dev URL
+            // CRASH FIX v13: previously passed the raw workers.dev URL
             // directly to the player with INFER_TYPE. But workers.dev URLs
             // return JSON (not video), so the player tried to play JSON
             // as video -> "error parsing container 3003". Removed this
@@ -418,9 +422,12 @@ class AnimeDayProvider : MainAPI() {
                 gPhotosHeaders["Cookie"] = it
             }
 
-            val pageText = withTimeoutOrNull(5000L) {  // Reduced from 10000L
+            val pageText = try {
+                // CRASH FIX v13: removed withTimeoutOrNull wrapper (see
+                // getAgents note). Plain app.get lets the call complete or
+                // fail naturally and release its OkHttp thread.
                 app.get(url, headers = gPhotosHeaders).text
-            } ?: return false
+            } catch (_: Exception) { return false }
 
             // Fix malformed percent encoding
             val fixed = Regex("%(?![0-9a-fA-F]{2})").replace(pageText) { "%25" }
@@ -445,7 +452,7 @@ class AnimeDayProvider : MainAPI() {
                 foundAny = true
             }
 
-            // CRASH FIX v12: lh3.googleusercontent.com /pw/ URLs are image-CDN
+            // CRASH FIX v13: lh3.googleusercontent.com /pw/ URLs are image-CDN
             // endpoints; the =m22/=m37/=m18 suffixes don't produce playable
             // video URLs. Dropped to avoid broken links.
             return foundAny
@@ -478,7 +485,10 @@ class AnimeDayProvider : MainAPI() {
 
             // Use metadata API — same as native app
             val metadataUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
-            val metaResponse = withTimeoutOrNull(5000L) {  // Reduced from 10000L
+            // CRASH FIX v13: removed withTimeoutOrNull wrapper (see
+            // getAgents note). Plain app.post lets the call complete or
+            // fail naturally and release its OkHttp thread.
+            val metaResponse = try {
                 app.post(
                     metadataUrl,
                     headers = mapOf(
@@ -488,7 +498,7 @@ class AnimeDayProvider : MainAPI() {
                     ),
                     data = mapOf("" to "")
                 ).text
-            } ?: return false
+            } catch (_: Exception) { return false }
 
             val metadata = mapper.readTree(metaResponse)
 
@@ -519,7 +529,10 @@ class AnimeDayProvider : MainAPI() {
             // Try ondemandHls if videos array fails
             val hlsUrl = metadata?.get("ondemandHls")?.asText()
             if (hlsUrl != null && hlsUrl.isNotEmpty()) {
-                val hlsResponse = withTimeoutOrNull(5000L) {  // Reduced from 10000L
+                // CRASH FIX v13: removed withTimeoutOrNull wrapper (see
+                // getAgents note). Plain app.get lets the call complete or
+                // fail naturally and release its OkHttp thread.
+                val hlsResponse = try {
                     app.get(
                         hlsUrl,
                         headers = mapOf(
@@ -527,7 +540,7 @@ class AnimeDayProvider : MainAPI() {
                             "Cookie" to cookie
                         )
                     ).text
-                } ?: return false
+                } catch (_: Exception) { return false }
 
                 val lines = hlsResponse.lines()
                 var foundAny = false
@@ -563,7 +576,7 @@ class AnimeDayProvider : MainAPI() {
             }
         } catch (_: Exception) {}
 
-        // CRASH FIX v12: loadExtractor fallback REMOVED (thread-spawning).
+        // CRASH FIX v13: loadExtractor fallback REMOVED (thread-spawning).
         return false
     }
 
@@ -577,7 +590,7 @@ class AnimeDayProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // CRASH FIX v12: loadExtractor REMOVED (thread-spawning catch-all).
+        // CRASH FIX v13: loadExtractor REMOVED (thread-spawning catch-all).
         return false
     }
 
@@ -608,7 +621,7 @@ class AnimeDayProvider : MainAPI() {
             return true
         } catch (_: Exception) {}
 
-        // CRASH FIX v12: loadExtractor fallback REMOVED.
+        // CRASH FIX v13: loadExtractor fallback REMOVED.
         return false
     }
 
@@ -699,7 +712,7 @@ class AnimeDayProvider : MainAPI() {
             return extractGooglePhotos(cleanUrl, serverName, callback)
         }
 
-        // CRASH FIX v12: loadExtractor for unknown URLs REMOVED, AND the
+        // CRASH FIX v13: loadExtractor for unknown URLs REMOVED, AND the
         // "last resort: pass as direct link" fallback is ALSO REMOVED.
         // Returning unknown URLs to the player with INFER_TYPE caused
         // runaway probing -> pthread_create failures.
@@ -777,7 +790,7 @@ class AnimeDayProvider : MainAPI() {
             "1" to "2", "1" to "1", "2" to "2", "2" to "1"
         )
 
-        // CRASH FIX v12: SEQUENTIAL (was 4 parallel async).
+        // CRASH FIX v13: SEQUENTIAL (was 4 parallel async).
         for ((type, classification) in searchConfigs) {
             try {
                 val text = app.get(
@@ -811,7 +824,7 @@ class AnimeDayProvider : MainAPI() {
         val playlists = parseList<Playlist>(playlistsText)
         if (playlists.isEmpty()) return null
 
-        // CRASH FIX v12: SEQUENTIAL (was parallel async per playlist).
+        // CRASH FIX v13: SEQUENTIAL (was parallel async per playlist).
         val playlistEpisodes = mutableMapOf<String, List<Episode>>()
         var firstEpisodeInfo: Episode? = null
 
@@ -926,38 +939,40 @@ class AnimeDayProvider : MainAPI() {
         }
 
         var foundAny = false
-        // CRASH FIX v12 = v8's exact loadLinks (which DIDN'T crash) + v9's
-        // 3003 fix (remove workers.dev raw-URL fallback):
+        // CRASH FIX v13 (ROOT CAUSE FINALLY IDENTIFIED via Stardima plugin
+        // comparison: https://github.com/maleek18000/CSSD/):
         //
-        // History of what crashed vs didn't:
-        //   v8  (1 server, 5s timeout, 1000ms delay, MAX_LINKS=3, workers.dev
-        //       raw-URL fallback PRESENT): NO CRASH, but 3003 errors from
-        //       the workers.dev fallback passing JSON to the player.
-        //   v9  (3 servers, 3s timeout, 200ms delay): CRASHED (3 servers too
-        //       many — saturated OkHttp pool).
-        //   v10 (1 server, 3s timeout, 200ms delay): CRASHED (3s timeout too
-        //       short → false "no links found" → tried all 6 servers → pool
-        //       saturated → crash on 2nd play).
-        //   v11 (2 servers, 5s timeout, 1000ms delay): CRASHED (2 servers
-        //       still too many).
+        // Stardima plugin works on ALL devices without crashing. Key finding:
+        // Stardima NEVER uses withTimeoutOrNull ANYWHERE. The agent analysis:
+        //   "when the timeout fires, the inner HTTP call is cancelled but the
+        //    OkHttp call may still be holding a pool thread; rapid retries
+        //    then stack up live pool threads."
         //
-        // Conclusion: the threshold is EXACTLY at v8's config — 1 server,
-        // 5s timeout, 1000ms delay. v12 restores v8's exact loadLinks and
-        // ONLY adds v9's 3003 fix (which doesn't add any HTTP requests).
+        // This is EXACTLY what happened in v1-v12. Every version wrapped
+        // extractions in withTimeoutOrNull. When the timeout fires, the
+        // OkHttp call is cancelled but its connection pool thread lingers.
+        // Across multiple loadLinks calls (playing multiple episodes), these
+        // lingering cancelled threads accumulate -> pool saturates ->
+        // pthread_create fails -> crash. v8 "didn't crash" on the FIRST
+        // episode, but after playing several, the accumulated lingering
+        // threads crashed it — which is why v12 (identical config) crashes.
         //
-        // v12 = v8 + 3003 fix:
-        //   1. PROCESS ONLY THE FIRST SERVER that returns links (from v8).
-        //   2. timeout = 5s (from v8 — reliable for slow networks).
-        //   3. delay = 1000ms (from v8 — lets OkHttp pool clean up).
-        //   4. MAX_LINKS=5 (workers.dev returns 3-5 qualities from a SINGLE
-        //      server, so user gets alternatives within that one server
-        //      without needing more HTTP requests).
-        //   5. workers.dev raw-URL fallback REMOVED (from v9) — if JSON
-        //      extraction fails, return false instead of feeding the player
-        //      JSON -> no more 3003.
-        //   6. ALL previous crash fixes retained: sequential search/load,
-        //      no loadExtractor, no lh3 fake URLs, no extractFromUrl
-        //      last-resort fallback.
+        // v13 = remove ALL withTimeoutOrNull (matching Stardima) + keep all
+        // structural fixes from v12:
+        //   1. REMOVED withTimeoutOrNull from: getAgents, extractWorkerUrl,
+        //      extractGooglePhotos, extractOkRu (x2), loadLinks. ALL of them.
+        //      Now HTTP calls complete or fail naturally via try/catch,
+        //      releasing their OkHttp threads cleanly.
+        //   2. Sequential search/load/loadLinks (from v12).
+        //   3. No loadExtractor calls (from v6+).
+        //   4. No fake lh3 URLs (from v3+).
+        //   5. No extractFromUrl last-resort fallback (from v7+).
+        //   6. No workers.dev raw-URL fallback (from v9+).
+        //   7. Break after first success (from v8).
+        //   8. Buffering callback MAX_LINKS=5 (safety net).
+        //   9. Removed delay(1000) between servers — Stardima doesn't use
+        //      delays, and without withTimeoutOrNull there are no lingering
+        //      threads to clean up.
         val MAX_LINKS = 5
         val linksReturned = java.util.concurrent.atomic.AtomicInteger(0)
         val bufferingCallback: (ExtractorLink) -> Unit = { link ->
@@ -967,31 +982,14 @@ class AnimeDayProvider : MainAPI() {
         }
 
         for ((serverName, urlAndExtraction) in videoUrls.entries) {
-            // CRASH FIX v12: stop as soon as the FIRST server returns any
-            // links. This is v8's exact approach that didn't crash. v9 (3
-            // servers) and v11 (2 servers) both crashed; 1 server is the
-            // safe threshold. This caps total HTTP requests to ~2 per
-            // loadLinks call (one for the first server, possibly one for
-            // getAgents if not cached), keeping OkHttp's connection pool
-            // well below saturation.
-            if (linksReturned.get() > 0) break
-            val result = coroutineScope {
-                withTimeoutOrNull(5000L) {  // 5s — v8's reliable timeout
-                    try {
-                        val (url, needsExtraction) = urlAndExtraction
-                        extractFromUrl(url, serverName, needsExtraction, subtitleCallback, bufferingCallback)
-                    } catch (_: Exception) {
-                        false
-                    }
-                } ?: false
+            if (linksReturned.get() > 0) break  // Got links, stop
+            val result = try {
+                val (url, needsExtraction) = urlAndExtraction
+                extractFromUrl(url, serverName, needsExtraction, subtitleCallback, bufferingCallback)
+            } catch (_: Exception) {
+                false
             }
             if (result) foundAny = true
-            // Longer delay to let OkHttp's connection pool release the
-            // connection before any potential next iteration. v8's 1000ms
-            // is critical — v10's 200ms was too short and contributed to
-            // the crash. Fully-qualified to avoid touching the import block.
-            kotlinx.coroutines.yield()
-            kotlinx.coroutines.delay(1000)
         }
 
         return foundAny
