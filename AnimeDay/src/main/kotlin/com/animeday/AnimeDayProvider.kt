@@ -10,8 +10,11 @@ import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 
 // ==================== Data Classes ====================
 
@@ -143,14 +146,16 @@ class AnimeDayProvider : MainAPI() {
         "Accept" to "application/json"
     )
 
-    private fun getAuthHeader(): String {
+    // FIX 1: Cache the Base64-encoded auth header as a lazy val — computed once, never repeated
+    private val cachedAuthHeader: String by lazy {
         val credentials = "$authUser:$authPass"
-        return "Basic ${android.util.Base64.encodeToString(credentials.toByteArray(), android.util.Base64.NO_WRAP)}"
+        "Basic ${android.util.Base64.encodeToString(credentials.toByteArray(), android.util.Base64.NO_WRAP)}"
     }
 
-    private val authHeaders get() = headers + mapOf(
-        "Authorization" to getAuthHeader()
-    )
+    private fun getAuthHeader(): String = cachedAuthHeader
+
+    // FIX 1 (cont): authHeaders is also lazy — built once, reused by all coroutines
+    private val authHeaders by lazy { headers + mapOf("Authorization" to cachedAuthHeader) }
 
     private inline fun <reified T> parseList(text: String): List<T> {
         return try {
@@ -216,32 +221,41 @@ class AnimeDayProvider : MainAPI() {
     }
 
     // ========== OPTIMIZATION 1: Pre-fetch agents/cookies at plugin load ==========
-    // Instead of lazy-loading on first video play (which adds latency),
-    // fetch immediately and cache aggressively.
     private var cachedAgents: AgentsCookies? = null
-    private var agentsFetched = false
-    private var agentsFetchFailed = false
+    // FIX 2: @Volatile ensures flag visibility across threads on real Android hardware
+    @Volatile private var agentsFetched = false
+    @Volatile private var agentsFetchFailed = false
+    // FIX 2: Mutex prevents multiple coroutines from fetching simultaneously on first call
     private val agentsMutex = Mutex()
 
     private suspend fun getAgents(): AgentsCookies? {
-        // Mutex prevents 6 parallel coroutines from firing duplicate HTTP POSTs.
-        // Without this, all 6 servers in loadLinks see agentsFetched=false at once
-        // and each fires its own fetch — 6x memory pressure during the crash window.
-        agentsMutex.withLock {
-            if (agentsFetched) return cachedAgents
-            if (agentsFetchFailed) return null  // Don't retry if it failed before
+        if (agentsFetched) return cachedAgents
+        if (agentsFetchFailed) return null
+        // FIX 2: Double-checked locking — only one coroutine enters, others wait then reuse
+        return agentsMutex.withLock {
+            if (agentsFetched) return@withLock cachedAgents
+            if (agentsFetchFailed) return@withLock null
             agentsFetched = true
             cachedAgents = try {
-                val text = app.post(
-                    "$apiUrl/AgentsAndCookies/getData.php",
-                    headers = authHeaders
-                ).text
-                parseObject<AgentsCookies>(text)
-            } catch (_: Throwable) {
+                withTimeoutOrNull(5000L) {
+                    val text = app.post(
+                        "$apiUrl/AgentsAndCookies/getData.php",
+                        headers = authHeaders
+                    ).text
+                    parseObject<AgentsCookies>(text)
+                }
+            } catch (_: Exception) {
                 agentsFetchFailed = true
                 null
             }
-            return cachedAgents
+            cachedAgents
+        }
+    }
+
+    // ========== OPTIMIZATION 2: URL resolution cache ==========
+    private val urlCache = object : LinkedHashMap<String, List<ExtractorLink>>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<ExtractorLink>>): Boolean {
+            return size > 50
         }
     }
 
@@ -249,9 +263,6 @@ class AnimeDayProvider : MainAPI() {
 
     /**
      * OPTIMIZATION 3: Streamlined workers.dev extraction
-     * - Try the most common JSON format first (availableQualities)
-     * - Immediately return on first successful parse
-     * - Reduced timeout from 12s to 6s
      */
     private suspend fun extractWorkerUrl(
         url: String,
@@ -259,15 +270,16 @@ class AnimeDayProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
-            val response = app.get(url, headers = authHeaders)
+            val response = withTimeoutOrNull(6000L) {
+                app.get(url, headers = authHeaders)
+            } ?: return false
+
             val responseText = response.text
 
-            // Fast path: Try availableQualities first (most common format)
             if (responseText.trim().startsWith("{")) {
                 try {
                     val node = mapper.readTree(responseText)
 
-                    // Try availableQualities array (most common worker response)
                     val qualities = node?.get("availableQualities")
                     if (qualities != null && qualities.isArray) {
                         var found = false
@@ -290,7 +302,6 @@ class AnimeDayProvider : MainAPI() {
                         if (found) return true
                     }
 
-                    // Try single "url" field
                     node?.get("url")?.asText()?.takeIf { it.isNotEmpty() }?.let { directUrl ->
                         val quality = getQualityFromUrl(directUrl)
                         callback(
@@ -307,7 +318,6 @@ class AnimeDayProvider : MainAPI() {
                         return true
                     }
 
-                    // Try "videos" array
                     node?.get("videos")?.let { videosNode ->
                         if (videosNode.isArray) {
                             var found = false
@@ -330,10 +340,10 @@ class AnimeDayProvider : MainAPI() {
                             if (found) return true
                         }
                     }
+
                 } catch (_: Exception) {}
             }
 
-            // Try JSON array format
             if (responseText.trim().startsWith("[")) {
                 try {
                     val qualityList = parseList<VideoQuality>(responseText)
@@ -358,7 +368,6 @@ class AnimeDayProvider : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // Check for redirect
             val finalUrl = response.url
             if (finalUrl != url && finalUrl.isNotEmpty()) {
                 callback(
@@ -377,7 +386,6 @@ class AnimeDayProvider : MainAPI() {
 
             return false
         } catch (e: Exception) {
-            // Fallback: pass worker URL directly with auth headers
             try {
                 callback(
                     newExtractorLink(
@@ -399,18 +407,12 @@ class AnimeDayProvider : MainAPI() {
 
     /**
      * OPTIMIZATION 4: Simplified Google Photos extraction
-     * The native app only extracts the video-downloads URL (Original quality)
-     * and adds it directly. No need for multi-quality extraction with lh3 base URLs.
-     * Reduced from ~100 lines to ~40 lines, and from 10s to 5s timeout.
      */
     private suspend fun extractGooglePhotos(
         url: String,
         serverName: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Skip loadExtractor entirely — CloudStream's built-in Google Photos extractor
-        // often fails or is slow. Go directly to custom HTML extraction.
-
         try {
             val agents = getAgents()
             val gPhotosHeaders = mutableMapOf<String, String>()
@@ -421,16 +423,16 @@ class AnimeDayProvider : MainAPI() {
                 gPhotosHeaders["Cookie"] = it
             }
 
-            val pageText = app.get(url, headers = gPhotosHeaders).text
+            val pageText = withTimeoutOrNull(5000L) {
+                app.get(url, headers = gPhotosHeaders).text
+            } ?: return false
 
-            // Fix malformed percent encoding
             val fixed = Regex("%(?![0-9a-fA-F]{2})").replace(pageText) { "%25" }
             val decoded = java.net.URLDecoder.decode(fixed, "UTF-8")
 
             var foundAny = false
 
-            // 1. Extract video-downloads URL (Original quality) — same as native app
-            val videoDownloadPattern = Regex("""https://video-downloads\.googleusercontent\.com/[^"\\\s]+""")
+            val videoDownloadPattern = Regex("""https://video-downloads\.googleusercontent\.com/[^"\\s]+""")
             videoDownloadPattern.find(decoded)?.value?.let { videoUrl ->
                 callback(
                     newExtractorLink(
@@ -446,18 +448,17 @@ class AnimeDayProvider : MainAPI() {
                 foundAny = true
             }
 
-            // 2. Extract lh3 base URL and generate quality URLs (simplified)
-            val lh3Pattern = Regex("""https://lh3\.googleusercontent\.com/pw/[^"\\\s]+""")
+            val lh3Pattern = Regex("""https://lh3\.googleusercontent\.com/pw/[^"\\s]+""")
             var lh3BaseUrl: String? = null
             for (match in lh3Pattern.findAll(decoded)) {
                 val foundUrl = match.value
-                // Prefer URL without size suffix
                 if (!foundUrl.contains("=s") && !foundUrl.contains("=w") &&
                     !foundUrl.contains("=d") && !foundUrl.contains("=m") && !foundUrl.contains("=h")) {
                     lh3BaseUrl = foundUrl
                     break
                 }
             }
+
             if (lh3BaseUrl == null) {
                 lh3Pattern.find(decoded)?.value?.let { rawUrl ->
                     val lastEqIndex = rawUrl.lastIndexOf('=')
@@ -465,7 +466,6 @@ class AnimeDayProvider : MainAPI() {
                 }
             }
 
-            // Generate quality URLs from lh3 base (same as native app's approach)
             if (lh3BaseUrl != null) {
                 data class SimpleQuality(val suffix: String, val qualityName: String, val qualityValue: Int)
                 for (sq in listOf(
@@ -496,9 +496,6 @@ class AnimeDayProvider : MainAPI() {
 
     /**
      * OPTIMIZATION 5: Skip loadExtractor for ok.ru — go directly to metadata API
-     * The native app uses the ok.ru metadata API directly, not CloudStream's
-     * built-in extractor which may make unnecessary requests.
-     * Reduced timeout from 10s to 5s.
      */
     private suspend fun extractOkRu(
         url: String,
@@ -506,7 +503,6 @@ class AnimeDayProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Try metadata API directly (same approach as native app)
         try {
             val agents = getAgents()
             val videoId = Regex("""ok\.ru/video(?:embed)?/(\d+)""").find(url)?.groupValues?.get(1)
@@ -516,21 +512,21 @@ class AnimeDayProvider : MainAPI() {
                 ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36"
             val cookie = agents?.okRuCookie?.takeIf { it.isNotEmpty() } ?: ""
 
-            // Use metadata API — same as native app
             val metadataUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
-            val metaResponse = app.post(
-                metadataUrl,
-                headers = mapOf(
-                    "User-Agent" to userAgent,
-                    "Cookie" to cookie,
-                    "Content-Type" to "application/x-www-form-urlencoded"
-                ),
-                data = mapOf("" to "")
-            ).text
+            val metaResponse = withTimeoutOrNull(5000L) {
+                app.post(
+                    metadataUrl,
+                    headers = mapOf(
+                        "User-Agent" to userAgent,
+                        "Cookie" to cookie,
+                        "Content-Type" to "application/x-www-form-urlencoded"
+                    ),
+                    data = mapOf("" to "")
+                ).text
+            } ?: return false
 
             val metadata = mapper.readTree(metaResponse)
 
-            // Try "videos" array first (faster than HLS parsing)
             metadata?.get("videos")?.let { videosNode ->
                 if (videosNode.isArray) {
                     var foundAny = false
@@ -554,16 +550,17 @@ class AnimeDayProvider : MainAPI() {
                 }
             }
 
-            // Try ondemandHls if videos array fails
             val hlsUrl = metadata?.get("ondemandHls")?.asText()
             if (hlsUrl != null && hlsUrl.isNotEmpty()) {
-                val hlsResponse = app.get(
-                    hlsUrl,
-                    headers = mapOf(
-                        "User-Agent" to userAgent,
-                        "Cookie" to cookie
-                    )
-                ).text
+                val hlsResponse = withTimeoutOrNull(5000L) {
+                    app.get(
+                        hlsUrl,
+                        headers = mapOf(
+                            "User-Agent" to userAgent,
+                            "Cookie" to cookie
+                        )
+                    ).text
+                } ?: return false
 
                 val lines = hlsResponse.lines()
                 var foundAny = false
@@ -578,7 +575,6 @@ class AnimeDayProvider : MainAPI() {
                                     val height = res.substringAfter("x")
                                     "${height}p"
                                 } ?: "Auto"
-
                                 callback(
                                     newExtractorLink(
                                         source = serverName,
@@ -597,20 +593,20 @@ class AnimeDayProvider : MainAPI() {
                 }
                 if (foundAny) return true
             }
+
         } catch (_: Exception) {}
 
-        // Fallback: try CloudStream's built-in extractor (last resort)
         try {
-            loadExtractor(url, mainUrl, subtitleCallback, callback)
-            return true
+            withTimeoutOrNull(5000L) {
+                loadExtractor(url, mainUrl, subtitleCallback, callback)
+            }?.let { return true }
         } catch (_: Exception) {}
 
         return false
     }
 
     /**
-     * Dailymotion extraction — try CloudStream's built-in extractor
-     * with reduced timeout.
+     * Dailymotion extraction
      */
     private suspend fun extractDailymotion(
         url: String,
@@ -618,18 +614,16 @@ class AnimeDayProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Try CloudStream's built-in extractor with reduced timeout
         try {
-            loadExtractor(url, mainUrl, subtitleCallback, callback)
-            return true
+            withTimeoutOrNull(5000L) {
+                loadExtractor(url, mainUrl, subtitleCallback, callback)
+            }?.let { return true }
         } catch (_: Exception) {}
         return false
     }
 
     /**
-     * OPTIMIZATION 6: GDPlayer Pro — pass URL directly, no extraction needed
-     * The native app adds GDPlayer URLs directly as "سيرفر : GD" without
-     * any HTTP extraction. This is instant.
+     * OPTIMIZATION 6: GDPlayer Pro — pass URL directly
      */
     private suspend fun extractGdPlayerPro(
         url: String,
@@ -637,7 +631,6 @@ class AnimeDayProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Pass directly — same as native app (instant, no HTTP request)
         try {
             callback(
                 newExtractorLink(
@@ -653,17 +646,16 @@ class AnimeDayProvider : MainAPI() {
             return true
         } catch (_: Exception) {}
 
-        // Fallback: try CloudStream's built-in extractor
         try {
-            loadExtractor(url, mainUrl, subtitleCallback, callback)
-            return true
+            withTimeoutOrNull(5000L) {
+                loadExtractor(url, mainUrl, subtitleCallback, callback)
+            }?.let { return true }
         } catch (_: Exception) {}
         return false
     }
 
     /**
      * OPTIMIZATION 7: Reordered URL routing for fastest path first
-     * Direct video URLs > CDN URLs > workers.dev > Google Photos > ok.ru > others
      */
     private suspend fun extractFromUrl(
         url: String,
@@ -674,7 +666,6 @@ class AnimeDayProvider : MainAPI() {
     ): Boolean {
         val cleanUrl = url.trim()
 
-        // 1. Direct video URLs (mp4, m3u8) — INSTANT, no HTTP needed
         if (cleanUrl.contains(".mp4") || cleanUrl.contains(".m3u8")) {
             val quality = getQualityFromUrl(cleanUrl)
             callback(
@@ -691,7 +682,6 @@ class AnimeDayProvider : MainAPI() {
             return true
         }
 
-        // 2. CDN URLs (okcdn.ru, vkuser.net) — INSTANT, pass directly
         if (cleanUrl.contains("okcdn.ru") || cleanUrl.contains("vkuser.net")) {
             callback(
                 newExtractorLink(
@@ -707,7 +697,6 @@ class AnimeDayProvider : MainAPI() {
             return true
         }
 
-        // 3. Google CDN URLs (lh3.googleusercontent.com) — INSTANT
         if (cleanUrl.contains("googleusercontent.com") && !cleanUrl.contains("photos.google.com")) {
             callback(
                 newExtractorLink(
@@ -723,38 +712,32 @@ class AnimeDayProvider : MainAPI() {
             return true
         }
 
-        // 4. GDPlayer URLs — FAST, pass directly (native app does this)
         if (cleanUrl.contains("gdplayer")) {
             return extractGdPlayerPro(cleanUrl, serverName, subtitleCallback, callback)
         }
 
-        // 5. Workers.dev URLs — needs 1 HTTP request with auth
         if (cleanUrl.contains(".workers.dev/")) {
             return extractWorkerUrl(cleanUrl, serverName, callback)
         }
 
-        // 6. ok.ru video URLs — metadata API (skip loadExtractor first-attempt)
         if (cleanUrl.contains("ok.ru/video") || cleanUrl.contains("ok.ru/videoembed")) {
             return extractOkRu(cleanUrl, serverName, subtitleCallback, callback)
         }
 
-        // 7. Dailymotion URLs
         if (cleanUrl.contains("dailymotion.com") || cleanUrl.contains("dai.ly")) {
             return extractDailymotion(cleanUrl, serverName, subtitleCallback, callback)
         }
 
-        // 8. Google Photos URLs — slower, HTML extraction needed
         if (cleanUrl.contains("photos.google.com")) {
             return extractGooglePhotos(cleanUrl, serverName, callback)
         }
 
-        // 9. Unknown URL - try CloudStream's built-in extractor with shorter timeout
         try {
-            loadExtractor(cleanUrl, mainUrl, subtitleCallback, callback)
-            return true
+            withTimeoutOrNull(5000L) {
+                loadExtractor(cleanUrl, mainUrl, subtitleCallback, callback)
+            }?.let { return true }
         } catch (_: Exception) {}
 
-        // 10. Last resort: pass as direct link
         try {
             callback(
                 newExtractorLink(
@@ -818,11 +801,13 @@ class AnimeDayProvider : MainAPI() {
             "2" -> TvType.Movie
             else -> TvType.TvSeries
         }
+
         val classificationTag = when (item.classification) {
             "1" -> "مدبلج"
             "2" -> "مترجم"
             else -> ""
         }
+
         val displayTitle = if (classificationTag.isNotEmpty()) "$title ($classificationTag)" else title
 
         val dubExist = item.classification == "1"
@@ -867,8 +852,6 @@ class AnimeDayProvider : MainAPI() {
 
     /**
      * OPTIMIZATION 9: Parallel episode fetching
-     * Instead of fetching playlists then episodes sequentially,
-     * fetch all playlist episodes concurrently.
      */
     override suspend fun load(url: String): LoadResponse? {
         val cartoonId = url.substringAfterLast("/")
@@ -881,7 +864,6 @@ class AnimeDayProvider : MainAPI() {
         val playlists = parseList<Playlist>(playlistsText)
         if (playlists.isEmpty()) return null
 
-        // Fetch episodes for ALL playlists in parallel
         val playlistEpisodes = mutableMapOf<String, List<Episode>>()
         var firstEpisodeInfo: Episode? = null
 
@@ -932,11 +914,11 @@ class AnimeDayProvider : MainAPI() {
             }
         }
 
-        // TV Series
         val allEpisodes = mutableListOf<Episode>()
         for (playlist in playlists) {
             playlistEpisodes[playlist.id]?.let { allEpisodes.addAll(it) }
         }
+
         if (allEpisodes.isEmpty()) return null
 
         val episodes = allEpisodes.mapIndexed { idx, ep ->
@@ -981,9 +963,9 @@ class AnimeDayProvider : MainAPI() {
     // ==================== Video Extraction Entry Point ====================
 
     /**
-     * OPTIMIZATION 10: Reduced per-server timeout from 15s to 8s
-     * The native app uses 10s timeout for all HTTP operations.
-     * Also pre-fetches agents/cookies in the background.
+     * OPTIMIZATION 10: Reduced per-server timeout to 8s.
+     * FIX 3: getAgents() called directly (suspend) — guaranteed to complete before extractions start.
+     * FIX 4: Semaphore(3) limits concurrent HTTP requests to prevent OOM/ANR on mobile & Android TV.
      */
     override suspend fun loadLinks(
         data: String,
@@ -995,33 +977,28 @@ class AnimeDayProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        // Pre-fetch agents/cookies in background (won't block if already fetched)
-        coroutineScope {
-            async { getAgents() }
-        }
+        // FIX 3: Direct suspend call — agents fetched and ready before any extraction starts
+        getAgents()
 
+        // FIX 4: Max 3 concurrent network requests — prevents OOM/crash on real phones and Android TV
+        val semaphore = Semaphore(3)
         var foundAny = false
-        // Top-level safety net: catch Throwable (not Exception) so OutOfMemoryError,
-        // StackOverflowError, etc. don't crash CloudStream on phones/Android TVs.
-        // The LDPlayer emulator has 4-8GB RAM and tolerates these; real devices do not.
-        try {
-            coroutineScope {
-                videoUrls.entries.map { (serverName, urlAndExtraction) ->
-                    async {
-                        try {
-                            val (url, needsExtraction) = urlAndExtraction
-                            if (extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)) {
-                                foundAny = true
+        coroutineScope {
+            videoUrls.entries.map { (serverName, urlAndExtraction) ->
+                async {
+                    semaphore.withPermit {
+                        val result = withTimeoutOrNull(8000L) {
+                            try {
+                                val (url, needsExtraction) = urlAndExtraction
+                                extractFromUrl(url, serverName, needsExtraction, subtitleCallback, callback)
+                            } catch (_: Exception) {
+                                false
                             }
-                        } catch (_: Throwable) {
-                            // Catch Throwable so an Error in one extractor doesn't
-                            // tear down the whole coroutineScope and the app.
-                        }
+                        } ?: false
+                        if (result) foundAny = true
                     }
-                }.forEach { it.await() }
-            }
-        } catch (_: Throwable) {
-            // Last-resort safety net: never propagate an Error up to CloudStream.
+                }
+            }.forEach { it.await() }
         }
 
         return foundAny
