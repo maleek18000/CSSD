@@ -9,7 +9,10 @@ import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
 
 // ==================== Data Classes ====================
@@ -265,6 +268,84 @@ class AnimeDayProvider : MainAPI() {
 
     private fun inferLinkType(url: String): ExtractorLinkType =
         if (url.contains(".m3u8") || url.contains("m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+
+
+    private fun isDirectVideoUrl(url: String): Boolean {
+        val u = url.lowercase()
+        return u.contains(".mp4") ||
+               u.contains(".m3u8") ||
+               u.contains("okcdn.ru") ||
+               u.contains("vkuser.net") ||
+               u.contains("video-downloads.googleusercontent.com") ||
+               u.contains("googleusercontent.com") ||
+               u.contains("googlevideo.com") ||
+               u.contains("/videoplayback")
+    }
+
+    // CRASH FIX v30: Pre-extract video URLs in load() (safe — no player competition)
+    // so loadLinks can return pre-resolved direct URLs with ZERO HTTP.
+    private fun resolveVideoUrl(url: String): String? {
+        val cleanUrl = url.trim()
+        if (cleanUrl.isEmpty()) return null
+        if (isDirectVideoUrl(cleanUrl)) return cleanUrl
+        return try {
+            when {
+                cleanUrl.contains(".workers.dev/") -> {
+                    val responseText = simpleHttpGet(cleanUrl, authHeaders) ?: return null
+                    val trimmed = responseText.trim()
+                    if (trimmed.startsWith("{")) {
+                        val node = mapper.readTree(responseText)
+                        node?.get("availableQualities")?.takeIf { it.isArray }?.firstOrNull()?.let { it.get("url")?.asText() }
+                            ?: node?.get("url")?.asText()
+                            ?: node?.get("videos")?.takeIf { it.isArray }?.firstOrNull()?.let { it.get("url")?.asText() }
+                    } else if (trimmed.startsWith("[")) {
+                        parseList<VideoQuality>(responseText).firstOrNull()?.url
+                    } else null
+                }
+                cleanUrl.contains("ok.ru/video") || cleanUrl.contains("ok.ru/videoembed") -> {
+                    val videoId = Regex("""ok\.ru/video(?:embed)?/(\d+)""").find(cleanUrl)?.groupValues?.get(1) ?: return null
+                    val agents = getAgents()
+                    val userAgent = agents?.okRuAgent?.takeIf { it.isNotEmpty() } ?: "Mozilla/5.0"
+                    val cookie = agents?.okRuCookie?.takeIf { it.isNotEmpty() } ?: ""
+                    val metaResponse = simpleHttpPost("https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId", headers = mapOf("User-Agent" to userAgent, "Cookie" to cookie, "Content-Type" to "application/x-www-form-urlencoded")) ?: return null
+                    val metadata = mapper.readTree(metaResponse)
+                    metadata?.get("videos")?.takeIf { it.isArray }?.firstOrNull()?.let { it.get("url")?.asText() }
+                }
+                cleanUrl.contains("photos.google.com") -> {
+                    val agents = getAgents()
+                    val gPhotosHeaders = mutableMapOf<String, String>()
+                    gPhotosHeaders["User-Agent"] = agents?.gPhotosAgent?.takeIf { it.isNotEmpty() } ?: "Mozilla/5.0"
+                    agents?.gPhotosCookie?.takeIf { it.isNotEmpty() }?.let { gPhotosHeaders["Cookie"] = it }
+                    val pageText = simpleHttpGet(cleanUrl, gPhotosHeaders) ?: return null
+                    val fixed = Regex("%(?![0-9a-fA-F]{2})").replace(pageText) { "%25" }
+                    val decoded = java.net.URLDecoder.decode(fixed, "UTF-8")
+                    Regex("""https://video-downloads\.googleusercontent\.com/[^"\\\s]+""").find(decoded)?.value
+                }
+                else -> null
+            }
+        } catch (_: Exception) { null }
+    }
+
+    private suspend fun resolveEpisodeUrls(videoUrls: Map<String, Pair<String, Boolean>>): Map<String, String> {
+        val resolved = mutableMapOf<String, String>()
+        val semaphore = Semaphore(3)
+        coroutineScope {
+            videoUrls.entries.map { (serverName, urlAndExtraction) ->
+                async {
+                    semaphore.withPermit {
+                        try {
+                            val (rawUrl, _) = urlAndExtraction
+                            val directUrl = resolveVideoUrl(rawUrl)
+                            if (!directUrl.isNullOrEmpty()) {
+                                synchronized(resolved) { resolved[serverName] = directUrl }
+                            }
+                        } catch (_: Exception) {}
+                    }
+                }
+            }.awaitAll()
+        }
+        return resolved
+    }
 
     // ========== OPTIMIZATION 1: Pre-fetch agents/cookies at plugin load ==========
     // Instead of lazy-loading on first video play (which adds latency),
@@ -835,7 +916,12 @@ class AnimeDayProvider : MainAPI() {
         if (isMovie) {
             val ep = firstPlaylistEps.firstOrNull()
             val videoUrls = if (ep != null) collectVideoUrls(ep) else emptyMap()
-            val linkData = LinkData(videoUrls)
+            val resolvedUrls = if (videoUrls.isNotEmpty()) resolveEpisodeUrls(videoUrls) else emptyMap()
+            val resolvedVideoUrls = videoUrls.mapValues { (serverName, _) ->
+                val resolved = resolvedUrls[serverName]
+                if (!resolved.isNullOrEmpty()) Pair(resolved, false) else videoUrls[serverName]!!
+            }
+            val linkData = LinkData(resolvedVideoUrls)
 
             return newMovieLoadResponse(title, url, TvType.Movie, linkData.toJson()) {
                 this.posterUrl = poster
@@ -855,7 +941,12 @@ class AnimeDayProvider : MainAPI() {
         val episodes = allEpisodes.mapIndexed { idx, ep ->
             val videoUrls = collectVideoUrls(ep)
             val pId = ep.getPlaylistIdString().ifEmpty { playlists.firstOrNull()?.id ?: "" }
-            val linkData = LinkData(videoUrls)
+            val resolvedUrls = if (videoUrls.isNotEmpty()) resolveEpisodeUrls(videoUrls) else emptyMap()
+            val resolvedVideoUrls = videoUrls.mapValues { (serverName, _) ->
+                val resolved = resolvedUrls[serverName]
+                if (!resolved.isNullOrEmpty()) Pair(resolved, false) else videoUrls[serverName]!!
+            }
+            val linkData = LinkData(resolvedVideoUrls)
 
             newEpisode(linkData.toJson()) {
                 this.name = ep.title ?: "الحلقة ${idx + 1}"
@@ -908,235 +999,39 @@ class AnimeDayProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        // CRASH FIX v27: Targeted SINGLE-HTTP extraction + return 1 resolved URL.
-        //
-        // History:
-        //   v18/v24/v26 (no extraction, raw URLs): NO CRASH, but 3003 errors
-        //     (raw workers.dev/ok.ru URLs aren't directly playable)
-        //   v19-v25 (full extraction): CRASHED (multiple HTTP calls)
-        //
-        // The dilemma: extraction crashes, but without extraction nothing plays.
-        //
-        // v27: Do ONE targeted HTTP extraction — only the workers.dev JSON path
-        // (the most common server type). Skip ok.ru (needs metadata API + HLS =
-        // 2 HTTP calls) and Google Photos (needs HTML scraping = 1 call but
-        // large response). For workers.dev: 1 HTTP call → parse JSON → get
-        // FIRST direct video URL → return ONLY that 1 link.
-        //
-        // For non-workers.dev URLs (mp4/m3u8/CDN/googleusercontent): return
-        // them directly (no extraction needed, they're already playable).
-        //
-        // For ok.ru/Google Photos/other: skip them (return nothing for that
-        // server, try next server sequentially).
-        //
-        // This caps HTTP requests to 1 per loadLinks call (just the workers.dev
-        // JSON fetch) and returns only 1 link → minimal OkHttp thread spawning
-        // → no crash. And the returned URL is a DIRECT video URL → no 3003.
+        // CRASH FIX v30: loadLinks returns PRE-RESOLVED URLs with ZERO HTTP.
+        // URLs were resolved in load() (safe — no player competition). loadLinks
+        // just returns them directly. No HTTP, no extraction → no crash.
+        // Only return URLs that are DIRECT video URLs (successfully resolved).
         var foundAny = false
         for ((serverName, urlAndExtraction) in videoUrls.entries) {
             kotlinx.coroutines.yield()
-            if (foundAny) break  // Got a link, stop
             val (rawUrl, _) = urlAndExtraction
             val cleanUrl = rawUrl.trim()
             if (cleanUrl.isEmpty()) continue
+            if (!isDirectVideoUrl(cleanUrl)) continue
 
-            // 1. Direct video URLs (mp4, m3u8) — return directly, NO HTTP
-            if (cleanUrl.contains(".mp4") || cleanUrl.contains(".m3u8")) {
-                try {
-                    callback(
-                        newExtractorLink(
-                            source = serverName,
-                            name = serverName,
-                            url = cleanUrl,
-                            type = if (cleanUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = mainUrl
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                    foundAny = true
-                    break
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                }
+            val linkType = when {
+                cleanUrl.contains(".m3u8") -> ExtractorLinkType.M3U8
+                else -> ExtractorLinkType.VIDEO
             }
 
-            // 2. CDN URLs — return directly, NO HTTP
-            else if (cleanUrl.contains("okcdn.ru") || cleanUrl.contains("vkuser.net") ||
-                     cleanUrl.contains("googleusercontent.com") || cleanUrl.contains("googlevideo.com")) {
-                try {
-                    callback(
-                        newExtractorLink(
-                            source = serverName,
-                            name = serverName,
-                            url = cleanUrl,
-                            type = ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = mainUrl
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                    foundAny = true
-                    break
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                }
+            try {
+                callback(
+                    newExtractorLink(
+                        source = serverName,
+                        name = serverName,
+                        url = cleanUrl,
+                        type = linkType
+                    ) {
+                        this.referer = mainUrl
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+                foundAny = true
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
             }
-
-            // 3. Workers.dev URLs — SINGLE HTTP extraction (the targeted fix)
-            else if (cleanUrl.contains(".workers.dev/")) {
-                try {
-                    val responseText = simpleHttpGet(cleanUrl, authHeaders) ?: continue
-                    val trimmed = responseText.trim()
-                    var directUrl: String? = null
-
-                    // Parse JSON object format
-                    if (trimmed.startsWith("{")) {
-                        try {
-                            val node = mapper.readTree(responseText)
-                            // Try availableQualities array (most common format)
-                            val qualities = node?.get("availableQualities")
-                            if (qualities != null && qualities.isArray) {
-                                for (q in qualities) {
-                                    val streamUrl = q.get("url")?.asText()
-                                    if (!streamUrl.isNullOrEmpty()) {
-                                        directUrl = streamUrl
-                                        break
-                                    }
-                                }
-                            }
-                            // Try single "url" field
-                            if (directUrl == null) {
-                                val urlField = node?.get("url")?.asText()
-                                if (!urlField.isNullOrEmpty()) directUrl = urlField
-                            }
-                            // Try "videos" array
-                            if (directUrl == null) {
-                                val videosNode = node?.get("videos")
-                                if (videosNode != null && videosNode.isArray) {
-                                    for (v in videosNode) {
-                                        val vUrl = v.get("url")?.asText()
-                                        if (!vUrl.isNullOrEmpty()) {
-                                            directUrl = vUrl
-                                            break
-                                        }
-                                    }
-                                }
-                            }
-                        } catch (_: Exception) {}
-                    }
-                    // Try JSON array format
-                    else if (trimmed.startsWith("[")) {
-                        try {
-                            val qualityList = parseList<VideoQuality>(responseText)
-                            for (q in qualityList) {
-                                val streamUrl = q.url
-                                if (!streamUrl.isNullOrEmpty()) {
-                                    directUrl = streamUrl
-                                    break
-                                }
-                            }
-                        } catch (_: Exception) {}
-                    }
-
-                    if (!directUrl.isNullOrEmpty()) {
-                        callback(
-                            newExtractorLink(
-                                source = serverName,
-                                name = serverName,
-                                url = directUrl,
-                                type = if (directUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                            ) {
-                                this.referer = mainUrl
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                        foundAny = true
-                        break  // Got a direct URL, stop
-                    }
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                }
-            }
-
-            // 4. ok.ru — SINGLE HTTP extraction (metadata API only, skip HLS)
-            else if (cleanUrl.contains("ok.ru/video") || cleanUrl.contains("ok.ru/videoembed")) {
-                try {
-                    val videoId = Regex("""ok\.ru/video(?:embed)?/(\d+)""").find(cleanUrl)?.groupValues?.get(1) ?: continue
-                    val agents = getAgents()
-                    val userAgent = agents?.okRuAgent?.takeIf { it.isNotEmpty() }
-                        ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36"
-                    val cookie = agents?.okRuCookie?.takeIf { it.isNotEmpty() } ?: ""
-                    val metadataUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
-                    val metaResponse = simpleHttpPost(
-                        metadataUrl,
-                        headers = mapOf("User-Agent" to userAgent, "Cookie" to cookie, "Content-Type" to "application/x-www-form-urlencoded")
-                    ) ?: continue
-                    val metadata = mapper.readTree(metaResponse)
-                    // Get FIRST direct video URL from "videos" array
-                    val videosNode = metadata?.get("videos")
-                    if (videosNode != null && videosNode.isArray) {
-                        for (v in videosNode) {
-                            val vUrl = v.get("url")?.asText()
-                            if (!vUrl.isNullOrEmpty()) {
-                                callback(
-                                    newExtractorLink(
-                                        source = serverName,
-                                        name = serverName,
-                                        url = vUrl,
-                                        type = if (vUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                                    ) {
-                                        this.referer = mainUrl
-                                        this.quality = Qualities.Unknown.value
-                                    }
-                                )
-                                foundAny = true
-                                break  // Got a direct URL, stop
-                            }
-                        }
-                    }
-                    if (foundAny) break
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                }
-            }
-
-            // 5. Google Photos — SINGLE HTTP extraction (HTML scraping)
-            else if (cleanUrl.contains("photos.google.com")) {
-                try {
-                    val agents = getAgents()
-                    val gPhotosHeaders = mutableMapOf<String, String>()
-                    val agent = agents?.gPhotosAgent?.takeIf { it.isNotEmpty() }
-                        ?: "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Mobile Safari/537.36"
-                    gPhotosHeaders["User-Agent"] = agent
-                    agents?.gPhotosCookie?.takeIf { it.isNotEmpty() }?.let { gPhotosHeaders["Cookie"] = it }
-                    val pageText = simpleHttpGet(cleanUrl, gPhotosHeaders) ?: continue
-                    val fixed = Regex("%(?![0-9a-fA-F]{2})").replace(pageText) { "%25" }
-                    val decoded = java.net.URLDecoder.decode(fixed, "UTF-8")
-                    // Extract video-downloads URL (Original quality) — direct video URL
-                    val videoDownloadPattern = Regex("""https://video-downloads\.googleusercontent\.com/[^"\\\s]+""")
-                    val videoUrl = videoDownloadPattern.find(decoded)?.value
-                    if (!videoUrl.isNullOrEmpty()) {
-                        callback(
-                            newExtractorLink(
-                                source = serverName,
-                                name = serverName,
-                                url = videoUrl,
-                                type = ExtractorLinkType.VIDEO
-                            ) {
-                                this.referer = mainUrl
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                        foundAny = true
-                        break  // Got a direct URL, stop
-                    }
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                }
-            }
-
-            // 6. Other — skip, try next server
         }
 
         return foundAny
