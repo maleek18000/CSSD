@@ -310,17 +310,12 @@ class AnimeDayProvider : MainAPI() {
                     metadata?.get("videos")?.takeIf { it.isArray }?.firstOrNull()?.let { it.get("url")?.asText() }
                 }
                 cleanUrl.contains("photos.google.com") -> {
-                    // CRASH FIX v44: Check cache first. When user long-presses
-                    // to copy, CloudStream calls loadLinks. When user plays,
-                    // it calls loadLinks again. Without cache, each call
-                    // re-fetches the Google Photos HTML page (slow). With
-                    // cache, first call fetches; subsequent calls are instant.
-                    val cached = googlePhotosUrlCache[cleanUrl]
-                    if (cached != null) return cached
-                    // CRASH FIX v42: Stream Google Photos HTML line-by-line
-                    // to find the video URL. Reads line-by-line and exits
-                    // immediately when the video URL is found, never holding
-                    // the full page in memory.
+                    // CRASH FIX v45: Stream Google Photos HTML line-by-line
+                    // to find the video URL. Optimized: only process lines
+                    // containing "video-downloads" (the URL marker), skipping
+                    // the expensive percent-decode + regex on 99% of lines.
+                    // This makes extraction much faster without loading the
+                    // full page into memory.
                     val agents = getAgents()
                     val gPhotosHeaders = mutableMapOf<String, String>()
                     gPhotosHeaders["User-Agent"] = agents?.gPhotosAgent?.takeIf { it.isNotEmpty() } ?: "Mozilla/5.0"
@@ -330,16 +325,19 @@ class AnimeDayProvider : MainAPI() {
                     try {
                         conn = (java.net.URL(cleanUrl).openConnection() as java.net.HttpURLConnection).apply {
                             requestMethod = "GET"
-                            connectTimeout = 10000
-                            readTimeout = 10000
+                            connectTimeout = 8000
+                            readTimeout = 8000
                             instanceFollowRedirects = true
                             gPhotosHeaders.forEach { (k, v) -> setRequestProperty(k, v) }
                         }
-                        // Read line-by-line, search for video URL, exit early
+                        // Read line-by-line. Skip lines without the marker
+                        // to avoid expensive processing on every line.
                         conn.inputStream.bufferedReader().use { reader ->
                             val pattern = Regex("""https://video-downloads\.googleusercontent\.com/[^"\\\s]+""")
                             while (true) {
                                 val line = reader.readLine() ?: break
+                                // Fast skip: only process lines containing the marker
+                                if (!line.contains("video-downloads")) continue
                                 val fixed = Regex("%(?![0-9a-fA-F]{2})").replace(line) { "%25" }
                                 val decoded = java.net.URLDecoder.decode(fixed, "UTF-8")
                                 val match = pattern.find(decoded)
@@ -350,10 +348,6 @@ class AnimeDayProvider : MainAPI() {
                             }
                         }
                     } catch (_: Exception) {} finally { conn?.disconnect() }
-                    // Cache the result so subsequent calls (play, copy, etc.) are instant
-                    if (!videoUrl.isNullOrEmpty()) {
-                        googlePhotosUrlCache[cleanUrl] = videoUrl!!
-                    }
                     videoUrl
                 }
                 else -> null
@@ -386,14 +380,6 @@ class AnimeDayProvider : MainAPI() {
             return size > 50  // Cache up to 50 resolved URLs
         }
     }
-
-    // CRASH FIX v44: Cache for resolved Google Photos video URLs.
-    // When user long-presses to copy, CloudStream calls loadLinks.
-    // When user plays, it calls loadLinks again. Without this cache,
-    // each call re-fetches the Google Photos HTML page (slow).
-    // With this cache, the first call fetches and caches; subsequent
-    // calls (copy, play, etc.) return instantly from cache.
-    private val googlePhotosUrlCache = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     // ==================== Video Extraction (OPTIMIZED) ====================
 
