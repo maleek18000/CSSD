@@ -132,6 +132,20 @@ class Arabp : MainAPI() {
         browseCache[url] = Pair(System.currentTimeMillis(), doc)
     }
 
+    // ---- Speed-up: home-page background prefetch ----
+    // Background scope for fire-and-forget prefetch of home-page carousels.
+    // Uses SupervisorJob so one failed prefetch doesn't cancel others.
+    private val prefetchScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // Cooldown to prevent repeated prefetch bursts. Set to 60s (same as cache TTL):
+    // - First home-page load: prefetch fires, caches all 11 carousels for 60s.
+    // - Within 60s: repeat loads are instant (cache hit). Prefetch on cooldown.
+    // - After 60s: cache expired, cooldown expired → next load triggers new prefetch.
+    @Volatile
+    private var lastPrefetchTimeMs = 0L
+    private val homePrefetchLock = Any()
+    private val PREFETCH_COOLDOWN_MS = 60_000L
+
     // ---- Speed-up: stale-while-revalidate cache ----
     // SEPARATE from the 60s fresh cache above. This stale cache has NO TTL — it
     // returns the last-known Document regardless of age. Used by fetchDocForBrowseCached:
@@ -162,19 +176,41 @@ class Arabp : MainAPI() {
     // wait on the lock and get the cached result. Saves ~10 duplicate requests.
     private val urlFetchLocks = ConcurrentHashMap<String, Any>()
 
-    // ---- Speed-up: home-page background prefetch ----
-    // Background scope for fire-and-forget prefetch of home-page carousels.
-    // Uses SupervisorJob so one failed prefetch doesn't cancel others.
-    private val prefetchScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-
-    // Cooldown to prevent repeated prefetch bursts. Set to 60s (same as cache TTL):
-    // - First home-page load: prefetch fires, caches all 11 carousels for 60s.
-    // - Within 60s: repeat loads are instant (cache hit). Prefetch on cooldown.
-    // - After 60s: cache expired, cooldown expired → next load triggers new prefetch.
+    // ---- Speed-up: eager login on plugin instantiation ----
+    // Fires login in the background the moment the plugin class is created, so by
+    // the time the user opens the home page, login is already done (or in flight).
+    // Without this, the first getMainPage() call blocks ~1-2s on login.
     @Volatile
-    private var lastPrefetchTimeMs = 0L
-    private val homePrefetchLock = Any()
-    private val PREFETCH_COOLDOWN_MS = 60_000L
+    private var eagerLoginTriggered = false
+
+    /**
+     * Eager background login — fires the moment the plugin is instantiated.
+     * CloudStream creates the plugin class when the user opens the home page;
+     * by the time getMainPage() is called, login is already in flight (or done).
+     * This eliminates the ~1-2s login delay from the critical path of the first
+     * home-page load. IP-ban safe: ensureLogin() has loginLock dedup, so even if
+     * getMainPage() also calls ensureLogin(), only ONE login HTTP request happens.
+     */
+    init {
+        triggerEagerLogin()
+    }
+
+    private fun triggerEagerLogin() {
+        if (eagerLoginTriggered) return
+        synchronized(this) {
+            if (eagerLoginTriggered) return
+            eagerLoginTriggered = true
+        }
+        Log.d(TAG, "triggerEagerLogin: firing background login on plugin init")
+        prefetchScope.launch {
+            try {
+                ensureLogin()
+                Log.d(TAG, "triggerEagerLogin: background login complete")
+            } catch (e: Exception) {
+                Log.w(TAG, "triggerEagerLogin: background login failed: ${e.message}")
+            }
+        }
+    }
 
     private fun randomUserAgent(): String =
         USER_AGENTS[kotlin.random.Random.nextInt(USER_AGENTS.size)]
@@ -594,7 +630,7 @@ class Arabp : MainAPI() {
         }
 
         // Tier 2: Stale cache hit (>60s) — return immediately, refresh in background.
-        // This is what makes the home page feel "almost instant" on repeat visits.
+        // This is what makes the home page feel "instant" on repeat visits.
         val staleDoc = getCachedStaleBrowseDoc(url)
         if (staleDoc != null) {
             Log.d(TAG, "fetchDocForBrowseCached: STALE HIT for $url — returning stale, refreshing in background")
