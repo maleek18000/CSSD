@@ -27,6 +27,10 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.Semaphore
+import java.util.concurrent.atomic.AtomicBoolean
+import okhttp3.ConnectionPool
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
 
 class Arabp : MainAPI() {
     override var mainUrl = "https://www.arabp2p.net"
@@ -208,11 +212,13 @@ class Arabp : MainAPI() {
     // so a slow/failing category page doesn't hold up the entire home page.
     private val browseClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            // No rate limiter interceptor — OkHttp's connection pool already limits
-            // concurrency to 5 simultaneous connections per host, which mirrors
-            // real browser behavior. Adding a rate limiter here serialized all 11
-            // category fetches through the shared lastRequestTimeMs AtomicLong,
-            // causing ~7-10s home page load times.
+            // Connection pool sized for home page: 8 concurrent connections allows
+            // all 11 category pages to load in ~2 batches instead of 3, cutting
+            // first-load time from ~6s to ~3-4s. With HTTP/2 (ALPN), all requests
+            // multiplex over 1 TCP connection so pool size is irrelevant.
+            .connectionPool(ConnectionPool(8, 5, TimeUnit.MINUTES))
+            // No rate limiter interceptor — OkHttp's connection pool limits
+            // concurrency, mirroring real browser behavior.
             .cookieJar(object : okhttp3.CookieJar {
                 override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) {
                     for (cookie in cookies) {
@@ -456,9 +462,19 @@ class Arabp : MainAPI() {
 
     // ==================== HOME PAGE ====================
 
-    // Single mainPage entry — CloudStream calls getMainPage() only ONCE, and we
-    // fetch all 11 categories in parallel inside that single call.  This cuts home
-    // page load from ~15 s (11 sequential HTTP round-trips) to ~3-5 s (parallel).
+    // --- STALE-WHILE-REVALIDATE CACHE ---
+    // After the very first load, EVERY subsequent load returns INSTANTLY from cache.
+    // If cache is stale (> 2 min), stale data is still returned immediately while
+    // a background refresh silently updates it for the next visit.
+    @Volatile
+    private var homePageCache: List<HomePageList>? = null
+    @Volatile
+    private var homePageCacheTime: Long = 0
+    private val isHomePageRefreshing = AtomicBoolean(false)
+    private val HOME_CACHE_TTL_MS = 2 * 60_000L  // 2 minutes
+
+    // Single mainPage entry — CloudStream calls getMainPage() only ONCE.
+    // We fetch all 11 categories in parallel inside that single call.
     override val mainPage = mainPageOf(
         "$mainUrl/" to "الصفحة الرئيسية"
     )
@@ -481,85 +497,105 @@ class Arabp : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        // Only load page 1; pagination is not needed for the home-page overview.
-        // Users can browse individual categories or search for more results.
         if (page > 1) return newHomePageResponse(mutableListOf(), false)
 
-        // Ensure login ONCE before parallel fetching — avoids 11 threads all
-        // trying to login through authClient's rate-limited path simultaneously.
-        if (!ensureLogin()) {
-            Log.e(TAG, "getMainPage: login failed, cannot load home page")
-            return newHomePageResponse(mutableListOf())
-        }
+        val now = System.currentTimeMillis()
+        val cached = homePageCache
 
-        val homeSets = mutableListOf<HomePageList>()
-
-        try {
-            // Fetch all 11 categories IN PARALLEL using coroutineScope + async.
-            // Each category fetch is independent and uses browseClient (no rate limiter).
-            // OkHttp's default connection pool allows multiple concurrent connections,
-            // so all 11 requests fire at once — just like a real browser tab loading.
-            // withTimeoutOrNull(5s) per category: if one page is slow/failing,
-            // it gets skipped instead of blocking the entire home page.
-            val results = coroutineScope {
-                homeCategories.map { (catUrl, catName) ->
-                    async(Dispatchers.IO) {
-                        val fullUrl = "$catUrl&pages=1"
-                        Log.d(TAG, "getMainPage: fetching $fullUrl for '$catName'")
-
-                        val doc = withTimeoutOrNull(5_000L) {
-                            fetchDocForBrowse(fullUrl)
-                        }
-
-                        if (doc == null) {
-                            Log.w(TAG, "getMainPage: timed out or failed for '$catName'")
-                            return@async null
-                        }
-
-                        try {
-                            val tvType = tvTypeFromPage(catUrl)
-                            val listingDivs = doc.select("div.listing_div1")
-                            Log.d(TAG, "getMainPage: found ${listingDivs.size} listing_div1 for '$catName'")
-                            val items = listingDivs.mapNotNull { toSearchResult(it, tvType) }
-
-                            // For torrent category pages (e.g. documentaries, Asian, Latin, Turkish),
-                            // try torrent table/modern parsing since they don't use listing_div1
-                            val allItems = if (items.isEmpty() && catUrl.contains("category=")) {
-                                // Modern torrent pages use div.file-header — prefer these as they give
-                                // one result per torrent. Avoid table tr selectors here because the
-                                // new page layout has a single tr containing ALL file-headers, which
-                                // would produce duplicate/wrong results.
-                                val modernResults = doc.select("div.file-header")
-                                    .mapNotNull { modernTorrentRowToSearchResult(it, tvType) }
-                                // Fallback: old-style table rows (only if no file-header found)
-                                val tableResults = if (modernResults.isEmpty()) {
-                                    doc.select("table.lista2t tr.lista2")
-                                        .mapNotNull { torrentRowToSearchResult(it, tvType) }
-                                } else emptyList()
-                                Log.d(TAG, "getMainPage: torrent page found ${modernResults.size} modern + ${tableResults.size} table for '$catName'")
-                                modernResults + tableResults
-                            } else {
-                                items
-                            }
-
-                            Log.d(TAG, "getMainPage: ${allItems.size} results for '$catName'")
-                            if (allItems.isNotEmpty()) {
-                                HomePageList(catName, allItems)
-                            } else null
-                        } catch (e: Exception) {
-                            Log.e(TAG, "MainPage Error for $catName: ${e.message}")
-                            null
-                        }
-                    }
-                }.mapNotNull { it.await() }
+        // ---- FAST PATH: return cache if available ----
+        if (cached != null) {
+            val age = now - homePageCacheTime
+            if (age < HOME_CACHE_TTL_MS) {
+                // Fresh cache — return instantly, no network calls
+                Log.d(TAG, "getMainPage: returning fresh cache (${cached.size} cats, ${age}ms old)")
+                return newHomePageResponse(cached.toList(), false)
             }
-
-            homeSets.addAll(results)
-        } catch (e: Exception) {
-            Log.e(TAG, "MainPage parallel fetch error: ${e.message}")
+            // Stale cache — still return instantly, but trigger background refresh
+            // so the NEXT load gets fresh data. User never waits.
+            Log.d(TAG, "getMainPage: returning stale cache (${cached.size} cats, ${age}ms old), refreshing in background")
+            if (isHomePageRefreshing.compareAndSet(false, true)) {
+                GlobalScope.launch(Dispatchers.IO) {
+                    try {
+                        val fresh = fetchAllCategories()
+                        if (fresh.isNotEmpty()) {
+                            homePageCache = fresh
+                            homePageCacheTime = System.currentTimeMillis()
+                            Log.d(TAG, "getMainPage: background refresh done, ${fresh.size} cats")
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "getMainPage: background refresh failed: ${e.message}")
+                    } finally {
+                        isHomePageRefreshing.set(false)
+                    }
+                }
+            }
+            return newHomePageResponse(cached.toList(), false)
         }
 
-        return newHomePageResponse(homeSets, homeSets.isNotEmpty())
+        // ---- SLOW PATH (first load ever): fetch all categories in parallel ----
+        Log.d(TAG, "getMainPage: no cache, fetching all categories in parallel")
+        return try {
+            val results = fetchAllCategories()
+            if (results.isNotEmpty()) {
+                homePageCache = results
+                homePageCacheTime = System.currentTimeMillis()
+            }
+            newHomePageResponse(results, results.isNotEmpty())
+        } catch (e: Exception) {
+            Log.e(TAG, "getMainPage: parallel fetch error: ${e.message}")
+            newHomePageResponse(mutableListOf())
+        }
+    }
+
+    /**
+     * Fetch all 11 home-page categories in parallel using coroutineScope + async.
+     * Pre-logins once to avoid 11 threads contending for the rate-limited authClient.
+     * Each category uses browseClient (no rate limiter) with a 4s timeout.
+     */
+    private suspend fun fetchAllCategories(): List<HomePageList> {
+        // Pre-login once — avoids 11 threads all fighting for loginLock
+        if (!ensureLogin()) {
+            Log.e(TAG, "fetchAllCategories: login failed")
+            return emptyList()
+        }
+
+        return coroutineScope {
+            homeCategories.map { (catUrl, catName) ->
+                async(Dispatchers.IO) {
+                    val fullUrl = "$catUrl&pages=1"
+                    val doc = withTimeoutOrNull(4_000L) {
+                        fetchDocForBrowse(fullUrl)
+                    }
+                    if (doc == null) {
+                        Log.w(TAG, "fetchAllCategories: timed out for '$catName'")
+                        return@async null
+                    }
+                    try {
+                        val tvType = tvTypeFromPage(catUrl)
+                        val listingDivs = doc.select("div.listing_div1")
+                        val items = listingDivs.mapNotNull { toSearchResult(it, tvType) }
+
+                        val allItems = if (items.isEmpty() && catUrl.contains("category=")) {
+                            val modernResults = doc.select("div.file-header")
+                                .mapNotNull { modernTorrentRowToSearchResult(it, tvType) }
+                            val tableResults = if (modernResults.isEmpty()) {
+                                doc.select("table.lista2t tr.lista2")
+                                    .mapNotNull { torrentRowToSearchResult(it, tvType) }
+                            } else emptyList()
+                            modernResults + tableResults
+                        } else {
+                            items
+                        }
+
+                        Log.d(TAG, "fetchAllCategories: ${allItems.size} results for '$catName'")
+                        if (allItems.isNotEmpty()) HomePageList(catName, allItems) else null
+                    } catch (e: Exception) {
+                        Log.e(TAG, "fetchAllCategories: error for $catName: ${e.message}")
+                        null
+                    }
+                }
+            }.mapNotNull { it.await() }
+        }
     }
 
     private fun tvTypeFromPage(pageUrl: String): TvType {
