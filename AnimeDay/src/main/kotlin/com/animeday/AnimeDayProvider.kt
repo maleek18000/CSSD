@@ -225,8 +225,10 @@ class AnimeDayProvider : MainAPI() {
     }
 
 
-    // CRASH FIX v31: HttpURLConnection helpers (bypass OkHttp's unbounded thread pool).
-    private fun simpleHttpGet(url: String, headers: Map<String, String> = emptyMap()): String? {
+    // CRASH FIX v31/v41: HttpURLConnection helpers (bypass OkHttp's unbounded thread pool).
+    // v41: added maxBytes param to limit response size (prevents crash when
+    // fetching large Google Photos HTML pages on phones/TVs).
+    private fun simpleHttpGet(url: String, headers: Map<String, String> = emptyMap(), maxBytes: Int = 0): String? {
         var conn: java.net.HttpURLConnection? = null
         return try {
             conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
@@ -236,7 +238,14 @@ class AnimeDayProvider : MainAPI() {
                 instanceFollowRedirects = true
                 headers.forEach { (k, v) -> setRequestProperty(k, v) }
             }
-            conn.inputStream.bufferedReader().use { it.readText() }
+            if (maxBytes > 0) {
+                // Read at most maxBytes (prevents OOM on large responses)
+                val buffer = ByteArray(maxBytes)
+                val read = conn.inputStream.use { it.read(buffer) }
+                if (read > 0) String(buffer, 0, read, Charsets.UTF_8) else null
+            } else {
+                conn.inputStream.bufferedReader().use { it.readText() }
+            }
         } catch (e: Exception) { null }
         finally { conn?.disconnect() }
     }
@@ -314,7 +323,10 @@ class AnimeDayProvider : MainAPI() {
                     val gPhotosHeaders = mutableMapOf<String, String>()
                     gPhotosHeaders["User-Agent"] = agents?.gPhotosAgent?.takeIf { it.isNotEmpty() } ?: "Mozilla/5.0"
                     agents?.gPhotosCookie?.takeIf { it.isNotEmpty() }?.let { gPhotosHeaders["Cookie"] = it }
-                    val pageText = simpleHttpGet(cleanUrl, gPhotosHeaders) ?: return null
+                    // CRASH FIX v41: Limit response to 500KB. Google Photos
+                    // pages can be 1-2MB; fetching the full page + regex
+                    // crashes phones/TVs. The video URL is in the first part.
+                    val pageText = simpleHttpGet(cleanUrl, gPhotosHeaders, maxBytes = 500000) ?: return null
                     val fixed = Regex("%(?![0-9a-fA-F]{2})").replace(pageText) { "%25" }
                     val decoded = java.net.URLDecoder.decode(fixed, "UTF-8")
                     Regex("""https://video-downloads\.googleusercontent\.com/[^"\\\s]+""").find(decoded)?.value
@@ -1076,23 +1088,8 @@ class AnimeDayProvider : MainAPI() {
                 val (rawUrl, needsExtraction) = urlAndExtraction
                 if (rawUrl.isBlank()) return@forEachIndexed
 
-                // CRASH FIX v39: Pre-resolve ONLY Google Photos URLs here (in
-                // load(), safe — no player competition). Google Photos URLs
-                // (photos.google.com) require HTML scraping to extract the
-                // direct video-downloads URL. Doing this in loadLinks crashes
-                // phones/TVs because CloudStream calls loadLinks when long-
-                // pressing/copying/opening-with-another-app (not just playing).
-                // By pre-resolving here, loadLinks gets a direct video URL and
-                // resolveSingleUrl returns it instantly (ZERO HTTP) via the
-                // isDirectVideoUrl check. All other servers stay exactly as v31.
-                val storedUrl = if (rawUrl.contains("photos.google.com")) {
-                    try { resolveSingleUrl(rawUrl) ?: rawUrl } catch (_: Exception) { rawUrl }
-                } else {
-                    rawUrl
-                }
-
                 // Store ONE server's data — loadLinks will resolve ONLY this one
-                val singleLinkData = SingleLinkData(serverName, storedUrl, needsExtraction)
+                val singleLinkData = SingleLinkData(serverName, rawUrl, needsExtraction)
 
                 cloudstreamEpisodes.add(newEpisode(singleLinkData.toJson()) {
                     this.name = serverName  // Show server name as episode name
