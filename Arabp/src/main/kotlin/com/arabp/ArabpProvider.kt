@@ -6,7 +6,6 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.SubtitleFile
-import okhttp3.ConnectionPool
 import okhttp3.FormBody
 import okhttp3.Headers.Companion.toHeaders
 import okhttp3.OkHttpClient
@@ -198,22 +197,22 @@ class Arabp : MainAPI() {
             .build()
     }
 
-    // Separate client for HOME PAGE BROWSING, SEARCH, and LOGIN.
-    // NO rate limiter and NO Semaphore — relies on OkHttp's connection pool
-    // (11 idle connections per host) which is exactly how real browsers behave
-    // when loading a page with many resources. Home page browsing is the most
-    // natural-looking traffic pattern and does not need artificial delays.
-    // This allows 11 category pages to load in ~3-5s instead of ~15s+.
+    // Separate client for HOME PAGE BROWSING and SEARCH only.
+    // NO rate limiter and NO Semaphore — relies on OkHttp's default connection
+    // pool (5 concurrent connections per host) which is exactly how real browsers
+    // behave. Home page browsing is the most natural-looking traffic pattern and
+    // does not need artificial delays. This allows 11 category pages to load in
+    // ~2-4 seconds instead of ~7-10 seconds with the previous 300ms limiter.
     // Anti-blocking for torrent downloads and detail pages still goes through authClient.
     // Shares the same cookieManager for auth, but has shorter timeouts
     // so a slow/failing category page doesn't hold up the entire home page.
     private val browseClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            // No rate limiter interceptor — OkHttp's connection pool limits
-            // concurrency naturally. Adding a rate limiter serialized all 11
+            // No rate limiter interceptor — OkHttp's connection pool already limits
+            // concurrency to 5 simultaneous connections per host, which mirrors
+            // real browser behavior. Adding a rate limiter here serialized all 11
             // category fetches through the shared lastRequestTimeMs AtomicLong,
-            // causing ~15s+ home page load times.
-            .connectionPool(ConnectionPool(11, 1, TimeUnit.MINUTES))
+            // causing ~7-10s home page load times.
             .cookieJar(object : okhttp3.CookieJar {
                 override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) {
                     for (cookie in cookies) {
@@ -243,8 +242,8 @@ class Arabp : MainAPI() {
                     }
                 }
             })
-            .connectTimeout(6, TimeUnit.SECONDS)
-            .readTimeout(10, TimeUnit.SECONDS)
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
             .followRedirects(true)
             .followSslRedirects(true)
             .build()
@@ -304,17 +303,11 @@ class Arabp : MainAPI() {
             if (isSessionAlive()) return true
 
             return try {
-                // Use browseClient for login (NO rate limiter, NO Semaphore).
-                // Previously used authClient which has Semaphore(1) + 1500ms rate limiter,
-                // making login take ~5-10s. With browseClient, login takes ~2-3s.
-                // Both clients share the same cookieManager, so session cookies
-                // are available to both. Login is a natural infrequent action
-                // (2 requests: GET + POST) and does not need rate limiting.
                 val initRequest = Request.Builder()
                     .url("$mainUrl/index.php?page=login")
-                    .headers(getAuthHeaders().toHeaders())
+                    .header("User-Agent", randomUserAgent())
                     .build()
-                browseClient.newCall(initRequest).execute().use { response ->
+                authClient.newCall(initRequest).execute().use { response ->
                     Log.d(TAG, "Init login page: ${response.code}")
                 }
 
@@ -326,10 +319,11 @@ class Arabp : MainAPI() {
                 val loginRequest = Request.Builder()
                     .url("$mainUrl/index.php?page=login&returnto=index.php")
                     .post(formBody)
-                    .headers(getAuthHeaders(referer = "$mainUrl/index.php?page=login").toHeaders())
+                    .header("User-Agent", randomUserAgent())
+                    .header("Referer", "$mainUrl/index.php?page=login")
                     .build()
 
-                browseClient.newCall(loginRequest).execute().use { response ->
+                authClient.newCall(loginRequest).execute().use { response ->
                     val body = response.body?.string() ?: ""
                     val cookiesAfterLogin = getSessionCookies()
                     Log.d(TAG, "Login response: code=${response.code}, cookies=$cookiesAfterLogin")
@@ -462,86 +456,110 @@ class Arabp : MainAPI() {
 
     // ==================== HOME PAGE ====================
 
+    // Single mainPage entry — CloudStream calls getMainPage() only ONCE, and we
+    // fetch all 11 categories in parallel inside that single call.  This cuts home
+    // page load from ~15 s (11 sequential HTTP round-trips) to ~3-5 s (parallel).
     override val mainPage = mainPageOf(
-        "$mainUrl/index.php?page=anime-listing" to "قائمة الانمي",
-        "$mainUrl/index.php?page=tv-listing" to "مسلسلات عربية",
-        "$mainUrl/index.php?page=movies-listing" to "أفلام عربية",
-        "$mainUrl/index.php?page=torrents&category=19" to "وثائقيات",
-        "$mainUrl/index.php?page=torrents&category=88" to "أفلام مدبلجة للعربية",
-        "$mainUrl/index.php?page=torrents&category=90" to "برامج و مسابقات",
-        "$mainUrl/index.php?page=torrents&category=93" to "وثائقيات مترجمة",
-        "$mainUrl/index.php?page=torrents&active=0&category=113" to "مسلسلات لاتينية",
-        "$mainUrl/index.php?page=torrents&active=0&category=57" to "مسلسلات آسيوية",
-        "$mainUrl/index.php?page=torrents&active=0&category=71" to "مسلسلات مدبلجة للعربية",
-        "$mainUrl/index.php?page=torrents&active=0&category=115" to "مسلسلات تركية"
+        "$mainUrl/" to "الصفحة الرئيسية"
+    )
+
+    // All 11 home-page categories, fetched concurrently inside getMainPage().
+    private data class HomeCategory(val url: String, val name: String)
+
+    private val homeCategories = listOf(
+        HomeCategory("$mainUrl/index.php?page=anime-listing", "قائمة الانمي"),
+        HomeCategory("$mainUrl/index.php?page=tv-listing", "مسلسلات عربية"),
+        HomeCategory("$mainUrl/index.php?page=movies-listing", "أفلام عربية"),
+        HomeCategory("$mainUrl/index.php?page=torrents&category=19", "وثائقيات"),
+        HomeCategory("$mainUrl/index.php?page=torrents&category=88", "أفلام مدبلجة للعربية"),
+        HomeCategory("$mainUrl/index.php?page=torrents&category=90", "برامج و مسابقات"),
+        HomeCategory("$mainUrl/index.php?page=torrents&category=93", "وثائقيات مترجمة"),
+        HomeCategory("$mainUrl/index.php?page=torrents&active=0&category=113", "مسلسلات لاتينية"),
+        HomeCategory("$mainUrl/index.php?page=torrents&active=0&category=57", "مسلسلات آسيوية"),
+        HomeCategory("$mainUrl/index.php?page=torrents&active=0&category=71", "مسلسلات مدبلجة للعربية"),
+        HomeCategory("$mainUrl/index.php?page=torrents&active=0&category=115", "مسلسلات تركية")
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        // PRE-LOGIN OUTSIDE THE TIMEOUT: This is the critical optimization.
-        // Previously, ensureLogin() was called inside fetchDocForBrowse(), which is
-        // inside withTimeoutOrNull(). When 11 categories load concurrently, the first
-        // thread does the login (~2-3s via browseClient), while the other 10 wait on
-        // loginLock. If login was inside the timeout, it would eat into the 10-15s
-        // budget, leaving little time for the actual HTTP request. By pre-logging in
-        // OUTSIDE the timeout, the full 10s is available for the category fetch.
-        // After login, fetchDocForBrowse()'s ensureLogin() hits the fast path
-        // (isSessionAlive() returns true) and returns instantly — no lock contention.
+        // Only load page 1; pagination is not needed for the home-page overview.
+        // Users can browse individual categories or search for more results.
+        if (page > 1) return newHomePageResponse(mutableListOf(), false)
+
+        // Ensure login ONCE before parallel fetching — avoids 11 threads all
+        // trying to login through authClient's rate-limited path simultaneously.
         if (!ensureLogin()) {
-            Log.w(TAG, "getMainPage: login failed, returning empty for '${request.name}'")
+            Log.e(TAG, "getMainPage: login failed, cannot load home page")
             return newHomePageResponse(mutableListOf())
         }
 
-        // Always use &pages=$page to ensure the site returns only one page of results.
-        val url = "${request.data}&pages=$page"
-        Log.d(TAG, "getMainPage: fetching $url for '${request.name}' (page=$page)")
-
-        // Since login is already done (pre-login above), fetchDocForBrowse() will
-        // skip ensureLogin() (fast path) and go straight to the HTTP request.
-        // 10s timeout per category — enough for normal responses, fast failure for slow ones.
-        val doc = withTimeoutOrNull(10_000L) {
-            fetchDocForBrowse(url)
-        }
-        if (doc == null) {
-            Log.w(TAG, "getMainPage: fetchDocForBrowse timed out or failed for $url")
-            return newHomePageResponse(mutableListOf())
-        }
         val homeSets = mutableListOf<HomePageList>()
 
         try {
-            val tvType = tvTypeFromPage(request.data)
-            val listingDivs = doc.select("div.listing_div1")
-            Log.d(TAG, "getMainPage: found ${listingDivs.size} listing_div1 elements for '${request.name}'")
-            val items = listingDivs.mapNotNull { toSearchResult(it, tvType) }
+            // Fetch all 11 categories IN PARALLEL using coroutineScope + async.
+            // Each category fetch is independent and uses browseClient (no rate limiter).
+            // OkHttp's default connection pool allows multiple concurrent connections,
+            // so all 11 requests fire at once — just like a real browser tab loading.
+            // withTimeoutOrNull(5s) per category: if one page is slow/failing,
+            // it gets skipped instead of blocking the entire home page.
+            val results = coroutineScope {
+                homeCategories.map { (catUrl, catName) ->
+                    async(Dispatchers.IO) {
+                        val fullUrl = "$catUrl&pages=1"
+                        Log.d(TAG, "getMainPage: fetching $fullUrl for '$catName'")
 
-            // For torrent category pages (e.g. documentaries, Asian, Latin, Turkish),
-            // try torrent table/modern parsing since they don't use listing_div1
-            val allItems = if (items.isEmpty() && request.data.contains("category=")) {
-                // Modern torrent pages use div.file-header — prefer these as they give
-                // one result per torrent. Avoid table tr selectors here because the
-                // new page layout has a single tr containing ALL file-headers, which
-                // would produce duplicate/wrong results.
-                val modernResults = doc.select("div.file-header")
-                    .mapNotNull { modernTorrentRowToSearchResult(it, tvType) }
-                // Fallback: old-style table rows (only if no file-header found)
-                val tableResults = if (modernResults.isEmpty()) {
-                    doc.select("table.lista2t tr.lista2")
-                        .mapNotNull { torrentRowToSearchResult(it, tvType) }
-                } else emptyList()
-                Log.d(TAG, "getMainPage: torrent page found ${modernResults.size} modern + ${tableResults.size} table results for '${request.name}'")
-                modernResults + tableResults
-            } else {
-                items
+                        val doc = withTimeoutOrNull(5_000L) {
+                            fetchDocForBrowse(fullUrl)
+                        }
+
+                        if (doc == null) {
+                            Log.w(TAG, "getMainPage: timed out or failed for '$catName'")
+                            return@async null
+                        }
+
+                        try {
+                            val tvType = tvTypeFromPage(catUrl)
+                            val listingDivs = doc.select("div.listing_div1")
+                            Log.d(TAG, "getMainPage: found ${listingDivs.size} listing_div1 for '$catName'")
+                            val items = listingDivs.mapNotNull { toSearchResult(it, tvType) }
+
+                            // For torrent category pages (e.g. documentaries, Asian, Latin, Turkish),
+                            // try torrent table/modern parsing since they don't use listing_div1
+                            val allItems = if (items.isEmpty() && catUrl.contains("category=")) {
+                                // Modern torrent pages use div.file-header — prefer these as they give
+                                // one result per torrent. Avoid table tr selectors here because the
+                                // new page layout has a single tr containing ALL file-headers, which
+                                // would produce duplicate/wrong results.
+                                val modernResults = doc.select("div.file-header")
+                                    .mapNotNull { modernTorrentRowToSearchResult(it, tvType) }
+                                // Fallback: old-style table rows (only if no file-header found)
+                                val tableResults = if (modernResults.isEmpty()) {
+                                    doc.select("table.lista2t tr.lista2")
+                                        .mapNotNull { torrentRowToSearchResult(it, tvType) }
+                                } else emptyList()
+                                Log.d(TAG, "getMainPage: torrent page found ${modernResults.size} modern + ${tableResults.size} table for '$catName'")
+                                modernResults + tableResults
+                            } else {
+                                items
+                            }
+
+                            Log.d(TAG, "getMainPage: ${allItems.size} results for '$catName'")
+                            if (allItems.isNotEmpty()) {
+                                HomePageList(catName, allItems)
+                            } else null
+                        } catch (e: Exception) {
+                            Log.e(TAG, "MainPage Error for $catName: ${e.message}")
+                            null
+                        }
+                    }
+                }.mapNotNull { it.await() }
             }
 
-            Log.d(TAG, "getMainPage: ${allItems.size} search results for '${request.name}'")
-            if (allItems.isNotEmpty()) {
-                homeSets.add(HomePageList(request.name, allItems))
-            }
-            return newHomePageResponse(homeSets, allItems.isNotEmpty())
+            homeSets.addAll(results)
         } catch (e: Exception) {
-            Log.e(TAG, "MainPage Error: ${e.message}")
+            Log.e(TAG, "MainPage parallel fetch error: ${e.message}")
         }
-        return newHomePageResponse(homeSets)
+
+        return newHomePageResponse(homeSets, homeSets.isNotEmpty())
     }
 
     private fun tvTypeFromPage(pageUrl: String): TvType {
@@ -625,9 +643,6 @@ class Arabp : MainAPI() {
     // ==================== SEARCH ====================
 
     override suspend fun search(query: String): List<SearchResponse> {
-        // Pre-login so fetchDocForBrowse() hits the fast path (no login delay inside each fetch)
-        ensureLogin()
-
         val encoded = URLEncoder.encode(query, "UTF-8")
         val results = mutableListOf<SearchResponse>()
         val queryLower = query.lowercase().trim()
