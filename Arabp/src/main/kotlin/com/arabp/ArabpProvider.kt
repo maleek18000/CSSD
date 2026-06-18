@@ -22,6 +22,9 @@ import java.net.URI
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.Semaphore
@@ -77,6 +80,19 @@ class Arabp : MainAPI() {
     // Semaphore to enforce MAX_CONCURRENT_REQUESTS. Prevents parallel async() in load()
     // from firing many HTTP requests simultaneously.
     private val requestSemaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
+
+    // ---- Speed-up state (search + home page only) ----
+    // Limits concurrent in-flight BROWSE requests (home page carousels + search pages).
+    // 3 permits = browser-like parallelism (Chrome uses ~6 per host). Plenty fast for
+    // 11 home-page carousels + 4 search pages, while staying gentle on the server.
+    private val browseSemaphore = Semaphore(3)
+
+    // Lock to prevent thundering-herd login. When 11 home-page carousels fire at once,
+    // without this lock all 11 would enter ensureLogin() simultaneously and serialize
+    // through authClient's semaphore (1 permit) — taking 11 * ~3s = ~33s on first load.
+    // With this lock, only the first coroutine logs in; the rest wait, then see
+    // isLoggedIn=true via the double-check and skip immediately.
+    private val loginLock = Any()
 
     private fun randomUserAgent(): String =
         USER_AGENTS[kotlin.random.Random.nextInt(USER_AGENTS.size)]
@@ -198,22 +214,19 @@ class Arabp : MainAPI() {
     private val browseClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .addInterceptor { chain ->
-                // Light rate limiter for browse requests: 300ms minimum + 0-300ms jitter.
-                // Fast enough for home page (11 categories in ~5s), gentle enough
-                // to not trigger IP blocking (browsers routinely make 6+ concurrent requests).
-                while (true) {
-                    val now = System.currentTimeMillis()
-                    val last = lastRequestTimeMs.get()
-                    val elapsed = now - last
-                    if (elapsed < 300L) {
-                        val delay = 300L - elapsed +
-                            kotlin.random.Random.nextLong(0, 300)
-                        try { Thread.sleep(delay) } catch (_: InterruptedException) {}
-                    }
-                    val newNow = System.currentTimeMillis()
-                    if (lastRequestTimeMs.compareAndSet(last, newNow)) break
+                // Speed-up: use browseSemaphore (3 permits) instead of the SHARED
+                // lastRequestTimeMs CAS loop. The previous implementation shared
+                // lastRequestTimeMs with authClient's 1500ms limiter, which caused
+                // browse requests to be throttled to 1500-1800ms intervals even
+                // though the intent was 300ms. The semaphore gives TRUE parallelism
+                // (up to 3 in-flight HTTP requests at once, no artificial sleep)
+                // while keeping the server load browser-like and IP-ban-safe.
+                browseSemaphore.acquire()
+                try {
+                    chain.proceed(chain.request())
+                } finally {
+                    browseSemaphore.release()
                 }
-                chain.proceed(chain.request())
             }
             .cookieJar(object : okhttp3.CookieJar {
                 override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) {
@@ -296,51 +309,62 @@ class Arabp : MainAPI() {
     }
 
     private fun ensureLogin(): Boolean {
+        // Fast path — no lock needed if already logged in.
         if (isSessionAlive()) return true
 
-        return try {
-            val initRequest = Request.Builder()
-                .url("$mainUrl/index.php?page=login")
-                .header("User-Agent", randomUserAgent())
-                .build()
-            authClient.newCall(initRequest).execute().use { response ->
-                Log.d(TAG, "Init login page: ${response.code}")
-            }
+        // Slow path — acquire loginLock to prevent thundering-herd login attempts.
+        // Without this, when 11 home-page carousels fire at once, all 11 would enter
+        // ensureLogin() simultaneously and serialize through authClient's semaphore
+        // (1 permit, 1500ms rate limit), taking 11 * ~3s = ~33s on first home-page load.
+        synchronized(loginLock) {
+            // Double-check inside the lock — another coroutine may have logged in
+            // while we were waiting.
+            if (isSessionAlive()) return true
 
-            val formBody = FormBody.Builder()
-                .add("uid", LOGIN_USERNAME)
-                .add("pwd", LOGIN_PASSWORD)
-                .build()
-
-            val loginRequest = Request.Builder()
-                .url("$mainUrl/index.php?page=login&returnto=index.php")
-                .post(formBody)
-                .header("User-Agent", randomUserAgent())
-                .header("Referer", "$mainUrl/index.php?page=login")
-                .build()
-
-            authClient.newCall(loginRequest).execute().use { response ->
-                val body = response.body?.string() ?: ""
-                val cookiesAfterLogin = getSessionCookies()
-                Log.d(TAG, "Login response: code=${response.code}, cookies=$cookiesAfterLogin")
-
-                val loginSuccess = response.code == 302 ||
-                        cookiesAfterLogin.contains("uid_") ||
-                        body.contains("logout.php") ||
-                        body.contains("page=logout") ||
-                        body.contains(LOGIN_USERNAME)
-
-                if (loginSuccess) {
-                    isLoggedIn = true
-                    Log.d(TAG, "Login SUCCESS! Cookies: $cookiesAfterLogin")
-                } else {
-                    Log.e(TAG, "Login FAILED. Response code=${response.code}, snippet: ${body.take(300)}")
+            return try {
+                val initRequest = Request.Builder()
+                    .url("$mainUrl/index.php?page=login")
+                    .header("User-Agent", randomUserAgent())
+                    .build()
+                authClient.newCall(initRequest).execute().use { response ->
+                    Log.d(TAG, "Init login page: ${response.code}")
                 }
-                loginSuccess
+
+                val formBody = FormBody.Builder()
+                    .add("uid", LOGIN_USERNAME)
+                    .add("pwd", LOGIN_PASSWORD)
+                    .build()
+
+                val loginRequest = Request.Builder()
+                    .url("$mainUrl/index.php?page=login&returnto=index.php")
+                    .post(formBody)
+                    .header("User-Agent", randomUserAgent())
+                    .header("Referer", "$mainUrl/index.php?page=login")
+                    .build()
+
+                authClient.newCall(loginRequest).execute().use { response ->
+                    val body = response.body?.string() ?: ""
+                    val cookiesAfterLogin = getSessionCookies()
+                    Log.d(TAG, "Login response: code=${response.code}, cookies=$cookiesAfterLogin")
+
+                    val loginSuccess = response.code == 302 ||
+                            cookiesAfterLogin.contains("uid_") ||
+                            body.contains("logout.php") ||
+                            body.contains("page=logout") ||
+                            body.contains(LOGIN_USERNAME)
+
+                    if (loginSuccess) {
+                        isLoggedIn = true
+                        Log.d(TAG, "Login SUCCESS! Cookies: $cookiesAfterLogin")
+                    } else {
+                        Log.e(TAG, "Login FAILED. Response code=${response.code}, snippet: ${body.take(300)}")
+                    }
+                    loginSuccess
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Login Error: ${e.message}")
+                false
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Login Error: ${e.message}")
-            false
         }
     }
 
@@ -604,7 +628,6 @@ class Arabp : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val encoded = URLEncoder.encode(query, "UTF-8")
-        val results = mutableListOf<SearchResponse>()
         val queryLower = query.lowercase().trim()
 
         val listingPages = listOf(
@@ -612,52 +635,76 @@ class Arabp : MainAPI() {
             Triple("$mainUrl/index.php?page=tv-listing&search=$encoded", "tv", TvType.TvSeries),
             Triple("$mainUrl/index.php?page=movies-listing&search=$encoded", "movies", TvType.Movie)
         )
+        val torrentsUrl = "$mainUrl/index.php?page=torrents&search=$encoded&category=0&active=0"
 
-        for ((listingUrl, label, tvType) in listingPages) {
-            try {
-                val doc = fetchDoc(listingUrl)
-                val listingResults = doc?.select("div.listing_div1")
-                    ?.mapNotNull { toSearchResult(it, tvType) }
-                    ?.filter { matchesQuery(it.name, queryLower) }
-                    ?: emptyList()
-                Log.d(TAG, "$label listing search: found ${listingResults.size} results")
-                results.addAll(listingResults)
-            } catch (e: Exception) {
-                Log.e(TAG, "$label listing search error: ${e.message}")
-            }
-        }
-
-        if (ensureLogin()) {
-            try {
-                val torrentsUrl = "$mainUrl/index.php?page=torrents&search=$encoded&category=0&active=0"
-                val request = Request.Builder()
-                    .url(torrentsUrl)
-                    .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
-                    .build()
-
-                authClient.newCall(request).execute().use { response ->
-                    val body = response.body?.string() ?: ""
-                    val torrentsDoc = Jsoup.parse(body, torrentsUrl)
-
-                    // Prefer modern file-header format; fall back to old table format
-                    val modernResults = torrentsDoc.select("div.file-header")
-                        .mapNotNull { modernTorrentRowToSearchResult(it) }
-                    val tableResults = if (modernResults.isEmpty()) {
-                        torrentsDoc.select("table.lista2t tr.lista2")
-                            .mapNotNull { torrentRowToSearchResult(it) }
-                    } else emptyList()
-
-                    val allTorrentResults = modernResults + tableResults
-                    Log.d(TAG, "Torrents search: found ${allTorrentResults.size} results")
-                    results.addAll(allTorrentResults)
+        // SPEED-UP: Fetch all 4 search pages IN PARALLEL using browseClient (3 concurrent
+        // permits, no per-request sleep) instead of the OLD sequential for-loop through
+        // authClient (1500ms rate limit + semaphore=1).
+        //
+        // Old: 3 listing pages sequential * ~1.5s + 1 torrents page * ~1.5s = ~6-9s
+        // New: 4 pages / 3 concurrent * ~500ms HTTP = ~1s
+        //
+        // IP-ban safety: browseSemaphore(3) caps in-flight requests at 3 — same as a
+        // browser loading a single page. Search pages are listing pages (not torrent
+        // downloads), so they don't need the strict authClient limiter.
+        return coroutineScope {
+            val listingDeferred = listingPages.map { (listingUrl, label, tvType) ->
+                async(Dispatchers.IO) {
+                    try {
+                        // Use fetchDocForBrowse (browseClient) — listing pages don't need
+                        // the strict authClient limiter that's reserved for torrent downloads.
+                        val doc = fetchDocForBrowse(listingUrl)
+                        val listingResults = doc?.select("div.listing_div1")
+                            ?.mapNotNull { toSearchResult(it, tvType) }
+                            ?.filter { matchesQuery(it.name, queryLower) }
+                            ?: emptyList()
+                        Log.d(TAG, "$label listing search: found ${listingResults.size} results")
+                        listingResults
+                    } catch (e: Exception) {
+                        Log.e(TAG, "$label listing search error: ${e.message}")
+                        emptyList()
+                    }
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Torrents search error: ${e.message}")
             }
-        }
 
-        Log.d(TAG, "Total search results: ${results.size}")
-        return results
+            val torrentsDeferred = async(Dispatchers.IO) {
+                if (!ensureLogin()) return@async emptyList<SearchResponse>()
+                try {
+                    val request = Request.Builder()
+                        .url(torrentsUrl)
+                        .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
+                        .build()
+
+                    // Use browseClient here too — the torrents search page is just another
+                    // listing page, not the actual .torrent download endpoint.
+                    browseClient.newCall(request).execute().use { response ->
+                        val body = response.body?.string() ?: ""
+                        val torrentsDoc = Jsoup.parse(body, torrentsUrl)
+
+                        // Prefer modern file-header format; fall back to old table format
+                        val modernResults = torrentsDoc.select("div.file-header")
+                            .mapNotNull { modernTorrentRowToSearchResult(it) }
+                        val tableResults = if (modernResults.isEmpty()) {
+                            torrentsDoc.select("table.lista2t tr.lista2")
+                                .mapNotNull { torrentRowToSearchResult(it) }
+                        } else emptyList()
+
+                        val allTorrentResults = modernResults + tableResults
+                        Log.d(TAG, "Torrents search: found ${allTorrentResults.size} results")
+                        allTorrentResults
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Torrents search error: ${e.message}")
+                    emptyList()
+                }
+            }
+
+            val results = mutableListOf<SearchResponse>()
+            results.addAll(listingDeferred.awaitAll().flatten())
+            results.addAll(torrentsDeferred.await())
+            Log.d(TAG, "Total search results: ${results.size}")
+            results
+        }
     }
 
     private fun matchesQuery(title: String?, queryLower: String): Boolean {
