@@ -987,13 +987,59 @@ class AnimeDayProvider : MainAPI() {
             else if (cleanUrl.contains(".workers.dev/")) {
                 try {
                     val responseText = simpleHttpGet(cleanUrl, authHeaders) ?: continue
-                    if (!responseText.trim().startsWith("{")) continue
-                    val node = mapper.readTree(responseText)
-                    // Get the FIRST direct video URL from the JSON
-                    val directUrl = node?.get("url")?.asText()?.takeIf { it.isNotEmpty() }
-                        ?: node?.get("availableQualities")?.takeIf { it.isArray }?.firstOrNull()?.let { it.get("url")?.asText() }
-                        ?: node?.get("videos")?.takeIf { it.isArray }?.firstOrNull()?.let { it.get("url")?.asText() }
-                    if (directUrl != null && directUrl.isNotEmpty()) {
+                    val trimmed = responseText.trim()
+                    var directUrl: String? = null
+
+                    // Parse JSON object format
+                    if (trimmed.startsWith("{")) {
+                        try {
+                            val node = mapper.readTree(responseText)
+                            // Try availableQualities array (most common format)
+                            val qualities = node?.get("availableQualities")
+                            if (qualities != null && qualities.isArray) {
+                                for (q in qualities) {
+                                    val streamUrl = q.get("url")?.asText()
+                                    if (!streamUrl.isNullOrEmpty()) {
+                                        directUrl = streamUrl
+                                        break
+                                    }
+                                }
+                            }
+                            // Try single "url" field
+                            if (directUrl == null) {
+                                val urlField = node?.get("url")?.asText()
+                                if (!urlField.isNullOrEmpty()) directUrl = urlField
+                            }
+                            // Try "videos" array
+                            if (directUrl == null) {
+                                val videosNode = node?.get("videos")
+                                if (videosNode != null && videosNode.isArray) {
+                                    for (v in videosNode) {
+                                        val vUrl = v.get("url")?.asText()
+                                        if (!vUrl.isNullOrEmpty()) {
+                                            directUrl = vUrl
+                                            break
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (_: Exception) {}
+                    }
+                    // Try JSON array format
+                    else if (trimmed.startsWith("[")) {
+                        try {
+                            val qualityList = parseList<VideoQuality>(responseText)
+                            for (q in qualityList) {
+                                val streamUrl = q.url
+                                if (!streamUrl.isNullOrEmpty()) {
+                                    directUrl = streamUrl
+                                    break
+                                }
+                            }
+                        } catch (_: Exception) {}
+                    }
+
+                    if (!directUrl.isNullOrEmpty()) {
                         callback(
                             newExtractorLink(
                                 source = serverName,
