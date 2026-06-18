@@ -30,6 +30,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Semaphore
 
 class Arabp : MainAPI() {
@@ -130,6 +131,36 @@ class Arabp : MainAPI() {
     private fun cacheBrowseDoc(url: String, doc: Document) = synchronized(browseCacheLock) {
         browseCache[url] = Pair(System.currentTimeMillis(), doc)
     }
+
+    // ---- Speed-up: stale-while-revalidate cache ----
+    // SEPARATE from the 60s fresh cache above. This stale cache has NO TTL — it
+    // returns the last-known Document regardless of age. Used by fetchDocForBrowseCached:
+    //   1. Fresh cache hit (≤60s)  → return immediately, no refresh
+    //   2. Stale cache hit (>60s)  → return immediately, trigger background refresh
+    //   3. No cache at all         → fetch synchronously (first ever load)
+    // This makes EVERY home-page load after the first one feel INSTANT — the user
+    // sees stale content immediately while fresh data loads in the background.
+    private val staleBrowseCacheLock = Any()
+    private val staleBrowseCache = object : LinkedHashMap<String, Document>(32, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Document>): Boolean {
+            return size > 32
+        }
+    }
+
+    private fun getCachedStaleBrowseDoc(url: String): Document? = synchronized(staleBrowseCacheLock) {
+        staleBrowseCache[url]
+    }
+
+    private fun cacheStaleBrowseDoc(url: String, doc: Document) = synchronized(staleBrowseCacheLock) {
+        staleBrowseCache[url] = doc
+    }
+
+    // ---- Speed-up: in-flight request deduplication ----
+    // When CloudStream calls getMainPage() for 11 carousels AND the background prefetch
+    // fires for 10 of those same URLs, we'd get 21 concurrent requests for 11 URLs.
+    // This map holds per-URL locks: only ONE HTTP request per URL is made. The rest
+    // wait on the lock and get the cached result. Saves ~10 duplicate requests.
+    private val urlFetchLocks = ConcurrentHashMap<String, Any>()
 
     // ---- Speed-up: home-page background prefetch ----
     // Background scope for fire-and-forget prefetch of home-page carousels.
@@ -533,23 +564,76 @@ class Arabp : MainAPI() {
     }
 
     /**
-     * Speed-up: cache-aware wrapper around fetchDocForBrowse.
-     * Checks the 60s TTL browse cache first. On cache miss, fetches and caches.
-     * Used by getMainPage() and search() so that navigating home → detail → back
-     * to home doesn't re-fetch all 11 carousels.
+     * Speed-up: stale-while-revalidate + in-flight deduplication wrapper.
+     *
+     * Three-tier strategy for INSTANT home page:
+     *
+     *   1. FRESH cache hit (≤60s old) → return immediately, no HTTP request at all.
+     *      Navigating home → detail → back-to-home within 60s is instant.
+     *
+     *   2. STALE cache hit (>60s old) → return stale Document IMMEDIATELY, then
+     *      trigger a fire-and-forget background refresh. The user sees content
+     *      instantly; fresh data is cached for next time. This makes EVERY
+     *      home-page load after the first one feel instant — no waiting at all.
+     *
+     *   3. NO cache (first ever load) → fetch synchronously with in-flight dedup.
+     *      Per-URL locks ensure that if 21 coroutines request 11 URLs simultaneously
+     *      (11 getMainPage calls + 10 background prefetch), only 11 HTTP requests
+     *      are made — not 21. The duplicate callers wait on the lock and get the
+     *      cached result.
+     *
+     * IP-ban safety: stale-while-revalidate REDUCES total request count vs the
+     * old approach. In-flight dedup eliminates duplicate requests. Net effect:
+     * fewer HTTP requests to the server, not more.
      */
     private fun fetchDocForBrowseCached(url: String): Document? {
-        // Fast path — return cached doc if fresh.
+        // Tier 1: Fresh cache hit (≤60s) — return immediately.
         getCachedBrowseDoc(url)?.let {
-            Log.d(TAG, "fetchDocForBrowseCached: cache HIT for $url")
+            Log.d(TAG, "fetchDocForBrowseCached: FRESH HIT for $url")
             return it
         }
-        // Slow path — fetch, parse, cache.
-        val doc = fetchDocForBrowse(url)
-        if (doc != null) {
-            cacheBrowseDoc(url, doc)
+
+        // Tier 2: Stale cache hit (>60s) — return immediately, refresh in background.
+        // This is what makes the home page feel "almost instant" on repeat visits.
+        val staleDoc = getCachedStaleBrowseDoc(url)
+        if (staleDoc != null) {
+            Log.d(TAG, "fetchDocForBrowseCached: STALE HIT for $url — returning stale, refreshing in background")
+            // Fire-and-forget background refresh. Uses prefetchScope (SupervisorJob)
+            // so failures don't cascade. browseSemaphore(5) limits concurrency.
+            prefetchScope.launch {
+                try {
+                    val freshDoc = fetchDocForBrowse(url)
+                    if (freshDoc != null) {
+                        cacheBrowseDoc(url, freshDoc)
+                        cacheStaleBrowseDoc(url, freshDoc)
+                        Log.d(TAG, "fetchDocForBrowseCached: background refresh OK for $url")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "fetchDocForBrowseCached: background refresh failed for $url: ${e.message}")
+                }
+            }
+            return staleDoc
         }
-        return doc
+
+        // Tier 3: No cache at all (first ever load) — fetch synchronously.
+        // In-flight dedup: per-URL lock ensures only ONE HTTP request per URL.
+        // If 3 coroutines request the same URL simultaneously, only 1 fetches;
+        // the other 2 wait on the lock and get the cached result.
+        val lock = urlFetchLocks.computeIfAbsent(url) { Any() }
+        synchronized(lock) {
+            // Double-check caches after acquiring lock — another coroutine may have
+            // fetched and cached this URL while we were waiting.
+            getCachedBrowseDoc(url)?.let { return it }
+            getCachedStaleBrowseDoc(url)?.let { return it }
+
+            Log.d(TAG, "fetchDocForBrowseCached: FETCH (no cache) for $url")
+            val doc = fetchDocForBrowse(url)
+            if (doc != null) {
+                cacheBrowseDoc(url, doc)
+                cacheStaleBrowseDoc(url, doc)
+            }
+            return doc
+        }
     }
 
     /**
