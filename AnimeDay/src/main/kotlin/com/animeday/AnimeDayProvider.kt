@@ -908,54 +908,61 @@ class AnimeDayProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        // CRASH FIX v25: EXTRACTION + RETURN ONLY 1 LINK.
+        // CRASH FIX v26: Return ALL servers' raw URLs (ZERO HTTP, no extraction).
         //
-        // Based on AnimeDay APK analysis (https://github.com/maleek18000/CSSD
-        // comparison + APK decompilation):
+        // History:
+        //   v18 (1 raw link, no extraction): NO CRASH, some episodes played
+        //   v24 (v18 exactly): NO CRASH, "most episodes doesn't work"
+        //   v25 (extraction + 1 link): CRASHED (extraction HTTP adds threads)
         //
-        // The app works on phones/TVs because it uses HttpURLConnection (Volley
-        // 4-thread pool + ExoPlayer DefaultHttpDataSource) for high-volume
-        // operations, keeping OkHttp (unbounded thread pool, max=Integer.MAX_VALUE)
-        // off the hot path.
+        // The dilemma: extraction makes more episodes play, but extraction HTTP
+        // calls crash. No extraction means raw URLs aren't playable for most.
         //
-        // v18 (no crash) returned 1 link. v19-v22 (crash) returned MULTIPLE links
-        // from extraction. Multiple links -> player probes ALL in parallel via
-        // OkHttp -> unbounded thread spawning -> pthread_create fails -> crash.
+        // v26: Return ALL servers' raw URLs (not just first) with ZERO HTTP.
+        // v18 returned only 1 link (first server) — most episodes failed because
+        // that one server's raw URL wasn't directly playable. v26 returns ALL 6
+        // servers' raw URLs so the user has more options in the picker. If one
+        // server gives 3003, the user can try another.
         //
-        // v25 combines v18's crash-free "1 link only" with extraction:
-        //   1. Do extraction via HttpURLConnection (1 HTTP call to workers.dev)
-        //   2. Capture ONLY the FIRST resolved direct video URL (skip rest)
-        //   3. Return that 1 link to the player
-        //   4. Player probes 1 URL -> 1 OkHttp thread -> no crash
-        //   5. If first server yields no links, try next server (sequentially)
+        // This is still ZERO HTTP in loadLinks (like v18) so no extraction crash.
+        // The picker probes the links, but 6 probes with no extraction threads
+        // should be manageable (v18 had 1 probe + 0 extraction = no crash;
+        // 6 probes + 0 extraction should also be OK).
         //
-        // This gives: no crash (1 link) + more episodes play (extraction resolves
-        // workers.dev JSON / ok.ru metadata / Google Photos HTML into direct URLs).
+        // Key insight from APK analysis: the app's player uses HttpURLConnection
+        // (DefaultHttpDataSource), NOT OkHttp. CloudStream's player uses OkHttp.
+        // Returning fewer links = fewer OkHttp probe threads = less crash risk.
+        // But returning only 1 link means most episodes fail. v26 returns all 6
+        // as a compromise — more options, still no extraction.
         var foundAny = false
-        val firstLink = arrayOf<ExtractorLink?>(null)  // capture first link only
-
-        val singleLinkCallback: (ExtractorLink) -> Unit = { link ->
-            if (firstLink[0] == null) {
-                firstLink[0] = link  // Capture ONLY the first link
-            }
-        }
-
         for ((serverName, urlAndExtraction) in videoUrls.entries) {
             kotlinx.coroutines.yield()
-            if (firstLink[0] != null) break  // Got a link, stop
-            firstLink[0] = null  // Reset for this server
-            val (url, needsExtraction) = urlAndExtraction
+            val (rawUrl, _) = urlAndExtraction
+            val cleanUrl = rawUrl.trim()
+            if (cleanUrl.isEmpty()) continue
+
+            val linkType = when {
+                cleanUrl.contains(".m3u8") -> ExtractorLinkType.M3U8
+                else -> ExtractorLinkType.VIDEO
+            }
+
             try {
-                extractFromUrl(url, serverName, needsExtraction, subtitleCallback, singleLinkCallback)
+                callback(
+                    newExtractorLink(
+                        source = serverName,
+                        name = serverName,
+                        url = cleanUrl,
+                        type = linkType
+                    ) {
+                        this.referer = mainUrl
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+                foundAny = true
+                // Don't break — return ALL servers' raw URLs (no HTTP cost)
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
             }
-            if (firstLink[0] != null) {
-                callback(firstLink[0]!!)  // Forward the SINGLE link to the player
-                foundAny = true
-                break  // FIRST SERVER with a link — stop
-            }
-            // If this server yielded no link, try next (sequentially)
         }
 
         return foundAny
