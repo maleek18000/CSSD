@@ -225,10 +225,8 @@ class AnimeDayProvider : MainAPI() {
     }
 
 
-    // CRASH FIX v31/v41: HttpURLConnection helpers (bypass OkHttp's unbounded thread pool).
-    // v41: added maxBytes param to limit response size (prevents crash when
-    // fetching large Google Photos HTML pages on phones/TVs).
-    private fun simpleHttpGet(url: String, headers: Map<String, String> = emptyMap(), maxBytes: Int = 0): String? {
+    // CRASH FIX v31: HttpURLConnection helpers (bypass OkHttp's unbounded thread pool).
+    private fun simpleHttpGet(url: String, headers: Map<String, String> = emptyMap()): String? {
         var conn: java.net.HttpURLConnection? = null
         return try {
             conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
@@ -238,14 +236,7 @@ class AnimeDayProvider : MainAPI() {
                 instanceFollowRedirects = true
                 headers.forEach { (k, v) -> setRequestProperty(k, v) }
             }
-            if (maxBytes > 0) {
-                // Read at most maxBytes (prevents OOM on large responses)
-                val buffer = ByteArray(maxBytes)
-                val read = conn.inputStream.use { it.read(buffer) }
-                if (read > 0) String(buffer, 0, read, Charsets.UTF_8) else null
-            } else {
-                conn.inputStream.bufferedReader().use { it.readText() }
-            }
+            conn.inputStream.bufferedReader().use { it.readText() }
         } catch (e: Exception) { null }
         finally { conn?.disconnect() }
     }
@@ -319,17 +310,42 @@ class AnimeDayProvider : MainAPI() {
                     metadata?.get("videos")?.takeIf { it.isArray }?.firstOrNull()?.let { it.get("url")?.asText() }
                 }
                 cleanUrl.contains("photos.google.com") -> {
+                    // CRASH FIX v42: Stream Google Photos HTML line-by-line
+                    // to find the video URL. Previous versions loaded the full
+                    // 1-2MB page into memory then ran regex -> crash on
+                    // phones/TVs. This version reads line-by-line and exits
+                    // immediately when the video URL is found, never holding
+                    // the full page in memory.
                     val agents = getAgents()
                     val gPhotosHeaders = mutableMapOf<String, String>()
                     gPhotosHeaders["User-Agent"] = agents?.gPhotosAgent?.takeIf { it.isNotEmpty() } ?: "Mozilla/5.0"
                     agents?.gPhotosCookie?.takeIf { it.isNotEmpty() }?.let { gPhotosHeaders["Cookie"] = it }
-                    // CRASH FIX v41: Limit response to 500KB. Google Photos
-                    // pages can be 1-2MB; fetching the full page + regex
-                    // crashes phones/TVs. The video URL is in the first part.
-                    val pageText = simpleHttpGet(cleanUrl, gPhotosHeaders, maxBytes = 500000) ?: return null
-                    val fixed = Regex("%(?![0-9a-fA-F]{2})").replace(pageText) { "%25" }
-                    val decoded = java.net.URLDecoder.decode(fixed, "UTF-8")
-                    Regex("""https://video-downloads\.googleusercontent\.com/[^"\\\s]+""").find(decoded)?.value
+                    var videoUrl: String? = null
+                    var conn: java.net.HttpURLConnection? = null
+                    try {
+                        conn = (java.net.URL(cleanUrl).openConnection() as java.net.HttpURLConnection).apply {
+                            requestMethod = "GET"
+                            connectTimeout = 10000
+                            readTimeout = 10000
+                            instanceFollowRedirects = true
+                            gPhotosHeaders.forEach { (k, v) -> setRequestProperty(k, v) }
+                        }
+                        // Read line-by-line, search for video URL, exit early
+                        conn.inputStream.bufferedReader().use { reader ->
+                            val pattern = Regex("""https://video-downloads\.googleusercontent\.com/[^"\\\s]+""")
+                            while (true) {
+                                val line = reader.readLine() ?: break
+                                val fixed = Regex("%(?![0-9a-fA-F]{2})").replace(line) { "%25" }
+                                val decoded = java.net.URLDecoder.decode(fixed, "UTF-8")
+                                val match = pattern.find(decoded)
+                                if (match != null) {
+                                    videoUrl = match.value
+                                    break  // Found it, stop reading
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {} finally { conn?.disconnect() }
+                    videoUrl
                 }
                 else -> null
             }
