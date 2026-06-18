@@ -908,61 +908,113 @@ class AnimeDayProvider : MainAPI() {
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
 
-        // CRASH FIX v26: Return ALL servers' raw URLs (ZERO HTTP, no extraction).
+        // CRASH FIX v27: Targeted SINGLE-HTTP extraction + return 1 resolved URL.
         //
         // History:
-        //   v18 (1 raw link, no extraction): NO CRASH, some episodes played
-        //   v24 (v18 exactly): NO CRASH, "most episodes doesn't work"
-        //   v25 (extraction + 1 link): CRASHED (extraction HTTP adds threads)
+        //   v18/v24/v26 (no extraction, raw URLs): NO CRASH, but 3003 errors
+        //     (raw workers.dev/ok.ru URLs aren't directly playable)
+        //   v19-v25 (full extraction): CRASHED (multiple HTTP calls)
         //
-        // The dilemma: extraction makes more episodes play, but extraction HTTP
-        // calls crash. No extraction means raw URLs aren't playable for most.
+        // The dilemma: extraction crashes, but without extraction nothing plays.
         //
-        // v26: Return ALL servers' raw URLs (not just first) with ZERO HTTP.
-        // v18 returned only 1 link (first server) — most episodes failed because
-        // that one server's raw URL wasn't directly playable. v26 returns ALL 6
-        // servers' raw URLs so the user has more options in the picker. If one
-        // server gives 3003, the user can try another.
+        // v27: Do ONE targeted HTTP extraction — only the workers.dev JSON path
+        // (the most common server type). Skip ok.ru (needs metadata API + HLS =
+        // 2 HTTP calls) and Google Photos (needs HTML scraping = 1 call but
+        // large response). For workers.dev: 1 HTTP call → parse JSON → get
+        // FIRST direct video URL → return ONLY that 1 link.
         //
-        // This is still ZERO HTTP in loadLinks (like v18) so no extraction crash.
-        // The picker probes the links, but 6 probes with no extraction threads
-        // should be manageable (v18 had 1 probe + 0 extraction = no crash;
-        // 6 probes + 0 extraction should also be OK).
+        // For non-workers.dev URLs (mp4/m3u8/CDN/googleusercontent): return
+        // them directly (no extraction needed, they're already playable).
         //
-        // Key insight from APK analysis: the app's player uses HttpURLConnection
-        // (DefaultHttpDataSource), NOT OkHttp. CloudStream's player uses OkHttp.
-        // Returning fewer links = fewer OkHttp probe threads = less crash risk.
-        // But returning only 1 link means most episodes fail. v26 returns all 6
-        // as a compromise — more options, still no extraction.
+        // For ok.ru/Google Photos/other: skip them (return nothing for that
+        // server, try next server sequentially).
+        //
+        // This caps HTTP requests to 1 per loadLinks call (just the workers.dev
+        // JSON fetch) and returns only 1 link → minimal OkHttp thread spawning
+        // → no crash. And the returned URL is a DIRECT video URL → no 3003.
         var foundAny = false
         for ((serverName, urlAndExtraction) in videoUrls.entries) {
             kotlinx.coroutines.yield()
+            if (foundAny) break  // Got a link, stop
             val (rawUrl, _) = urlAndExtraction
             val cleanUrl = rawUrl.trim()
             if (cleanUrl.isEmpty()) continue
 
-            val linkType = when {
-                cleanUrl.contains(".m3u8") -> ExtractorLinkType.M3U8
-                else -> ExtractorLinkType.VIDEO
+            // 1. Direct video URLs (mp4, m3u8) — return directly, NO HTTP
+            if (cleanUrl.contains(".mp4") || cleanUrl.contains(".m3u8")) {
+                try {
+                    callback(
+                        newExtractorLink(
+                            source = serverName,
+                            name = serverName,
+                            url = cleanUrl,
+                            type = if (cleanUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = mainUrl
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                    foundAny = true
+                    break
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                }
             }
 
-            try {
-                callback(
-                    newExtractorLink(
-                        source = serverName,
-                        name = serverName,
-                        url = cleanUrl,
-                        type = linkType
-                    ) {
-                        this.referer = mainUrl
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-                foundAny = true
-                // Don't break — return ALL servers' raw URLs (no HTTP cost)
-            } catch (e: Exception) {
-                if (e is java.util.concurrent.CancellationException) throw e
+            // 2. CDN URLs — return directly, NO HTTP
+            else if (cleanUrl.contains("okcdn.ru") || cleanUrl.contains("vkuser.net") ||
+                     cleanUrl.contains("googleusercontent.com") || cleanUrl.contains("googlevideo.com")) {
+                try {
+                    callback(
+                        newExtractorLink(
+                            source = serverName,
+                            name = serverName,
+                            url = cleanUrl,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = mainUrl
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                    foundAny = true
+                    break
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                }
             }
+
+            // 3. Workers.dev URLs — SINGLE HTTP extraction (the targeted fix)
+            else if (cleanUrl.contains(".workers.dev/")) {
+                try {
+                    val responseText = simpleHttpGet(cleanUrl, authHeaders) ?: continue
+                    if (!responseText.trim().startsWith("{")) continue
+                    val node = mapper.readTree(responseText)
+                    // Get the FIRST direct video URL from the JSON
+                    val directUrl = node?.get("url")?.asText()?.takeIf { it.isNotEmpty() }
+                        ?: node?.get("availableQualities")?.takeIf { it.isArray }?.firstOrNull()?.let { it.get("url")?.asText() }
+                        ?: node?.get("videos")?.takeIf { it.isArray }?.firstOrNull()?.let { it.get("url")?.asText() }
+                    if (directUrl != null && directUrl.isNotEmpty()) {
+                        callback(
+                            newExtractorLink(
+                                source = serverName,
+                                name = serverName,
+                                url = directUrl,
+                                type = if (directUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = mainUrl
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                        foundAny = true
+                        break  // Got a direct URL, stop
+                    }
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                }
+            }
+
+            // 4. ok.ru / Google Photos / other — SKIP (extraction needs multiple
+            //    HTTP calls which crashes). Try next server.
         }
 
         return foundAny
