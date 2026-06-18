@@ -83,9 +83,10 @@ class Arabp : MainAPI() {
 
     // ---- Speed-up state (search + home page only) ----
     // Limits concurrent in-flight BROWSE requests (home page carousels + search pages).
-    // 3 permits = browser-like parallelism (Chrome uses ~6 per host). Plenty fast for
-    // 11 home-page carousels + 4 search pages, while staying gentle on the server.
-    private val browseSemaphore = Semaphore(3)
+    // 5 permits = browser-like parallelism (Chrome uses 6 per host). With 11 home-page
+    // carousels this means 11/5 = 2.2 batches instead of 11/3 = 3.7 batches, cutting
+    // home-page fetch time by ~40% while staying IP-ban-safe.
+    private val browseSemaphore = Semaphore(5)
 
     // Lock to prevent thundering-herd login. When 11 home-page carousels fire at once,
     // without this lock all 11 would enter ensureLogin() simultaneously and serialize
@@ -93,6 +94,39 @@ class Arabp : MainAPI() {
     // With this lock, only the first coroutine logs in; the rest wait, then see
     // isLoggedIn=true via the double-check and skip immediately.
     private val loginLock = Any()
+
+    // ---- Speed-up: shared OkHttp ConnectionPool ----
+    // Both authClient and browseClient connect to the same host (arabp2p.net).
+    // Without sharing, each client does its own TLS handshake (~300-500ms each).
+    // Sharing one pool means the second client reuses the first's warm connection.
+    // Thread-safe by design (OkHttp ConnectionPool is internally synchronized).
+    private val sharedConnectionPool = okhttp3.ConnectionPool(5, 5, TimeUnit.MINUTES)
+
+    // ---- Speed-up: short-TTL cache for browse Documents ----
+    // Caches parsed HTML Documents for home-page carousel URLs and search URLs.
+    // TTL = 60s: short enough to stay fresh, long enough that navigating from home
+    // → detail → back-to-home is instant instead of re-fetching all 11 carousels.
+    // Also REDUCES total request count → IP-ban safer.
+    private val browseCacheLock = Any()
+    private val browseCache = object : LinkedHashMap<String, Pair<Long, Document>>(32, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<Long, Document>>): Boolean {
+            return size > 32
+        }
+    }
+    private val BROWSE_CACHE_TTL_MS = 60_000L
+
+    private fun getCachedBrowseDoc(url: String): Document? = synchronized(browseCacheLock) {
+        val entry = browseCache[url] ?: return null
+        if (System.currentTimeMillis() - entry.first > BROWSE_CACHE_TTL_MS) {
+            browseCache.remove(url)
+            return null
+        }
+        entry.second
+    }
+
+    private fun cacheBrowseDoc(url: String, doc: Document) = synchronized(browseCacheLock) {
+        browseCache[url] = Pair(System.currentTimeMillis(), doc)
+    }
 
     private fun randomUserAgent(): String =
         USER_AGENTS[kotlin.random.Random.nextInt(USER_AGENTS.size)]
@@ -202,6 +236,7 @@ class Arabp : MainAPI() {
             .readTimeout(60, TimeUnit.SECONDS)
             .followRedirects(true)
             .followSslRedirects(true)
+            .connectionPool(sharedConnectionPool)
             .build()
     }
 
@@ -261,6 +296,7 @@ class Arabp : MainAPI() {
             .readTimeout(20, TimeUnit.SECONDS)
             .followRedirects(true)
             .followSslRedirects(true)
+            .connectionPool(sharedConnectionPool)
             .build()
     }
 
@@ -322,11 +358,18 @@ class Arabp : MainAPI() {
             if (isSessionAlive()) return true
 
             return try {
+                // Speed-up: fetch the login PAGE via browseClient (fast, no 1500ms rate
+                // limit) instead of authClient. The login page is a public page — it
+                // doesn't need the strict anti-scraping limiter. Only the credential
+                // POST below needs authClient. Cookies are shared via cookieManager so
+                // the POST picks up any session cookie set by this GET.
+                // Saves ~1.5s on every first-load login (the 1500ms rate-limit gap
+                // between init GET and POST is eliminated).
                 val initRequest = Request.Builder()
                     .url("$mainUrl/index.php?page=login")
                     .header("User-Agent", randomUserAgent())
                     .build()
-                authClient.newCall(initRequest).execute().use { response ->
+                browseClient.newCall(initRequest).execute().use { response ->
                     Log.d(TAG, "Init login page: ${response.code}")
                 }
 
@@ -472,6 +515,26 @@ class Arabp : MainAPI() {
         }
     }
 
+    /**
+     * Speed-up: cache-aware wrapper around fetchDocForBrowse.
+     * Checks the 60s TTL browse cache first. On cache miss, fetches and caches.
+     * Used by getMainPage() and search() so that navigating home → detail → back
+     * to home doesn't re-fetch all 11 carousels.
+     */
+    private fun fetchDocForBrowseCached(url: String): Document? {
+        // Fast path — return cached doc if fresh.
+        getCachedBrowseDoc(url)?.let {
+            Log.d(TAG, "fetchDocForBrowseCached: cache HIT for $url")
+            return it
+        }
+        // Slow path — fetch, parse, cache.
+        val doc = fetchDocForBrowse(url)
+        if (doc != null) {
+            cacheBrowseDoc(url, doc)
+        }
+        return doc
+    }
+
     // ==================== HOME PAGE ====================
 
     override val mainPage = mainPageOf(
@@ -495,13 +558,14 @@ class Arabp : MainAPI() {
         val url = "${request.data}&pages=$page"
         Log.d(TAG, "getMainPage: fetching $url for '${request.name}' (page=$page)")
 
-        // Use fetchDocForBrowse (browseClient) instead of fetchDoc (authClient).
-        // browseClient has a lighter rate limiter (300ms vs 1500ms) and no Semaphore,
-        // so 11 categories can load concurrently without hitting 120s timeout.
+        // Use fetchDocForBrowseCached (browseClient + 60s TTL cache) instead of
+        // fetchDoc (authClient). browseClient has 5 concurrent permits and shorter
+        // timeouts, so 11 categories load fast without hitting 120s timeout.
+        // The cache makes "home → detail → back-to-home" instant.
         // Also wrap in withTimeoutOrNull(20s) as safety net — if one category page
         // is slow/failing, return empty instead of blocking the entire home page.
         val doc = withTimeoutOrNull(20_000L) {
-            fetchDocForBrowse(url)
+            fetchDocForBrowseCached(url)
         }
         if (doc == null) {
             Log.w(TAG, "getMainPage: fetchDocForBrowse timed out or failed for $url")
@@ -637,23 +701,25 @@ class Arabp : MainAPI() {
         )
         val torrentsUrl = "$mainUrl/index.php?page=torrents&search=$encoded&category=0&active=0"
 
-        // SPEED-UP: Fetch all 4 search pages IN PARALLEL using browseClient (3 concurrent
+        // SPEED-UP: Fetch all 4 search pages IN PARALLEL using browseClient (5 concurrent
         // permits, no per-request sleep) instead of the OLD sequential for-loop through
         // authClient (1500ms rate limit + semaphore=1).
         //
         // Old: 3 listing pages sequential * ~1.5s + 1 torrents page * ~1.5s = ~6-9s
-        // New: 4 pages / 3 concurrent * ~500ms HTTP = ~1s
+        // New: 4 pages / 5 concurrent * ~500ms HTTP = ~0.5s (all 4 fit in one batch)
         //
-        // IP-ban safety: browseSemaphore(3) caps in-flight requests at 3 — same as a
-        // browser loading a single page. Search pages are listing pages (not torrent
-        // downloads), so they don't need the strict authClient limiter.
+        // IP-ban safety: browseSemaphore(5) caps in-flight requests at 5 — well within
+        // browser behavior (Chrome uses 6 per host). Search pages are listing pages
+        // (not torrent downloads), so they don't need the strict authClient limiter.
+        // Also benefits from the 60s TTL cache — repeat searches are instant.
         return coroutineScope {
             val listingDeferred = listingPages.map { (listingUrl, label, tvType) ->
                 async(Dispatchers.IO) {
                     try {
-                        // Use fetchDocForBrowse (browseClient) — listing pages don't need
-                        // the strict authClient limiter that's reserved for torrent downloads.
-                        val doc = fetchDocForBrowse(listingUrl)
+                        // Use fetchDocForBrowseCached (browseClient + 60s TTL cache) —
+                        // listing pages don't need the strict authClient limiter that's
+                        // reserved for torrent downloads.
+                        val doc = fetchDocForBrowseCached(listingUrl)
                         val listingResults = doc?.select("div.listing_div1")
                             ?.mapNotNull { toSearchResult(it, tvType) }
                             ?.filter { matchesQuery(it.name, queryLower) }
@@ -670,6 +736,22 @@ class Arabp : MainAPI() {
             val torrentsDeferred = async(Dispatchers.IO) {
                 if (!ensureLogin()) return@async emptyList<SearchResponse>()
                 try {
+                    // Check 60s TTL cache first — repeat searches for the same query
+                    // are instant and don't hit the server at all.
+                    val cachedDoc = getCachedBrowseDoc(torrentsUrl)
+                    if (cachedDoc != null) {
+                        Log.d(TAG, "Torrents search: cache HIT for $torrentsUrl")
+                        val modernResults = cachedDoc.select("div.file-header")
+                            .mapNotNull { modernTorrentRowToSearchResult(it) }
+                        val tableResults = if (modernResults.isEmpty()) {
+                            cachedDoc.select("table.lista2t tr.lista2")
+                                .mapNotNull { torrentRowToSearchResult(it) }
+                        } else emptyList()
+                        val allTorrentResults = modernResults + tableResults
+                        Log.d(TAG, "Torrents search: found ${allTorrentResults.size} results (cached)")
+                        return@async allTorrentResults
+                    }
+
                     val request = Request.Builder()
                         .url(torrentsUrl)
                         .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
@@ -680,6 +762,8 @@ class Arabp : MainAPI() {
                     browseClient.newCall(request).execute().use { response ->
                         val body = response.body?.string() ?: ""
                         val torrentsDoc = Jsoup.parse(body, torrentsUrl)
+                        // Cache for future repeat searches
+                        cacheBrowseDoc(torrentsUrl, torrentsDoc)
 
                         // Prefer modern file-header format; fall back to old table format
                         val modernResults = torrentsDoc.select("div.file-header")
