@@ -6,6 +6,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.SubtitleFile
+import okhttp3.ConnectionPool
 import okhttp3.FormBody
 import okhttp3.Headers.Companion.toHeaders
 import okhttp3.OkHttpClient
@@ -197,22 +198,22 @@ class Arabp : MainAPI() {
             .build()
     }
 
-    // Separate client for HOME PAGE BROWSING and SEARCH only.
-    // NO rate limiter and NO Semaphore — relies on OkHttp's default connection
-    // pool (5 concurrent connections per host) which is exactly how real browsers
-    // behave. Home page browsing is the most natural-looking traffic pattern and
-    // does not need artificial delays. This allows 11 category pages to load in
-    // ~2-4 seconds instead of ~7-10 seconds with the previous 300ms limiter.
+    // Separate client for HOME PAGE BROWSING, SEARCH, and LOGIN.
+    // NO rate limiter and NO Semaphore — relies on OkHttp's connection pool
+    // (11 idle connections per host) which is exactly how real browsers behave
+    // when loading a page with many resources. Home page browsing is the most
+    // natural-looking traffic pattern and does not need artificial delays.
+    // This allows 11 category pages to load in ~3-5s instead of ~15s+.
     // Anti-blocking for torrent downloads and detail pages still goes through authClient.
     // Shares the same cookieManager for auth, but has shorter timeouts
     // so a slow/failing category page doesn't hold up the entire home page.
     private val browseClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            // No rate limiter interceptor — OkHttp's connection pool already limits
-            // concurrency to 5 simultaneous connections per host, which mirrors
-            // real browser behavior. Adding a rate limiter here serialized all 11
+            // No rate limiter interceptor — OkHttp's connection pool limits
+            // concurrency naturally. Adding a rate limiter serialized all 11
             // category fetches through the shared lastRequestTimeMs AtomicLong,
-            // causing ~7-10s home page load times.
+            // causing ~15s+ home page load times.
+            .connectionPool(ConnectionPool(11, 1, TimeUnit.MINUTES))
             .cookieJar(object : okhttp3.CookieJar {
                 override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) {
                     for (cookie in cookies) {
@@ -242,8 +243,8 @@ class Arabp : MainAPI() {
                     }
                 }
             })
-            .connectTimeout(8, TimeUnit.SECONDS)
-            .readTimeout(15, TimeUnit.SECONDS)
+            .connectTimeout(6, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
             .followRedirects(true)
             .followSslRedirects(true)
             .build()
@@ -303,11 +304,17 @@ class Arabp : MainAPI() {
             if (isSessionAlive()) return true
 
             return try {
+                // Use browseClient for login (NO rate limiter, NO Semaphore).
+                // Previously used authClient which has Semaphore(1) + 1500ms rate limiter,
+                // making login take ~5-10s. With browseClient, login takes ~2-3s.
+                // Both clients share the same cookieManager, so session cookies
+                // are available to both. Login is a natural infrequent action
+                // (2 requests: GET + POST) and does not need rate limiting.
                 val initRequest = Request.Builder()
                     .url("$mainUrl/index.php?page=login")
-                    .header("User-Agent", randomUserAgent())
+                    .headers(getAuthHeaders().toHeaders())
                     .build()
-                authClient.newCall(initRequest).execute().use { response ->
+                browseClient.newCall(initRequest).execute().use { response ->
                     Log.d(TAG, "Init login page: ${response.code}")
                 }
 
@@ -319,11 +326,10 @@ class Arabp : MainAPI() {
                 val loginRequest = Request.Builder()
                     .url("$mainUrl/index.php?page=login&returnto=index.php")
                     .post(formBody)
-                    .header("User-Agent", randomUserAgent())
-                    .header("Referer", "$mainUrl/index.php?page=login")
+                    .headers(getAuthHeaders(referer = "$mainUrl/index.php?page=login").toHeaders())
                     .build()
 
-                authClient.newCall(loginRequest).execute().use { response ->
+                browseClient.newCall(loginRequest).execute().use { response ->
                     val body = response.body?.string() ?: ""
                     val cookiesAfterLogin = getSessionCookies()
                     Log.d(TAG, "Login response: code=${response.code}, cookies=$cookiesAfterLogin")
@@ -471,19 +477,28 @@ class Arabp : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
+        // PRE-LOGIN OUTSIDE THE TIMEOUT: This is the critical optimization.
+        // Previously, ensureLogin() was called inside fetchDocForBrowse(), which is
+        // inside withTimeoutOrNull(). When 11 categories load concurrently, the first
+        // thread does the login (~2-3s via browseClient), while the other 10 wait on
+        // loginLock. If login was inside the timeout, it would eat into the 10-15s
+        // budget, leaving little time for the actual HTTP request. By pre-logging in
+        // OUTSIDE the timeout, the full 10s is available for the category fetch.
+        // After login, fetchDocForBrowse()'s ensureLogin() hits the fast path
+        // (isSessionAlive() returns true) and returns instantly — no lock contention.
+        if (!ensureLogin()) {
+            Log.w(TAG, "getMainPage: login failed, returning empty for '${request.name}'")
+            return newHomePageResponse(mutableListOf())
+        }
+
         // Always use &pages=$page to ensure the site returns only one page of results.
-        // Without this, page 1 loads ALL items at once, causing too many HTTP requests
-        // (poster images etc.) which triggers IP blocking.
         val url = "${request.data}&pages=$page"
         Log.d(TAG, "getMainPage: fetching $url for '${request.name}' (page=$page)")
 
-        // Use fetchDocForBrowse (browseClient) instead of fetchDoc (authClient).
-        // browseClient has NO rate limiter and no Semaphore, relying on OkHttp's
-        // default connection pool (5 per host) for natural concurrency limiting.
-        // This allows 11 categories to load in ~2-4s instead of ~7-10s.
-        // Also wrap in withTimeoutOrNull(15s) as safety net — if one category page
-        // is slow/failing, return empty instead of blocking the entire home page.
-        val doc = withTimeoutOrNull(15_000L) {
+        // Since login is already done (pre-login above), fetchDocForBrowse() will
+        // skip ensureLogin() (fast path) and go straight to the HTTP request.
+        // 10s timeout per category — enough for normal responses, fast failure for slow ones.
+        val doc = withTimeoutOrNull(10_000L) {
             fetchDocForBrowse(url)
         }
         if (doc == null) {
@@ -610,6 +625,9 @@ class Arabp : MainAPI() {
     // ==================== SEARCH ====================
 
     override suspend fun search(query: String): List<SearchResponse> {
+        // Pre-login so fetchDocForBrowse() hits the fast path (no login delay inside each fetch)
+        ensureLogin()
+
         val encoded = URLEncoder.encode(query, "UTF-8")
         val results = mutableListOf<SearchResponse>()
         val queryLower = query.lowercase().trim()
