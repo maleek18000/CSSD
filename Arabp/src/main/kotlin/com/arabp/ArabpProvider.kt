@@ -22,8 +22,6 @@ import java.net.URI
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.Semaphore
@@ -79,12 +77,6 @@ class Arabp : MainAPI() {
     // Semaphore to enforce MAX_CONCURRENT_REQUESTS. Prevents parallel async() in load()
     // from firing many HTTP requests simultaneously.
     private val requestSemaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
-
-    // Lock for thread-safe login: ensures only one thread performs the login
-    // sequence while others wait. Without this, 11 concurrent getMainPage() calls
-    // all call ensureLogin() simultaneously, causing multiple serialized logins
-    // through authClient (Semaphore(1) + 1500ms rate limiter = ~30s+ wasted).
-    private val loginLock = Any()
 
     private fun randomUserAgent(): String =
         USER_AGENTS[kotlin.random.Random.nextInt(USER_AGENTS.size)]
@@ -197,22 +189,32 @@ class Arabp : MainAPI() {
             .build()
     }
 
-    // Separate client for HOME PAGE BROWSING and SEARCH only.
-    // NO rate limiter and NO Semaphore — relies on OkHttp's default connection
-    // pool (5 concurrent connections per host) which is exactly how real browsers
-    // behave. Home page browsing is the most natural-looking traffic pattern and
-    // does not need artificial delays. This allows 11 category pages to load in
-    // ~2-4 seconds instead of ~7-10 seconds with the previous 300ms limiter.
-    // Anti-blocking for torrent downloads and detail pages still goes through authClient.
+    // Separate client for HOME PAGE BROWSING only.
+    // Uses a MUCH lighter rate limiter (300ms vs 1500ms) and NO Semaphore,
+    // allowing concurrent category fetches so 11 carousels load fast.
     // Shares the same cookieManager for auth, but has shorter timeouts
     // so a slow/failing category page doesn't hold up the entire home page.
+    // Anti-blocking for torrent downloads still goes through authClient.
     private val browseClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            // No rate limiter interceptor — OkHttp's connection pool already limits
-            // concurrency to 5 simultaneous connections per host, which mirrors
-            // real browser behavior. Adding a rate limiter here serialized all 11
-            // category fetches through the shared lastRequestTimeMs AtomicLong,
-            // causing ~7-10s home page load times.
+            .addInterceptor { chain ->
+                // Light rate limiter for browse requests: 300ms minimum + 0-300ms jitter.
+                // Fast enough for home page (11 categories in ~5s), gentle enough
+                // to not trigger IP blocking (browsers routinely make 6+ concurrent requests).
+                while (true) {
+                    val now = System.currentTimeMillis()
+                    val last = lastRequestTimeMs.get()
+                    val elapsed = now - last
+                    if (elapsed < 300L) {
+                        val delay = 300L - elapsed +
+                            kotlin.random.Random.nextLong(0, 300)
+                        try { Thread.sleep(delay) } catch (_: InterruptedException) {}
+                    }
+                    val newNow = System.currentTimeMillis()
+                    if (lastRequestTimeMs.compareAndSet(last, newNow)) break
+                }
+                chain.proceed(chain.request())
+            }
             .cookieJar(object : okhttp3.CookieJar {
                 override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) {
                     for (cookie in cookies) {
@@ -242,8 +244,8 @@ class Arabp : MainAPI() {
                     }
                 }
             })
-            .connectTimeout(8, TimeUnit.SECONDS)
-            .readTimeout(15, TimeUnit.SECONDS)
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
             .followRedirects(true)
             .followSslRedirects(true)
             .build()
@@ -294,58 +296,51 @@ class Arabp : MainAPI() {
     }
 
     private fun ensureLogin(): Boolean {
-        // Fast path: already logged in, no lock needed
         if (isSessionAlive()) return true
 
-        // Slow path: acquire lock so only one thread performs the login sequence.
-        // Other threads wait, then re-check isSessionAlive() (double-checked locking).
-        synchronized(loginLock) {
-            if (isSessionAlive()) return true
-
-            return try {
-                val initRequest = Request.Builder()
-                    .url("$mainUrl/index.php?page=login")
-                    .header("User-Agent", randomUserAgent())
-                    .build()
-                authClient.newCall(initRequest).execute().use { response ->
-                    Log.d(TAG, "Init login page: ${response.code}")
-                }
-
-                val formBody = FormBody.Builder()
-                    .add("uid", LOGIN_USERNAME)
-                    .add("pwd", LOGIN_PASSWORD)
-                    .build()
-
-                val loginRequest = Request.Builder()
-                    .url("$mainUrl/index.php?page=login&returnto=index.php")
-                    .post(formBody)
-                    .header("User-Agent", randomUserAgent())
-                    .header("Referer", "$mainUrl/index.php?page=login")
-                    .build()
-
-                authClient.newCall(loginRequest).execute().use { response ->
-                    val body = response.body?.string() ?: ""
-                    val cookiesAfterLogin = getSessionCookies()
-                    Log.d(TAG, "Login response: code=${response.code}, cookies=$cookiesAfterLogin")
-
-                    val loginSuccess = response.code == 302 ||
-                            cookiesAfterLogin.contains("uid_") ||
-                            body.contains("logout.php") ||
-                            body.contains("page=logout") ||
-                            body.contains(LOGIN_USERNAME)
-
-                    if (loginSuccess) {
-                        isLoggedIn = true
-                        Log.d(TAG, "Login SUCCESS! Cookies: $cookiesAfterLogin")
-                    } else {
-                        Log.e(TAG, "Login FAILED. Response code=${response.code}, snippet: ${body.take(300)}")
-                    }
-                    loginSuccess
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Login Error: ${e.message}")
-                false
+        return try {
+            val initRequest = Request.Builder()
+                .url("$mainUrl/index.php?page=login")
+                .header("User-Agent", randomUserAgent())
+                .build()
+            authClient.newCall(initRequest).execute().use { response ->
+                Log.d(TAG, "Init login page: ${response.code}")
             }
+
+            val formBody = FormBody.Builder()
+                .add("uid", LOGIN_USERNAME)
+                .add("pwd", LOGIN_PASSWORD)
+                .build()
+
+            val loginRequest = Request.Builder()
+                .url("$mainUrl/index.php?page=login&returnto=index.php")
+                .post(formBody)
+                .header("User-Agent", randomUserAgent())
+                .header("Referer", "$mainUrl/index.php?page=login")
+                .build()
+
+            authClient.newCall(loginRequest).execute().use { response ->
+                val body = response.body?.string() ?: ""
+                val cookiesAfterLogin = getSessionCookies()
+                Log.d(TAG, "Login response: code=${response.code}, cookies=$cookiesAfterLogin")
+
+                val loginSuccess = response.code == 302 ||
+                        cookiesAfterLogin.contains("uid_") ||
+                        body.contains("logout.php") ||
+                        body.contains("page=logout") ||
+                        body.contains(LOGIN_USERNAME)
+
+                if (loginSuccess) {
+                    isLoggedIn = true
+                    Log.d(TAG, "Login SUCCESS! Cookies: $cookiesAfterLogin")
+                } else {
+                    Log.e(TAG, "Login FAILED. Response code=${response.code}, snippet: ${body.take(300)}")
+                }
+                loginSuccess
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Login Error: ${e.message}")
+            false
         }
     }
 
@@ -409,12 +404,11 @@ class Arabp : MainAPI() {
     }
 
     /**
-     * Fast document fetch for HOME PAGE BROWSING and SEARCH.
-     * Uses browseClient (NO rate limiter, no Semaphore, shorter timeouts)
+     * Fast document fetch for HOME PAGE BROWSING only.
+     * Uses browseClient (light rate limiter, no Semaphore, shorter timeouts)
      * so that 11 category pages can load concurrently without hitting the
-     * 120s CloudStream timeout. OkHttp's connection pool (5 per host)
-     * provides natural concurrency limiting like a real browser.
-     * Still calls ensureLogin() to get auth cookies, then
+     * 120s CloudStream timeout.
+     * Still calls ensureLogin() via authClient to get auth cookies, then
      * uses browseClient for the actual page fetch.
      */
     private fun fetchDocForBrowse(url: String): Document? {
@@ -478,12 +472,11 @@ class Arabp : MainAPI() {
         Log.d(TAG, "getMainPage: fetching $url for '${request.name}' (page=$page)")
 
         // Use fetchDocForBrowse (browseClient) instead of fetchDoc (authClient).
-        // browseClient has NO rate limiter and no Semaphore, relying on OkHttp's
-        // default connection pool (5 per host) for natural concurrency limiting.
-        // This allows 11 categories to load in ~2-4s instead of ~7-10s.
-        // Also wrap in withTimeoutOrNull(15s) as safety net — if one category page
+        // browseClient has a lighter rate limiter (300ms vs 1500ms) and no Semaphore,
+        // so 11 categories can load concurrently without hitting 120s timeout.
+        // Also wrap in withTimeoutOrNull(20s) as safety net — if one category page
         // is slow/failing, return empty instead of blocking the entire home page.
-        val doc = withTimeoutOrNull(15_000L) {
+        val doc = withTimeoutOrNull(20_000L) {
             fetchDocForBrowse(url)
         }
         if (doc == null) {
@@ -620,35 +613,20 @@ class Arabp : MainAPI() {
             Triple("$mainUrl/index.php?page=movies-listing&search=$encoded", "movies", TvType.Movie)
         )
 
-        // Run the 3 listing searches IN PARALLEL using browseClient (no rate limiter).
-        // Previously these were sequential through authClient (1500ms rate limiter),
-        // taking ~6-9s. Now they run concurrently in ~2-3s.
-        try {
-            val listingResults = coroutineScope {
-                listingPages.map { (listingUrl, label, tvType) ->
-                    async(Dispatchers.IO) {
-                        try {
-                            val doc = fetchDocForBrowse(listingUrl)
-                            val listingResults = doc?.select("div.listing_div1")
-                                ?.mapNotNull { toSearchResult(it, tvType) }
-                                ?.filter { matchesQuery(it.name, queryLower) }
-                                ?: emptyList()
-                            Log.d(TAG, "$label listing search: found ${listingResults.size} results")
-                            listingResults
-                        } catch (e: Exception) {
-                            Log.e(TAG, "$label listing search error: ${e.message}")
-                            emptyList()
-                        }
-                    }
-                }.flatMap { it.await() }
+        for ((listingUrl, label, tvType) in listingPages) {
+            try {
+                val doc = fetchDoc(listingUrl)
+                val listingResults = doc?.select("div.listing_div1")
+                    ?.mapNotNull { toSearchResult(it, tvType) }
+                    ?.filter { matchesQuery(it.name, queryLower) }
+                    ?: emptyList()
+                Log.d(TAG, "$label listing search: found ${listingResults.size} results")
+                results.addAll(listingResults)
+            } catch (e: Exception) {
+                Log.e(TAG, "$label listing search error: ${e.message}")
             }
-            results.addAll(listingResults)
-        } catch (e: Exception) {
-            Log.e(TAG, "Parallel listing search error: ${e.message}")
         }
 
-        // Torrent search also uses browseClient for speed.
-        // Previously used authClient which added ~3s of rate-limiting delay.
         if (ensureLogin()) {
             try {
                 val torrentsUrl = "$mainUrl/index.php?page=torrents&search=$encoded&category=0&active=0"
@@ -657,7 +635,7 @@ class Arabp : MainAPI() {
                     .headers(getAuthHeaders(referer = "$mainUrl/").toHeaders())
                     .build()
 
-                browseClient.newCall(request).execute().use { response ->
+                authClient.newCall(request).execute().use { response ->
                     val body = response.body?.string() ?: ""
                     val torrentsDoc = Jsoup.parse(body, torrentsUrl)
 
