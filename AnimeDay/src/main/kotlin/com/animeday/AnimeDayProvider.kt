@@ -1059,8 +1059,84 @@ class AnimeDayProvider : MainAPI() {
                 }
             }
 
-            // 4. ok.ru / Google Photos / other — SKIP (extraction needs multiple
-            //    HTTP calls which crashes). Try next server.
+            // 4. ok.ru — SINGLE HTTP extraction (metadata API only, skip HLS)
+            else if (cleanUrl.contains("ok.ru/video") || cleanUrl.contains("ok.ru/videoembed")) {
+                try {
+                    val videoId = Regex("""ok\.ru/video(?:embed)?/(\d+)""").find(cleanUrl)?.groupValues?.get(1) ?: continue
+                    val agents = getAgents()
+                    val userAgent = agents?.okRuAgent?.takeIf { it.isNotEmpty() }
+                        ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36"
+                    val cookie = agents?.okRuCookie?.takeIf { it.isNotEmpty() } ?: ""
+                    val metadataUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
+                    val metaResponse = simpleHttpPost(
+                        metadataUrl,
+                        headers = mapOf("User-Agent" to userAgent, "Cookie" to cookie, "Content-Type" to "application/x-www-form-urlencoded")
+                    ) ?: continue
+                    val metadata = mapper.readTree(metaResponse)
+                    // Get FIRST direct video URL from "videos" array
+                    val videosNode = metadata?.get("videos")
+                    if (videosNode != null && videosNode.isArray) {
+                        for (v in videosNode) {
+                            val vUrl = v.get("url")?.asText()
+                            if (!vUrl.isNullOrEmpty()) {
+                                callback(
+                                    newExtractorLink(
+                                        source = serverName,
+                                        name = serverName,
+                                        url = vUrl,
+                                        type = if (vUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                                    ) {
+                                        this.referer = mainUrl
+                                        this.quality = Qualities.Unknown.value
+                                    }
+                                )
+                                foundAny = true
+                                break  // Got a direct URL, stop
+                            }
+                        }
+                    }
+                    if (foundAny) break
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                }
+            }
+
+            // 5. Google Photos — SINGLE HTTP extraction (HTML scraping)
+            else if (cleanUrl.contains("photos.google.com")) {
+                try {
+                    val agents = getAgents()
+                    val gPhotosHeaders = mutableMapOf<String, String>()
+                    val agent = agents?.gPhotosAgent?.takeIf { it.isNotEmpty() }
+                        ?: "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Mobile Safari/537.36"
+                    gPhotosHeaders["User-Agent"] = agent
+                    agents?.gPhotosCookie?.takeIf { it.isNotEmpty() }?.let { gPhotosHeaders["Cookie"] = it }
+                    val pageText = simpleHttpGet(cleanUrl, gPhotosHeaders) ?: continue
+                    val fixed = Regex("%(?![0-9a-fA-F]{2})").replace(pageText) { "%25" }
+                    val decoded = java.net.URLDecoder.decode(fixed, "UTF-8")
+                    // Extract video-downloads URL (Original quality) — direct video URL
+                    val videoDownloadPattern = Regex("""https://video-downloads\.googleusercontent\.com/[^"\\\s]+""")
+                    val videoUrl = videoDownloadPattern.find(decoded)?.value
+                    if (!videoUrl.isNullOrEmpty()) {
+                        callback(
+                            newExtractorLink(
+                                source = serverName,
+                                name = serverName,
+                                url = videoUrl,
+                                type = ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = mainUrl
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                        foundAny = true
+                        break  // Got a direct URL, stop
+                    }
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                }
+            }
+
+            // 6. Other — skip, try next server
         }
 
         return foundAny
