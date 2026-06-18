@@ -115,12 +115,10 @@ data class LinkData(
     val videoUrls: Map<String, Pair<String, Boolean>>  // server name -> (raw URL, needsExtraction)
 )
 
-// CRASH FIX v37: Single RESOLVED link data — the URL is ALREADY a direct
-// video URL (resolved in load() which is safe — no player competition).
-// loadLinks just returns it with ZERO HTTP. This is critical because
-// CloudStream's player uses OkHttpDataSource (shared app.baseClient) for
-// streaming. If loadLinks also does HTTP, the combined OkHttp thread
-// pressure crashes phones/TVs (pthread_create failed).
+// CRASH FIX v32: Single RESOLVED link data — passed to loadLinks when user
+// clicks an "episode". The URL is ALREADY a direct video URL (resolved in
+// load() which is safe — no player competition). loadLinks just returns it
+// with ZERO HTTP. Each quality (1080p, 720p, etc.) is a separate episode.
 data class SingleLinkData(
     val name: String,           // Display name: "Server1 - 1080p"
     val directUrl: String,      // ALREADY resolved direct video URL
@@ -283,13 +281,57 @@ class AnimeDayProvider : MainAPI() {
                u.contains("/videoplayback")
     }
 
-    // CRASH FIX v37: Resolve a SINGLE video URL to ALL available qualities.
+    // CRASH FIX v31: Resolve a SINGLE video URL to a direct video URL.
+    // Called from loadLinks for ONE link at a time. Player gets ONE link.
+    private fun resolveSingleUrl(url: String): String? {
+        val cleanUrl = url.trim()
+        if (cleanUrl.isEmpty()) return null
+        if (isDirectVideoUrl(cleanUrl)) return cleanUrl
+        return try {
+            when {
+                cleanUrl.contains(".workers.dev/") -> {
+                    val responseText = simpleHttpGet(cleanUrl, authHeaders) ?: return null
+                    val trimmed = responseText.trim()
+                    if (trimmed.startsWith("{")) {
+                        val node = mapper.readTree(responseText)
+                        node?.get("availableQualities")?.takeIf { it.isArray }?.firstOrNull()?.let { it.get("url")?.asText() }
+                            ?: node?.get("url")?.asText()
+                            ?: node?.get("videos")?.takeIf { it.isArray }?.firstOrNull()?.let { it.get("url")?.asText() }
+                    } else if (trimmed.startsWith("[")) {
+                        parseList<VideoQuality>(responseText).firstOrNull()?.url
+                    } else null
+                }
+                cleanUrl.contains("ok.ru/video") || cleanUrl.contains("ok.ru/videoembed") -> {
+                    val videoId = Regex("""ok\.ru/video(?:embed)?/(\d+)""").find(cleanUrl)?.groupValues?.get(1) ?: return null
+                    val agents = getAgents()
+                    val userAgent = agents?.okRuAgent?.takeIf { it.isNotEmpty() } ?: "Mozilla/5.0"
+                    val cookie = agents?.okRuCookie?.takeIf { it.isNotEmpty() } ?: ""
+                    val metaResponse = simpleHttpPost("https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId", headers = mapOf("User-Agent" to userAgent, "Cookie" to cookie, "Content-Type" to "application/x-www-form-urlencoded")) ?: return null
+                    val metadata = mapper.readTree(metaResponse)
+                    metadata?.get("videos")?.takeIf { it.isArray }?.firstOrNull()?.let { it.get("url")?.asText() }
+                }
+                cleanUrl.contains("photos.google.com") -> {
+                    val agents = getAgents()
+                    val gPhotosHeaders = mutableMapOf<String, String>()
+                    gPhotosHeaders["User-Agent"] = agents?.gPhotosAgent?.takeIf { it.isNotEmpty() } ?: "Mozilla/5.0"
+                    agents?.gPhotosCookie?.takeIf { it.isNotEmpty() }?.let { gPhotosHeaders["Cookie"] = it }
+                    val pageText = simpleHttpGet(cleanUrl, gPhotosHeaders) ?: return null
+                    val fixed = Regex("%(?![0-9a-fA-F]{2})").replace(pageText) { "%25" }
+                    val decoded = java.net.URLDecoder.decode(fixed, "UTF-8")
+                    Regex("""https://video-downloads\.googleusercontent\.com/[^"\\\s]+""").find(decoded)?.value
+                }
+                else -> null
+            }
+        } catch (_: Exception) { null }
+    }
+
+    // CRASH FIX v32: Resolve a SINGLE video URL to ALL available qualities.
     // Returns list of (display name, direct URL, isM3u8). Called from load()
     // (safe — no player competition). Each quality becomes a separate episode.
-    // loadLinks then returns the pre-resolved DIRECT URL with ZERO HTTP.
     private fun resolveAllUrls(url: String, serverName: String): List<Triple<String, String, Boolean>> {
         val cleanUrl = url.trim()
         if (cleanUrl.isEmpty()) return emptyList()
+        // Already direct — return as single quality
         if (isDirectVideoUrl(cleanUrl)) {
             return listOf(Triple(serverName, cleanUrl, cleanUrl.contains(".m3u8")))
         }
@@ -301,16 +343,19 @@ class AnimeDayProvider : MainAPI() {
                     val results = mutableListOf<Triple<String, String, Boolean>>()
                     if (trimmed.startsWith("{")) {
                         val node = mapper.readTree(responseText)
+                        // availableQualities array — multiple qualities
                         node?.get("availableQualities")?.takeIf { it.isArray }?.forEach { q ->
                             val qualityStr = q.get("quality")?.asText() ?: return@forEach
                             val streamUrl = q.get("url")?.asText() ?: return@forEach
                             results.add(Triple("$serverName - $qualityStr", streamUrl, streamUrl.contains(".m3u8")))
                         }
+                        // Single url field
                         if (results.isEmpty()) {
                             node?.get("url")?.asText()?.takeIf { it.isNotEmpty() }?.let {
                                 results.add(Triple(serverName, it, it.contains(".m3u8")))
                             }
                         }
+                        // videos array
                         if (results.isEmpty()) {
                             node?.get("videos")?.takeIf { it.isArray }?.forEach { v ->
                                 val vUrl = v.get("url")?.asText() ?: return@forEach
@@ -343,21 +388,20 @@ class AnimeDayProvider : MainAPI() {
                     results
                 }
                 cleanUrl.contains("photos.google.com") -> {
-                    // CRASH FIX v37: Google Photos — restore it. The URL itself
-                    // is fine (direct MP4). The crash was from loadLinks doing
-                    // HTTP extraction WHILE the player starts (combined OkHttp
-                    // thread pressure). Now load() pre-resolves (safe), and
-                    // loadLinks does ZERO HTTP, so the player has full OkHttp
-                    // thread headroom for streaming.
-                    val agents = getAgents()
-                    val gPhotosHeaders = mutableMapOf<String, String>()
-                    gPhotosHeaders["User-Agent"] = agents?.gPhotosAgent?.takeIf { it.isNotEmpty() } ?: "Mozilla/5.0"
-                    agents?.gPhotosCookie?.takeIf { it.isNotEmpty() }?.let { gPhotosHeaders["Cookie"] = it }
-                    val pageText = simpleHttpGet(cleanUrl, gPhotosHeaders) ?: return emptyList()
-                    val fixed = Regex("%(?![0-9a-fA-F]{2})").replace(pageText) { "%25" }
-                    val decoded = java.net.URLDecoder.decode(fixed, "UTF-8")
-                    val videoUrl = Regex("""https://video-downloads\.googleusercontent\.com/[^"\\\s]+""").find(decoded)?.value
-                    if (!videoUrl.isNullOrEmpty()) listOf(Triple("$serverName - Original", videoUrl, false)) else emptyList()
+                    // CRASH FIX v36: SKIP Google Photos servers.
+                    //
+                    // v35 tried marking Google Photos as M3U8 to use progressive
+                    // streaming — but that made CloudStream try to parse a 233MB
+                    // MP4 as an HLS playlist, crashing the HOME PAGE.
+                    //
+                    // The real issue: Google Photos URLs return 233MB+ direct MP4
+                    // files. CloudStream's OkHttp-based player buffers aggressively
+                    // -> OOM on phones/TVs. The AnimeDay app streams progressively
+                    // via ExoPlayer's HttpURLConnection-based DataSource.
+                    //
+                    // We can't change CloudStream's player. So skip Google Photos.
+                    // Users have other servers (workers.dev, ok.ru, direct).
+                    emptyList()
                 }
                 else -> emptyList()
             }
@@ -1086,16 +1130,15 @@ class AnimeDayProvider : MainAPI() {
             }
         }
 
-        // CRASH FIX v37: Pre-resolve ALL qualities in load() (safe — no player
-        // competition). Each quality becomes a separate "episode". loadLinks
-        // just returns the pre-resolved DIRECT URL with ZERO HTTP. This is
-        // critical because CloudStream's player uses OkHttpDataSource (shared
-        // app.baseClient) for streaming. If loadLinks also does HTTP, the
-        // combined OkHttp thread pressure crashes phones/TVs.
+        // CRASH FIX v32: Resolve ALL qualities in load() (safe — no player
+        // competition). Each quality (1080p, 720p, etc.) becomes a separate
+        // "episode". loadLinks just returns the pre-resolved DIRECT URL with
+        // ZERO HTTP. Player handles ONE link -> no crash.
         //
-        // By pre-resolving in load() (HttpURLConnection, no player competition)
-        // and doing ZERO HTTP in loadLinks, the player has full OkHttp thread
-        // headroom for streaming — even Google Photos URLs work.
+        // Structure:
+        //   Season N = anime episode N
+        //   Episode 1 = "Server1 - 1080p", Episode 2 = "Server1 - 720p",
+        //   Episode 3 = "Server2 - 1080p", etc.
         val allEpisodes = mutableListOf<Episode>()
         for (playlist in playlists) {
             playlistEpisodes[playlist.id]?.let { allEpisodes.addAll(it) }
@@ -1119,12 +1162,14 @@ class AnimeDayProvider : MainAPI() {
                 val (rawUrl, _) = urlAndExtraction
                 if (rawUrl.isBlank()) return@forEach
 
+                // Get ALL qualities for this server URL
                 val qualities = try { resolveAllUrls(rawUrl, serverName) } catch (_: Exception) { emptyList() }
 
                 for ((name, directUrl, isM3u8) in qualities) {
+                    // Store the RESOLVED direct URL — loadLinks just returns it
                     val singleLinkData = SingleLinkData(name, directUrl, isM3u8)
                     cloudstreamEpisodes.add(newEpisode(singleLinkData.toJson()) {
-                        this.name = name
+                        this.name = name  // "Server1 - 1080p"
                         this.season = seasonNum
                         this.episode = ++episodeIdx
                         this.posterUrl = ep.thumb?.takeIf { it.isNotEmpty() } ?: poster
@@ -1166,13 +1211,12 @@ class AnimeDayProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // CRASH FIX v37: loadLinks returns the PRE-RESOLVED direct URL with
-        // ZERO HTTP. URL was already resolved in load() (safe — no player
-        // competition). This is critical: CloudStream's player uses
-        // OkHttpDataSource (shared app.baseClient) for streaming. If loadLinks
-        // also does HTTP, the combined OkHttp thread pressure crashes
-        // phones/TVs (pthread_create failed). By doing ZERO HTTP here, the
-        // player has full thread headroom — even Google Photos URLs work.
+        // CRASH FIX v34: loadLinks returns the PRE-RESOLVED direct URL.
+        // URL was already resolved in load() (safe — no player competition).
+        // loadLinks just returns it with ZERO HTTP. Player gets ONE direct
+        // video URL -> plays immediately -> no crash, no 3003.
+        // Google Photos servers are skipped in resolveAllUrls (they crash
+        // on phones/TVs — hardware/resource issue, not auth).
         val singleLink = tryParseJson<SingleLinkData>(data)
         if (singleLink != null) {
             kotlinx.coroutines.yield()
@@ -1195,7 +1239,7 @@ class AnimeDayProvider : MainAPI() {
             return false
         }
 
-        // Movie: resolve on demand (movies are less frequent)
+        // Movie: handle all servers (resolve on demand — movies are less frequent)
         val linkData = tryParseJson<LinkData>(data) ?: return false
         val videoUrls = linkData.videoUrls
         if (videoUrls.isEmpty()) return false
