@@ -903,5 +903,28 @@
   "description": "Xtream Codes IPTV - Live TV, Movies & Series",
   "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/XtreamIPTV.cs3",
   "name": "Xtream IPTV"
-  }
+  },
+  {
+  "iconUrl": "https://arabicsource.net/img/logo.png",
+  "apiVersion": 1,
+  "repositoryUrl": "https://github.com/maleek18000/CSSD",
+  "fileSize": 40000,
+  "status": 1,
+  "language": "ar",
+  "authors": [
+    "Armano"
+  ],
+  "tvTypes": [
+    "Movie",
+    "TvSeries",
+    "Anime",
+    "AnimeMovie",
+    "OVA"
+  ],
+  "version": 1,
+  "internalName": "ArabicSource",
+  "description": "المصدر العربي - Arabic torrent tracker with movies, series, anime & documentaries",
+  "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/ArabicSource.cs3",
+  "name": "المصدر العربي"
+ } 
 ]
