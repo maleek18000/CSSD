@@ -4,7 +4,7 @@ import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
-import okhttp3.MultipartBody
+import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Cookie
 import okhttp3.HttpUrl
@@ -175,20 +175,19 @@ class ArabicSource : MainAPI() {
                 ?: loginDoc.selectFirst("input[name=_token]")?.attr("value")
                 ?: return
 
-            // Build multipart form (NOT url-encoded — UNIT3D captcha requires multipart)
-            val formBuilder = MultipartBody.Builder()
-                .setType(MultipartBody.FORM)
-                .addFormDataPart("_token", csrfToken)
-                .addFormDataPart("username", LOGIN_USERNAME)
-                .addFormDataPart("password", LOGIN_PASSWORD)
-                .addFormDataPart("remember", "on")
+            // Build URL-encoded form (UNIT3D login expects application/x-www-form-urlencoded)
+            val formBuilder = FormBody.Builder()
+                .add("_token", csrfToken)
+                .add("username", LOGIN_USERNAME)
+                .add("password", LOGIN_PASSWORD)
+                .add("remember", "on")
             // Add all other hidden inputs (captcha, dynamic timestamp, etc.)
             loginDoc.select("input[type=hidden]").forEach { input ->
                 val inputName = input.attr("name")
                 val inputValue = input.attr("value")
                 if (inputName == "_username" || inputName == "username" || inputName == "password") return@forEach
                 if (inputName == "_token") return@forEach
-                formBuilder.addFormDataPart(inputName, inputValue)
+                formBuilder.add(inputName, inputValue)
             }
             val formBody = formBuilder.build()
 
@@ -281,16 +280,16 @@ class ArabicSource : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════
 
     override val mainPage = mainPageOf(
-        "$mainUrl/torrents?categoryIds[0]=1" to "أفلام رسوم مدبلجة",
-        "$mainUrl/torrents?categoryIds[0]=2" to "أفلام رسوم مترجمة",
-        "$mainUrl/torrents?categoryIds[0]=3" to "أفلام عربية",
-        "$mainUrl/torrents?categoryIds[0]=4" to "أفلام أجنبية",
-        "$mainUrl/torrents?categoryIds[0]=5" to "مسلسلات رسوم مدبلجة",
-        "$mainUrl/torrents?categoryIds[0]=6" to "مسلسلات رسوم مترجمة",
-        "$mainUrl/torrents?categoryIds[0]=7" to "مسلسلات عربية",
-        "$mainUrl/torrents?categoryIds[0]=22" to "مسلسلات أجنبية",
-        "$mainUrl/torrents?categoryIds[0]=9" to "أفلام وثائقية",
-        "$mainUrl/torrents?categoryIds[0]=20" to "مسلسلات وثائقية"
+        "$mainUrl/torrents?categoryIds%5B0%5D=1" to "أفلام رسوم مدبلجة",
+        "$mainUrl/torrents?categoryIds%5B0%5D=2" to "أفلام رسوم مترجمة",
+        "$mainUrl/torrents?categoryIds%5B0%5D=3" to "أفلام عربية",
+        "$mainUrl/torrents?categoryIds%5B0%5D=4" to "أفلام أجنبية",
+        "$mainUrl/torrents?categoryIds%5B0%5D=5" to "مسلسلات رسوم مدبلجة",
+        "$mainUrl/torrents?categoryIds%5B0%5D=6" to "مسلسلات رسوم مترجمة",
+        "$mainUrl/torrents?categoryIds%5B0%5D=7" to "مسلسلات عربية",
+        "$mainUrl/torrents?categoryIds%5B0%5D=22" to "مسلسلات أجنبية",
+        "$mainUrl/torrents?categoryIds%5B0%5D=9" to "أفلام وثائقية",
+        "$mainUrl/torrents?categoryIds%5B0%5D=20" to "مسلسلات وثائقية"
     )
 
     override suspend fun getMainPage(
@@ -302,7 +301,7 @@ class ArabicSource : MainAPI() {
         val doc = fetchDoc(url) ?: return newHomePageResponse(request.name, emptyList(), false)
 
         val items = parseTorrentList(doc)
-        val hasNext = doc.selectFirst(".pagination__next:not(.pagination__previous--disabled) a") != null
+        val hasNext = doc.selectFirst(".pagination__next a[href]") != null
         return newHomePageResponse(request.name, items, hasNext)
     }
 
