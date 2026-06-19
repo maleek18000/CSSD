@@ -513,6 +513,55 @@ class ArabicSource : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // GHOST PEER CLEANUP
+    // ═══════════════════════════════════════════════════════════════════
+
+    /**
+     * Flushes ghost/stale peers from the tracker so they don't count
+     * against the concurrent-download limit. Called automatically before
+     * each torrent stream.
+     *
+     * API:  POST /users/{user}/active  with  _method=DELETE  (Laravel spoofed)
+     */
+    private fun flushGhostPeers() {
+        try {
+            // 1) GET the active-torrents page to grab a fresh CSRF token
+            val getReq = okhttp3.Request.Builder()
+                .url("$mainUrl/users/$LOGIN_USERNAME/active")
+                .header("User-Agent", USER_AGENTS[0])
+                .header("Accept", "text/html")
+                .build()
+            val getResp = browseClient.newCall(getReq).execute()
+            val getBody = getResp.body?.string() ?: return
+            getResp.close()
+
+            // 2) Extract CSRF token from the page
+            val doc = Jsoup.parse(getBody, "$mainUrl/users/$LOGIN_USERNAME/active")
+            val csrf = doc.selectFirst("input[name=_token]")?.attr("value") ?: return
+
+            // 3) POST with _method=DELETE to flush ghost peers
+            val formBody = FormBody.Builder()
+                .add("_token", csrf)
+                .add("_method", "DELETE")
+                .build()
+
+            val postReq = okhttp3.Request.Builder()
+                .url("$mainUrl/users/$LOGIN_USERNAME/active")
+                .header("User-Agent", USER_AGENTS[0])
+                .header("Referer", "$mainUrl/users/$LOGIN_USERNAME/active")
+                .header("Origin", mainUrl)
+                .post(formBody)
+                .build()
+            val postResp = browseClient.newCall(postReq).execute()
+            postResp.close()
+
+            Log.d(TAG, "Ghost peer flush sent")
+        } catch (e: Exception) {
+            Log.w(TAG, "Ghost peer flush failed (non-fatal)", e)
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // LOAD LINKS (VIDEO EXTRACTION)
     // ═══════════════════════════════════════════════════════════════════
 
@@ -523,6 +572,8 @@ class ArabicSource : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         ensureLogin()
+        // Clean up ghost peers from previous sessions before starting a new stream
+        flushGhostPeers()
         val parts = data.split("|")
         if (parts.size < 2) return false
 
