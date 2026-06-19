@@ -144,55 +144,74 @@ class ArabicSource : MainAPI() {
 
     private fun performLogin() {
         try {
-            val getResponse = authClient.newCall(
+            // Use a redirect-following client for login flow
+            val loginClient = browseClient.newBuilder()
+                .followRedirects(true)
+                .followSslRedirects(true)
+                    .cookieJar(cookieJar)
+                    .build()
+
+            val getResponse = loginClient.newCall(
                 okhttp3.Request.Builder()
                     .url("$mainUrl/login")
-                    .header("User-Agent", USER_AGENTS.random())
+                    .header("User-Agent", USER_AGENTS[0])
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .header("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
                     .build()
             ).execute()
 
             val loginPageBody = getResponse.body?.string() ?: return
+            getResponse.close()
             val loginDoc = Jsoup.parse(loginPageBody, mainUrl)
 
-            if (!getResponse.isRedirect && getResponse.code == 200) {
-                val csrfToken = loginDoc.selectFirst("meta[name=csrf-token]")?.attr("content")
-                    ?: loginDoc.selectFirst("input[name=_token]")?.attr("value")
-                    ?: return
-
-                val captchaField = loginDoc.selectFirst("input[name=_captcha]")?.attr("value") ?: ""
-
-                val formBody = FormBody.Builder()
-                    .add("_token", csrfToken)
-                    .add("username", LOGIN_USERNAME)
-                    .add("password", LOGIN_PASSWORD)
-                    .add("remember", "on")
-                    .add("_captcha", captchaField)
-                    .build()
-
-                val postResponse = authClient.newCall(
-                    okhttp3.Request.Builder()
-                        .url("$mainUrl/login")
-                        .header("User-Agent", USER_AGENTS.random())
-                        .header("Referer", "$mainUrl/login")
-                        .header("X-Requested-With", "XMLHttpRequest")
-                        .post(formBody)
-                        .build()
-                ).execute()
-
-                if (postResponse.isRedirect) {
-                    val location = postResponse.header("Location") ?: return
-                    authClient.newCall(
-                        okhttp3.Request.Builder()
-                            .url(location)
-                            .header("User-Agent", USER_AGENTS.random())
-                            .build()
-                    ).execute()
-                }
-                postResponse.close()
+            // Already logged in if redirected away from /login
+            if (!loginPageBody.contains("name=\"password\"") && !loginPageBody.contains("name='password'")) {
+                loggedIn = true
+                Log.d(TAG, "Already logged in")
+                return
             }
-            getResponse.close()
+
+            val csrfToken = loginDoc.selectFirst("meta[name=csrf-token]")?.attr("content")
+                ?: loginDoc.selectFirst("input[name=_token]")?.attr("value")
+                ?: return
+
+            // Build form with ALL hidden fields (except honeypot _username)
+            val formBuilder = FormBody.Builder()
+                .add("_token", csrfToken)
+                .add("username", LOGIN_USERNAME)
+                .add("password", LOGIN_PASSWORD)
+                .add("remember", "on")
+            // Add all other hidden inputs (captcha, dynamic timestamp, etc.)
+            loginDoc.select("input[type=hidden]").forEach { input ->
+                val inputName = input.attr("name")
+                val inputValue = input.attr("value")
+                if (inputName == "_username" || inputName == "username" || inputName == "password") return@forEach
+                if (inputName == "_token") return@forEach
+                formBuilder.add(inputName, inputValue)
+            }
+            val formBody = formBuilder.build()
+
+            val postResponse = loginClient.newCall(
+                okhttp3.Request.Builder()
+                    .url("$mainUrl/login")
+                    .header("User-Agent", USER_AGENTS[0])
+                    .header("Referer", "$mainUrl/login")
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .header("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
+                    .header("Origin", mainUrl)
+                    .post(formBody)
+                    .build()
+            ).execute()
+
+            val postBody = postResponse.body?.string()
+            postResponse.close()
+
             loggedIn = isSessionAlive()
-            if (loggedIn) Log.d(TAG, "Login successful") else Log.w(TAG, "Login failed")
+            if (loggedIn) {
+                Log.d(TAG, "Login successful")
+            } else {
+                Log.w(TAG, "Login failed. Response snippet: ${postBody?.take(200)}")
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Login error", e)
         }
@@ -296,10 +315,10 @@ class ArabicSource : MainAPI() {
                 val typeId = row.attr("data-type-id") ?: ""
                 val resolutionId = row.attr("data-resolution-id") ?: ""
 
-                val nameEl = row.selectFirst(".torrent-search--list__name a")
+                val nameEl = row.selectFirst("a.torrent-search--list__name")
                 val name = nameEl?.text()?.trim() ?: continue
-                val href = nameEl.attr("abs:href")
-                if (href.isBlank()) continue
+                val href = nameEl?.attr("abs:href")
+                if (href.isNullOrBlank()) continue
 
                 val sizeText = row.selectFirst(".torrent-search--list__size span")?.text()?.trim() ?: ""
                 val seeders = row.selectFirst(".torrent-search--list__seeders a")?.text()?.trim()?.toIntOrNull() ?: 0
@@ -308,7 +327,7 @@ class ArabicSource : MainAPI() {
                 val resolution = resolutionIdToName(resolutionId)
                 val encodeType = typeIdToName(typeId)
 
-                val posterUrl = row.selectFirst("img.torrent-search--list__poster")?.attr("abs:src")
+                // No posters in list view on this site
 
                 val response: SearchResponse = when (tvType) {
                     TvType.Anime, TvType.AnimeMovie, TvType.OVA -> {
