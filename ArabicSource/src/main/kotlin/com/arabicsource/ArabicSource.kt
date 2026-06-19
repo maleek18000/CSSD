@@ -4,7 +4,7 @@ import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
-import okhttp3.FormBody
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Cookie
 import okhttp3.HttpUrl
@@ -175,19 +175,20 @@ class ArabicSource : MainAPI() {
                 ?: loginDoc.selectFirst("input[name=_token]")?.attr("value")
                 ?: return
 
-            // Build form with ALL hidden fields (except honeypot _username)
-            val formBuilder = FormBody.Builder()
-                .add("_token", csrfToken)
-                .add("username", LOGIN_USERNAME)
-                .add("password", LOGIN_PASSWORD)
-                .add("remember", "on")
+            // Build multipart form (NOT url-encoded — UNIT3D captcha requires multipart)
+            val formBuilder = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("_token", csrfToken)
+                .addFormDataPart("username", LOGIN_USERNAME)
+                .addFormDataPart("password", LOGIN_PASSWORD)
+                .addFormDataPart("remember", "on")
             // Add all other hidden inputs (captcha, dynamic timestamp, etc.)
             loginDoc.select("input[type=hidden]").forEach { input ->
                 val inputName = input.attr("name")
                 val inputValue = input.attr("value")
                 if (inputName == "_username" || inputName == "username" || inputName == "password") return@forEach
                 if (inputName == "_token") return@forEach
-                formBuilder.add(inputName, inputValue)
+                formBuilder.addFormDataPart(inputName, inputValue)
             }
             val formBody = formBuilder.build()
 
@@ -331,19 +332,13 @@ class ArabicSource : MainAPI() {
 
                 val response: SearchResponse = when (tvType) {
                     TvType.Anime, TvType.AnimeMovie, TvType.OVA -> {
-                        newAnimeSearchResponse(name, href, tvType) {
-                            this.posterUrl = posterUrl
-                        }
+                        newAnimeSearchResponse(name, href, tvType)
                     }
                     TvType.TvSeries -> {
-                        newTvSeriesSearchResponse(name, href, tvType) {
-                            this.posterUrl = posterUrl
-                        }
+                        newTvSeriesSearchResponse(name, href, tvType)
                     }
                     else -> {
-                        newMovieSearchResponse(name, href, tvType) {
-                            this.posterUrl = posterUrl
-                        }
+                        newMovieSearchResponse(name, href, tvType)
                     }
                 }
 
@@ -412,9 +407,11 @@ class ArabicSource : MainAPI() {
         // Rating (site uses 0-10 scale)
         val ratingValue = doc.selectFirst(".meta__rating-value")?.text()?.trim()?.toDoubleOrNull()
 
-        // Determine TvType from category link
-        val categoryLink = doc.selectFirst(".torrent__category a")?.attr("abs:href") ?: ""
-        val categoryId = Regex("categoryIds\\[\\d+]=(\\d+)").find(categoryLink)?.groupValues?.get(1) ?: "4"
+        // Determine TvType from category tag on detail page
+        val categoryLink = doc.selectFirst(".work__media-type a")?.attr("abs:href") ?: ""
+        val categoryId = Regex("categoryIds%5B\\d+%5D=(\\d+)").find(categoryLink)?.groupValues?.get(1)
+            ?: Regex("categoryIds\\[\\d+]=(\\d+)").find(categoryLink)?.groupValues?.get(1)
+            ?: "4"
         val tvType = categoryToTvType(categoryId)
 
         // Download URL
