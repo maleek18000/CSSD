@@ -695,6 +695,7 @@ class Arabp2 : MainAPI() {
         val detailHref: String,
         val downloadHref: String,
         val magnetHref: String,
+        val posterUrl: String,
         val isFree: Boolean,
         val isExternal: Boolean,
         val baseData: String
@@ -707,6 +708,18 @@ class Arabp2 : MainAPI() {
         val torrentId = DIGITS.find(detailHref.substringAfter("id="))?.value ?: return null
         val downloadHref = row.selectFirst("a[href*=download.php]")?.attr("href") ?: ""
         val magnetHref = row.selectFirst("a[href^=magnet:]")?.attr("href") ?: ""
+
+        // Poster URL — try common locations used by torrent sites.
+        // arabp2p.net uses jQuery lightbox-style <a class="screenshot" rel="IMAGE_URL">;
+        // some pages use <img data-original="..."> (lazy-load) or a plain poster <img>.
+        // Reading from already-fetched HTML = zero extra HTTP requests = no slowdown.
+        val posterUrl = row.selectFirst("a.screenshot")?.attr("rel")
+            ?: row.selectFirst("a.screenshot")?.attr("data-src")
+            ?: row.selectFirst("img[data-original]")?.attr("data-original")
+            ?: row.selectFirst("img[src*=poster]")?.attr("src")
+            ?: row.selectFirst("img")?.attr("src")
+            ?: ""
+
         val isFree = isFreeTorrent(row)
         val isExternal = isExternalTorrent(row)
 
@@ -721,14 +734,14 @@ class Arabp2 : MainAPI() {
             if (seeders.isNotEmpty()) append(" | ▲$seeders")
         }
         val baseData = "$torrentId|${toAbsoluteUrl(detailHref)}|${toAbsoluteUrl(downloadHref)}|$magnetHref|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
-        TorrentRowInfo(displayName, torrentId, detailHref, downloadHref, magnetHref, isFree, isExternal, baseData)
+        TorrentRowInfo(displayName, torrentId, detailHref, downloadHref, magnetHref, posterUrl, isFree, isExternal, baseData)
     } catch (e: Exception) {
         Log.e(TAG, "parseTorrentRow: ${e.message}")
         null
     }
 
     private fun toSearchResult(info: TorrentRowInfo, fallbackTvType: TvType = TvType.Anime): SearchResponse? {
-        val posterUrl = "" // category pages usually have no per-row poster
+        val absPosterUrl = if (info.posterUrl.isNotBlank()) toAbsoluteUrl(info.posterUrl) else ""
         val tvType = when {
             info.displayName.contains("فيلم", ignoreCase = true) || info.displayName.contains("Movie", ignoreCase = true) -> {
                 if (fallbackTvType == TvType.Anime) TvType.AnimeMovie else TvType.Movie
@@ -738,15 +751,15 @@ class Arabp2 : MainAPI() {
         }
         return when (tvType) {
             TvType.TvSeries -> newTvSeriesSearchResponse(info.displayName, info.baseData, tvType) {
-                this.posterUrl = toAbsoluteUrl(posterUrl)
+                this.posterUrl = absPosterUrl
                 this.posterHeaders = imageHeaders
             }
             TvType.Movie -> newMovieSearchResponse(info.displayName, info.baseData, tvType) {
-                this.posterUrl = toAbsoluteUrl(posterUrl)
+                this.posterUrl = absPosterUrl
                 this.posterHeaders = imageHeaders
             }
             else -> newAnimeSearchResponse(info.displayName, info.baseData, tvType) {
-                this.posterUrl = toAbsoluteUrl(posterUrl)
+                this.posterUrl = absPosterUrl
                 this.posterHeaders = imageHeaders
             }
         }
