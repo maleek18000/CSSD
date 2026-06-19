@@ -801,6 +801,21 @@
     "name": "Arabp"
   },
   {
+  "iconUrl": "https://www.arabp2p.net/favicon.ico",
+  "apiVersion": 1,
+  "repositoryUrl": "https://github.com/maleek18000/CSSD",
+  "fileSize": 53248,
+  "status": 1,
+  "language": "ar",
+  "authors": ["Abodabodd"],
+  "tvTypes": ["TvSeries", "Movie", "Anime", "AnimeMovie", "OVA"],
+  "version": 1,
+  "internalName": "Arabp2",
+  "description": "Arabp2 - Fast rewrite of Arabp for arabp2p.net. Loads episode lists from HTML detail pages instead of downloading .torrent files in load(), so shows with multiple quality variants load ~5x faster. Each quality variant appears as its own season.",
+  "url": "https://github.com/maleek18000/CSSD/raw/refs/heads/main/build/Arabp2.cs3",
+  "name": "Arabp2"
+  },
+  {
   "iconUrl": "https://arab-torrents.com/favicon.ico",
   "apiVersion": 1,
   "repositoryUrl": "https://github.com/maleek18000/CSSD",
