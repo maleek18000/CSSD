@@ -181,11 +181,11 @@ class ArabicSource : MainAPI() {
                 .add("username", LOGIN_USERNAME)
                 .add("password", LOGIN_PASSWORD)
                 .add("remember", "on")
-            // Add all other hidden inputs (captcha, dynamic timestamp, etc.)
+                .add("_username", "") // honeypot field (type=text, hidden off-screen) — MUST be present but empty
+            // Add all other hidden inputs (_captcha, dynamic timestamp, etc.)
             loginDoc.select("input[type=hidden]").forEach { input ->
                 val inputName = input.attr("name")
                 val inputValue = input.attr("value")
-                if (inputName == "_username" || inputName == "username" || inputName == "password") return@forEach
                 if (inputName == "_token") return@forEach
                 formBuilder.add(inputName, inputValue)
             }
