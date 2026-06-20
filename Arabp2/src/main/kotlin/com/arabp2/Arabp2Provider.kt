@@ -636,12 +636,20 @@ class Arabp2 : MainAPI() {
                         ?: detailDoc.selectFirst("td#Title h1 a[href*=download.php]")
                     if (dlLink != null) {
                         resolvedUrl = toAbsoluteUrl(dlLink.attr("href"))
-                        if (resolvedUrl.contains("&f=")) cacheResolvedUrl(torrentId, resolvedUrl)
+                        // If the detail-page download link lacks &f=, append a dummy
+                        // filename. arabp2p.net's download.php requires &f= to return
+                        // the .torrent binary; without it the server returns HTML.
+                        // Working categories already have &f= in their data string
+                        // and skip this block entirely (no slowdown).
+                        if (!resolvedUrl.contains("&f=")) {
+                            resolvedUrl = "$resolvedUrl&f=torrent.torrent"
+                        }
+                        cacheResolvedUrl(torrentId, resolvedUrl)
                     }
                 }
             }
 
-            if (resolvedUrl.isNotBlank()) {
+            if (resolvedUrl.isNotBlank() && resolvedUrl.contains("&f=")) {
                 var result = downloadTorrentFile(resolvedUrl)
                 if (result is TorrentDownloadResult.DailyLimitExceeded) {
                     Log.w(TAG, "loadLinks: daily limit hit, thanking and retrying...")
