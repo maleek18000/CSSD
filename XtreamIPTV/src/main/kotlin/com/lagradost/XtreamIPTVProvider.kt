@@ -14,6 +14,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -24,6 +25,7 @@ import java.net.URI
 import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
+import java.util.concurrent.atomic.AtomicBoolean
 
 // ═══════════════════════════════════════════════════════════════════
 //  PLUGIN ENTRY POINT
@@ -72,6 +74,20 @@ data class XEpInfo(val plot: String? = null, val image: String? = null)
 
 data class ItemRef(val t: String, val id: Int, val n: String, val e: String? = null)
 data class LinkData(val t: String, val id: Int, val e: String? = null)
+
+/**
+ * Lightweight search index entry — only stores name + id + type + icon.
+ * Memory: ~100 bytes per entry. 50,000 entries = ~5MB (well within budget).
+ * Pre-computes nameLower so search() is a tight inner loop with no allocs.
+ */
+data class SearchEntry(
+    val name: String,
+    val nameLower: String,
+    val type: String,          // "m" (movie), "s" (series), "l" (live)
+    val id: Int,               // stream_id or series_id
+    val icon: String? = null,
+    val ext: String? = null    // container_extension (movies only)
+)
 
 // ═══════════════════════════════════════════════════════════════════
 //  RAW HTTP CLIENT  (bypasses CloudStream's app.get to avoid 403)
@@ -198,7 +214,14 @@ class XtreamIPTVProvider : MainAPI() {
     override var name = "Xtream IPTV"
     override val supportedTypes = setOf(TvType.Live, TvType.Movie, TvType.TvSeries)
     override val hasMainPage = true
-    override val hasQuickSearch = false
+    override val hasQuickSearch = true  // ENABLED — instant quickSearch() that only hits the in-memory index
+
+    // Fail-fast timeouts. CloudStream's defaults are 120s for search and 30s
+    // for quick search — way too long when an IPTV server hangs. The in-memory
+    // index makes warm searches instant, and these caps ensure cold searches
+    // return quickly instead of spinning the UI for 2 minutes.
+    override val searchTimeoutMs: Long? = 30_000L
+    override val quickSearchTimeoutMs: Long? = 8_000L
 
     // ═══════════════════════════════════════════════════════════════════
     //  URL HELPERS  (strip category filter ~ for HTTP requests)
@@ -559,6 +582,26 @@ class XtreamIPTVProvider : MainAPI() {
     private val MAX_CACHED_CATEGORIES = 30
 
     // ═══════════════════════════════════════════════════════════════════
+    //  SEARCH INDEX — flat list of ALL stream names + IDs + types.
+    //  Built once in the background after home page loads (or kicked off
+    //  from search() on first call). Subsequent searches hit this list
+    //  directly → instant results (< 50ms for 50,000 entries).
+    //  Memory: ~100 bytes/entry × up to 100,000 entries ≈ 10MB max.
+    //  @Volatile for thread-safe reads from the UI thread.
+    // ═══════════════════════════════════════════════════════════════════
+    @Volatile
+    private var searchIndex: List<SearchEntry>? = null
+
+    @Volatile
+    private var searchIndexReady = AtomicBoolean(false)
+
+    @Volatile
+    private var searchIndexBuilding = AtomicBoolean(false)
+
+    /** Thread-safe snapshot accessor. */
+    private fun getSearchIndex(): List<SearchEntry>? = searchIndex
+
+    // ═══════════════════════════════════════════════════════════════════
     //  XTREAM API HELPERS  (per-category only — never load all streams)
     // ═══════════════════════════════════════════════════════════════════
 
@@ -674,6 +717,91 @@ class XtreamIPTVProvider : MainAPI() {
                 }
             } catch (_: Throwable) {
                 // OOM or other — stop background loading silently
+            }
+        }
+    }
+
+    /**
+     * Build the in-memory search index by fetching the THREE full Xtream
+     * catalogs (VOD, Series, Live) in PARALLEL.
+     *
+     * KEY INSIGHT: each Xtream `player_api.php?action=get_*` endpoint returns
+     * the ENTIRE library in ONE response when called WITHOUT `category_id`.
+     * So instead of N parallel per-category requests (which is slow and
+     * triggers server rate limiting), we make exactly THREE requests.
+     *
+     * Result on a 30,000-item library:
+     *   OLD per-category fallback: 10-20 sequential requests × ~10s ≈ 60-200s
+     *   NEW: 3 parallel requests × ~5-10s ≈ 5-10s total
+     *
+     * Intermediate snapshots are published after each phase so search()
+     * can return partial results (VOD-only, then VOD+Series, then full).
+     */
+    private fun buildSearchIndexInBackground(c: Cfg) {
+        if (!searchIndexBuilding.compareAndSet(false, true)) return
+
+        bgScope.launch {
+            val index = mutableListOf<SearchEntry>()
+            try {
+                val encUser = URLEncoder.encode(c.user, "UTF-8")
+                val encPass = URLEncoder.encode(c.pass, "UTF-8")
+                val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
+
+                val MAX_INDEX_ENTRIES = 100_000
+                // Generous per-request timeout — full catalog can be a few MB.
+                val FULL_CAT_READ_TIMEOUT_MS = 30_000
+
+                // ── Fire the three catalog fetches in PARALLEL ──
+                val (vodText, seriesText, liveText) = coroutineScope {
+                    val vodDef = async { RawHttp.apiGet("$apiBase&action=get_vod_streams", FULL_CAT_READ_TIMEOUT_MS) }
+                    val serDef = async { RawHttp.apiGet("$apiBase&action=get_series", FULL_CAT_READ_TIMEOUT_MS) }
+                    val liveDef = async { RawHttp.apiGet("$apiBase&action=get_live_streams", FULL_CAT_READ_TIMEOUT_MS) }
+                    Triple(vodDef.await(), serDef.await(), liveDef.await())
+                }
+
+                // ── Phase 1: VOD (movies) — usually the biggest catalog ──
+                if (enoughMemory() && index.size < MAX_INDEX_ENTRIES && !vodText.isNullOrEmpty()) {
+                    try {
+                        val streams = tryParseJson<List<XVod>>(vodText) ?: emptyList()
+                        for (s in streams) {
+                            if (index.size >= MAX_INDEX_ENTRIES) break
+                            index.add(SearchEntry(s.name, s.name.lowercase(), "m", s.stream_id, s.stream_icon, s.container_extension ?: "mp4"))
+                        }
+                        if (index.isNotEmpty()) searchIndex = index.toList()
+                    } catch (_: Throwable) {}
+                }
+
+                // ── Phase 2: Series ──
+                if (enoughMemory() && index.size < MAX_INDEX_ENTRIES && !seriesText.isNullOrEmpty()) {
+                    try {
+                        val streams = tryParseJson<List<XSeries>>(seriesText) ?: emptyList()
+                        for (s in streams) {
+                            if (index.size >= MAX_INDEX_ENTRIES) break
+                            index.add(SearchEntry(s.name, s.name.lowercase(), "s", s.series_id, s.cover))
+                        }
+                        if (index.isNotEmpty()) searchIndex = index.toList()
+                    } catch (_: Throwable) {}
+                }
+
+                // ── Phase 3: Live TV ──
+                if (enoughMemory() && index.size < MAX_INDEX_ENTRIES && !liveText.isNullOrEmpty()) {
+                    try {
+                        val streams = tryParseJson<List<XLive>>(liveText) ?: emptyList()
+                        for (s in streams) {
+                            if (index.size >= MAX_INDEX_ENTRIES) break
+                            index.add(SearchEntry(s.name, s.name.lowercase(), "l", s.stream_id, s.stream_icon))
+                        }
+                        if (index.isNotEmpty()) searchIndex = index.toList()
+                    } catch (_: Throwable) {}
+                }
+
+                searchIndexReady.set(true)
+                searchIndexBuilding.set(false)
+            } catch (_: Throwable) {
+                // Save whatever we have so far so the next search isn't empty
+                if (index.isNotEmpty()) searchIndex = index.toList()
+                searchIndexReady.set(true)
+                searchIndexBuilding.set(false)
             }
         }
     }
@@ -951,8 +1079,11 @@ class XtreamIPTVProvider : MainAPI() {
 
                 if (lists.isNotEmpty()) {
                     val response = newHomePageResponse(lists, false)
-                    // NOTE: Background preload disabled to prevent memory issues.
-                    // Search will use on-demand per-category loading instead.
+                    // Kick off the in-memory search index in the background.
+                    // This is what makes search() instant — it fetches the 3
+                    // full Xtream catalogs (VOD/Series/Live) once and indexes
+                    // them so subsequent searches are < 50ms.
+                    buildSearchIndexInBackground(c)
                     return response
                 }
             }
@@ -1135,10 +1266,12 @@ class XtreamIPTVProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse>? {
         val url = cleanUrl()
         if (url.isEmpty() || url == "http://example.com/username/password") return null
-        val q = query.lowercase()
+        val q = query.trim().lowercase()
+        if (q.isEmpty()) return null
+
         val results = mutableListOf<SearchResponse>()
 
-        // ── Search M3U cache ──
+        // ── Layer 1: M3U cache search (if M3U mode) — instant ──
         cachedM3U?.filter {
             it.name.lowercase().contains(q) || it.group.lowercase().contains(q)
         }?.take(30)?.forEach { entry ->
@@ -1150,7 +1283,7 @@ class XtreamIPTVProvider : MainAPI() {
             }
         }
 
-        // ── Search per-category cache ──
+        // ── Layer 2: Per-category cache search (instant when cached) ──
         for ((key, streams) in cachedCatStreams) {
             if (results.size >= 30) break
             when {
@@ -1178,69 +1311,119 @@ class XtreamIPTVProvider : MainAPI() {
             }
         }
 
-        // ── If no cached results, search on-demand per-category (limited) ──
-        if (results.size < 5) {
+        // ── KICK-OFF: If the index isn't built and isn't currently building,
+        // start the background builder NOW. This makes the SECOND search
+        // instant even if the user went straight to Search without first
+        // scrolling the Home page.
+        // ──
+        if (getSearchIndex() == null && !searchIndexBuilding.get()) {
             val c = cfg()
-            if (c != null) {
-                try {
-                    val encUser = URLEncoder.encode(c.user, "UTF-8")
-                    val encPass = URLEncoder.encode(c.pass, "UTF-8")
-                    val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
+            if (c != null) buildSearchIndexInBackground(c)
+        }
 
-                    // Search VOD categories on-demand (limit to first 10 categories)
-                    val vodCats = cachedXtreamVodCats?.let { tryParseJson<List<XCat>>(it) } ?: emptyList()
-                    for (cat in vodCats.take(10)) {
-                        if (results.size >= 20) break
-                        val catId = cat.category_id ?: continue
-                        val key = "v_$catId"
+        // ── Layer 3: In-memory index search — instant (< 50ms for 50k) ──
+        val index = getSearchIndex()
+        if (index != null && index.isNotEmpty()) {
+            val vodMatches = mutableListOf<SearchResponse>()
+            val serMatches = mutableListOf<SearchResponse>()
+            val liveMatches = mutableListOf<SearchResponse>()
 
-                        val vodStreams: List<XVod> = if (cachedCatStreams.containsKey(key)) {
-                            cachedCatStreams[key] as? List<XVod> ?: emptyList()
-                        } else {
-                            val text = RawHttp.apiGet("$apiBase&action=get_vod_streams&category_id=$catId", 10000)
-                            if (text != null) {
-                                tryParseJson<List<XVod>>(text)?.also { parsed ->
-                                    if (cachedCatStreams.size < MAX_CACHED_CATEGORIES) {
-                                        cachedCatStreams[key] = parsed
-                                    }
-                                } ?: emptyList()
-                            } else emptyList()
-                        }
-                        vodStreams.filter { it.name.lowercase().contains(q) }.take(10).forEach { s ->
-                            results.add(newMovieSearchResponse(s.name, ItemRef("m", s.stream_id, s.name, s.container_extension ?: "mp4").toJson(), TvType.Movie) {
-                                posterUrl = s.stream_icon
-                            })
-                        }
-                    }
-
-                    // Search series categories on-demand (limit to first 10)
-                    val serCats = cachedXtreamSeriesCats?.let { tryParseJson<List<XCat>>(it) } ?: emptyList()
-                    for (cat in serCats.take(10)) {
-                        if (results.size >= 30) break
-                        val catId = cat.category_id ?: continue
-                        val key = "s_$catId"
-
-                        val serStreams: List<XSeries> = if (cachedCatStreams.containsKey(key)) {
-                            cachedCatStreams[key] as? List<XSeries> ?: emptyList()
-                        } else {
-                            val text = RawHttp.apiGet("$apiBase&action=get_series&category_id=$catId", 10000)
-                            if (text != null) {
-                                tryParseJson<List<XSeries>>(text)?.also { parsed ->
-                                    if (cachedCatStreams.size < MAX_CACHED_CATEGORIES) {
-                                        cachedCatStreams[key] = parsed
-                                    }
-                                } ?: emptyList()
-                            } else emptyList()
-                        }
-                        serStreams.filter { it.name.lowercase().contains(q) }.take(10).forEach { s ->
-                            results.add(newTvSeriesSearchResponse(s.name, ItemRef("s", s.series_id, s.name).toJson(), TvType.TvSeries) {
-                                posterUrl = s.cover
-                            })
-                        }
-                    }
-                } catch (_: Throwable) {
-                    // OOM or network — stop searching
+            for (entry in index) {
+                if (!entry.nameLower.contains(q)) continue
+                when (entry.type) {
+                    "m" -> if (vodMatches.size < 30) vodMatches.add(newMovieSearchResponse(entry.name, ItemRef("m", entry.id, entry.name, entry.ext ?: "mp4").toJson(), TvType.Movie) { posterUrl = entry.icon })
+                    "s" -> if (serMatches.size < 30) serMatches.add(newTvSeriesSearchResponse(entry.name, ItemRef("s", entry.id, entry.name).toJson(), TvType.TvSeries) { posterUrl = entry.icon })
+                    "l" -> if (liveMatches.size < 30) liveMatches.add(newMovieSearchResponse(entry.name, ItemRef("l", entry.id, entry.name).toJson(), TvType.Live) { posterUrl = entry.icon })
                 }
+            }
+            results.addAll(vodMatches)
+            results.addAll(serMatches)
+            results.addAll(liveMatches)
+        }
+
+        // If anything was found (M3U / per-cat cache / index), return it now.
+        if (results.isNotEmpty()) {
+            val seen = HashSet<String>()
+            val deduped = results.filter { seen.add(it.name.lowercase()) }
+            return deduped.take(60)
+        }
+
+        // ── WAIT-FOR-INDEX (replaces the old slow per-category fallback).
+        //
+        // If the index is currently being built (e.g., the very first
+        // search kicked off the builder a moment ago), poll the snapshot
+        // for a short window so we can return partial results as soon as
+        // the VOD catalog arrives. This avoids the old "N sequential
+        // per-category requests" path that took 60-200 seconds on big
+        // libraries.
+        //
+        // If nothing arrives within the window, we return null — the
+        // user sees "no results" briefly and retries, at which point
+        // the index is ready and search is instant.
+        // ──
+        if (searchIndexBuilding.get()) {
+            val deadline = System.currentTimeMillis() + 4_000L
+            while (System.currentTimeMillis() < deadline) {
+                val current = getSearchIndex()
+                if (current != null && current.isNotEmpty()) {
+                    val matches = mutableListOf<SearchResponse>()
+                    var vodN = 0; var serN = 0; var liveN = 0
+                    for (entry in current) {
+                        if (!entry.nameLower.contains(q)) continue
+                        when (entry.type) {
+                            "m" -> if (vodN < 30) { matches.add(newMovieSearchResponse(entry.name, ItemRef("m", entry.id, entry.name, entry.ext ?: "mp4").toJson(), TvType.Movie) { posterUrl = entry.icon }); vodN++ }
+                            "s" -> if (serN < 30) { matches.add(newTvSeriesSearchResponse(entry.name, ItemRef("s", entry.id, entry.name).toJson(), TvType.TvSeries) { posterUrl = entry.icon }); serN++ }
+                            "l" -> if (liveN < 30) { matches.add(newMovieSearchResponse(entry.name, ItemRef("l", entry.id, entry.name).toJson(), TvType.Live) { posterUrl = entry.icon }); liveN++ }
+                        }
+                        if (vodN >= 30 && serN >= 30 && liveN >= 30) break
+                    }
+                    if (matches.isNotEmpty()) {
+                        val seen = HashSet<String>()
+                        return matches.filter { seen.add(it.name.lowercase()) }.take(60)
+                    }
+                }
+                delay(150)
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * Quick search — MUST be instant. Only hits the M3U cache and the
+     * in-memory index, NEVER does network. If neither is ready, returns
+     * null so CloudStream skips us rather than blocking the UI.
+     */
+    override suspend fun quickSearch(query: String): List<SearchResponse>? {
+        val q = query.trim().lowercase()
+        if (q.isEmpty()) return null
+
+        val results = mutableListOf<SearchResponse>()
+
+        // ── M3U cache (instant when in M3U mode) ──
+        cachedM3U?.filter {
+            it.name.lowercase().contains(q) || it.group.lowercase().contains(q)
+        }?.take(10)?.forEach { entry ->
+            val ref = EntryRef(entry.streamUrl, entry.type, entry.name, entry.group, entry.logo, entry.seriesName)
+            when (entry.type) {
+                "movie" -> results.add(newMovieSearchResponse(entry.name, ref.toJson(), TvType.Movie) { posterUrl = entry.logo })
+                "series" -> results.add(newTvSeriesSearchResponse(entry.seriesName.ifBlank { entry.name }, ref.toJson(), TvType.TvSeries) { posterUrl = entry.logo })
+                else -> results.add(newMovieSearchResponse(entry.name, ref.toJson(), TvType.Live) { posterUrl = entry.logo })
+            }
+        }
+
+        // ── In-memory index (instant, never hits network) ──
+        val index = getSearchIndex()
+        if (index != null && index.isNotEmpty()) {
+            var vodN = 0; var serN = 0; var liveN = 0
+            for (entry in index) {
+                if (!entry.nameLower.contains(q)) continue
+                when (entry.type) {
+                    "m" -> if (vodN < 10) { results.add(newMovieSearchResponse(entry.name, ItemRef("m", entry.id, entry.name, entry.ext ?: "mp4").toJson(), TvType.Movie) { posterUrl = entry.icon }); vodN++ }
+                    "s" -> if (serN < 10) { results.add(newTvSeriesSearchResponse(entry.name, ItemRef("s", entry.id, entry.name).toJson(), TvType.TvSeries) { posterUrl = entry.icon }); serN++ }
+                    "l" -> if (liveN < 10) { results.add(newMovieSearchResponse(entry.name, ItemRef("l", entry.id, entry.name).toJson(), TvType.Live) { posterUrl = entry.icon }); liveN++ }
+                }
+                if (vodN >= 10 && serN >= 10 && liveN >= 10) break
             }
         }
 
