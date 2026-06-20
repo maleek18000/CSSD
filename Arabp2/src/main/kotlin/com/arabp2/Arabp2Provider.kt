@@ -630,13 +630,36 @@ class Arabp2 : MainAPI() {
             // Resolve the actual download URL (must contain &f=).
             var resolvedUrl = getCachedResolvedUrl(torrentId) ?: downloadUrl
             if (resolvedUrl.isBlank() || !resolvedUrl.contains("&f=")) {
-                val detailDoc = if (detailUrl.isNotBlank()) fetchDoc(detailUrl) else null
+                // Fallback: construct detail URL from torrent ID when not provided.
+                // Category pages (documentaries, Asian, Latin, etc.) sometimes
+                // only carry the torrent-details link, not a download.php link.
+                val detailPageUrl = if (detailUrl.isNotBlank()) detailUrl
+                    else "$mainUrl/index.php?page=torrent-details&id=$torrentId"
+                val detailDoc = fetchDoc(detailPageUrl)
                 if (detailDoc != null) {
                     val dlLink = detailDoc.selectFirst("a[href*=download.php]")
                         ?: detailDoc.selectFirst("td#Title h1 a[href*=download.php]")
                     if (dlLink != null) {
                         resolvedUrl = toAbsoluteUrl(dlLink.attr("href"))
-                        if (resolvedUrl.contains("&f=")) cacheResolvedUrl(torrentId, resolvedUrl)
+                        cacheResolvedUrl(torrentId, resolvedUrl)
+                    }
+
+                    // Extract magnet directly from the detail page as a fallback link.
+                    // Critical for category-page torrents whose download.php URL may
+                    // lack &f=, which causes the .torrent binary download below to be
+                    // skipped. Without this fallback the user sees "no links found".
+                    // The detail-page magnet is always playable regardless of &f=.
+                    val magnetEl = detailDoc.selectFirst("a[href^=magnet:]")
+                    if (magnetEl != null) {
+                        val pageMagnet = magnetEl.attr("href")
+                        if (pageMagnet.startsWith("magnet:")) {
+                            callback(newExtractorLink(
+                                source = name,
+                                name = "$name (Magnet)",
+                                url = pageMagnet,
+                                type = ExtractorLinkType.MAGNET
+                            ))
+                        }
                     }
                 }
             }
@@ -657,7 +680,14 @@ class Arabp2 : MainAPI() {
             }
         }
 
-        if (torrentBytes == null) return false
+        if (torrentBytes == null) {
+            // No .torrent bytes — but we may have already callback'd a magnet link
+            // from the detail page above (category-page torrents). Return true so
+            // CloudStream keeps that link instead of discarding it as "no links found".
+            // If no link was callback'd, the link list is empty and the UI shows the
+            // same "no links found" message either way.
+            return true
+        }
 
         // Serve .torrent via local HTTP server.
         val localUrl = startLocalTorrentServer(torrentBytes)
