@@ -664,7 +664,7 @@ class Arabp2 : MainAPI() {
                 }
             }
 
-            if (resolvedUrl.isNotBlank() && resolvedUrl.contains("&f=")) {
+            if (resolvedUrl.isNotBlank()) {
                 var result = downloadTorrentFile(resolvedUrl)
                 if (result is TorrentDownloadResult.DailyLimitExceeded) {
                     Log.w(TAG, "loadLinks: daily limit hit, thanking and retrying...")
