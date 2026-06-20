@@ -560,208 +560,36 @@ class XtreamIPTVProvider : MainAPI() {
     private val MAX_CACHED_CATEGORIES = 30
 
     // ═══════════════════════════════════════════════════════════════════
-    //  GLOBAL MINI CACHE  (powers the fast search path)
+    //  GLOBAL FULL-LIST CACHE  (powers the fast search path)
     //
-    //  Same strategy as OTT Navigator: pre-fetch the entire library ONCE
-    //  in the background, then filter in-memory on every search query.
-    //
-    //  Critical: we DO NOT cache the full XVod/XSeries/XLive objects —
-    //  large providers can have 130K+ VOD items (~50MB JSON, ~200MB when
-    //  parsed into data-class objects → OOM on Android). Instead we
-    //  STREAM-parse the response (bypassing the 5MB RawHttp limit) and
-    //  extract ONLY the 3-4 fields search needs per item, into compact
-    //  "mini" records. Total mini-cache for a 130K-item provider is
-    //  ~14MB — fits comfortably in Android heap.
+    //  Same strategy as OTT Navigator and the Stremio worker at
+    //  broad-rain-6b47.ninf-2016.workers.dev: pre-fetch the entire
+    //  library ONCE in the background, then filter in-memory on every
+    //  search query. By the time the user types a search, the cache is
+    //  already warm → search is instant.
     //
     //  Populated by preloadAllStreams() from getMainPage (fire-and-forget).
-    //  Consumed by search() — zero HTTP calls during search.
+    //  Consumed by search() — NO per-category HTTP calls during search.
     // ═══════════════════════════════════════════════════════════════════
 
-    /** Compact VOD record — only fields search needs. ~80 bytes/item. */
-    private data class VodMini(val sid: Int, val n: String, val ic: String?, val ex: String)
-    /** Compact Series record — only fields search needs. ~70 bytes/item. */
-    private data class SeriesMini(val sid: Int, val n: String, val cv: String?)
-    /** Compact Live record — only fields search needs. ~60 bytes/item. */
-    private data class LiveMini(val sid: Int, val n: String, val ic: String?)
-
-    /** Cached compact VOD list (or null if not yet loaded). Filtered by search(). */
-    @Volatile private var cachedVodMini: List<VodMini>? = null
-    /** Cached compact Series list (or null if not yet loaded). Filtered by search(). */
-    @Volatile private var cachedSeriesMini: List<SeriesMini>? = null
-    /** Cached compact Live list (or null if not yet loaded). Filtered by search(). */
-    @Volatile private var cachedLiveMini: List<LiveMini>? = null
+    /** Cached full VOD list (or null if not yet loaded). Filtered by search(). */
+    @Volatile private var cachedAllVod: List<XVod>? = null
+    /** Cached full Series list (or null if not yet loaded). Filtered by search(). */
+    @Volatile private var cachedAllSeries: List<XSeries>? = null
+    /** Cached full Live list (or null if not yet loaded). Filtered by search(). */
+    @Volatile private var cachedAllLive: List<XLive>? = null
     /** Timestamp (ms) of the last successful cache population. */
-    @Volatile private var cachedMiniAtMs: Long = 0L
+    @Volatile private var cachedAllAtMs: Long = 0L
     /** Cache TTL — pre-fetch again after this many ms. */
     private val GLOBAL_CACHE_TTL_MS = 30L * 60 * 1000  // 30 min
     /** Max time search() waits for a cold cache to populate before returning partial results. */
     private val GLOBAL_FETCH_DEADLINE_MS = 2500L
-    /** Per-call read timeout for the full-list fetch (large providers take 30s+). */
-    private val ALL_STREAMS_TIMEOUT_MS = 60000
+    /** Per-call read timeout for the full-list fetch (VOD can be 10-20s on slow providers). */
+    private val ALL_STREAMS_TIMEOUT_MS = 30000
     /** Dedup flag — prevents concurrent duplicate full-list fetches. */
     @Volatile private var globalFetchRunning: Boolean = false
     /** Lock for cache field mutations. */
     private val globalCacheLock = Any()
-
-    // ═══════════════════════════════════════════════════════════════════
-    //  FAST JSON FIELD EXTRACTION  (no Gson — pure string ops)
-    //
-    //  Used by streamLargeJsonArray to pull just 3-4 fields out of each
-    //  ~10KB item JSON object. Roughly 1000× faster than tryParseJson
-    //  per item, and zero allocation overhead beyond the result string.
-    // ═══════════════════════════════════════════════════════════════════
-
-    /**
-     * Extract a JSON string value by key from a small JSON object text.
-     * Returns null if the key is absent or value is null/non-string.
-     * Handles standard escape sequences: \n \t \r \" \\ \/ \uXXXX.
-     */
-    private fun extractJsonString(text: String, key: String): String? {
-        val needle = "\"$key\":\""
-        val start = text.indexOf(needle)
-        if (start < 0) return null
-        var i = start + needle.length
-        val sb = StringBuilder(64)
-        while (i < text.length) {
-            val c = text[i]
-            when {
-                c == '\\' && i + 1 < text.length -> {
-                    when (text[i + 1]) {
-                        'n' -> { sb.append('\n'); i += 2 }
-                        't' -> { sb.append('\t'); i += 2 }
-                        'r' -> { sb.append('\r'); i += 2 }
-                        '"' -> { sb.append('"'); i += 2 }
-                        '\\' -> { sb.append('\\'); i += 2 }
-                        '/' -> { sb.append('/'); i += 2 }
-                        'u' -> {
-                            // \uXXXX — 4 hex digits → Unicode codepoint
-                            if (i + 5 < text.length) {
-                                val hex = text.substring(i + 2, i + 6)
-                                val cp = hex.toIntOrNull(16)
-                                if (cp != null) {
-                                    sb.appendCodePoint(cp)
-                                    i += 6
-                                } else { sb.append('u'); i += 2 }
-                            } else { sb.append('u'); i += 2 }
-                        }
-                        else -> { sb.append(text[i + 1]); i += 2 }
-                    }
-                }
-                c == '"' -> return sb.toString()
-                else -> { sb.append(c); i++ }
-            }
-        }
-        return null
-    }
-
-    /**
-     * Extract a JSON integer value by key from a small JSON object text.
-     * Returns null if the key is absent or value is not a valid integer.
-     */
-    private fun extractJsonInt(text: String, key: String): Int? {
-        val needle = "\"$key\":"
-        val start = text.indexOf(needle)
-        if (start < 0) return null
-        var i = start + needle.length
-        while (i < text.length && text[i].isWhitespace()) i++
-        val sb = StringBuilder(8)
-        if (i < text.length && text[i] == '-') { sb.append('-'); i++ }
-        while (i < text.length && text[i].isDigit()) { sb.append(text[i]); i++ }
-        return sb.toString().toIntOrNull()
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    //  STREAMING JSON ARRAY FETCHER
-    //
-    //  Bypasses RawHttp.fetch()'s 5MB cap by opening HttpURLConnection
-    //  directly. Streams the response char-by-char (buffered 8K at a
-    //  time), tracks brace depth to identify top-level array items,
-    //  and hands each complete item's text to [onItem] for parsing.
-    //
-    //  Memory stays flat regardless of response size — only the current
-    //  item's text (~10KB) is held in memory at any time. This is what
-    //  makes searching 130K-item providers feasible on Android.
-    //
-    //  Returns true if the stream completed successfully, false on any
-    //  error (network, HTTP 4xx/5xx, IO exception).
-    // ═══════════════════════════════════════════════════════════════════
-    private fun streamLargeJsonArray(
-        url: String,
-        timeoutMs: Int,
-        onItem: (String) -> Unit
-    ): Boolean {
-        val conn = try {
-            (URL(url).openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                setRequestProperty("User-Agent", "okhttp/4.12.0")
-                setRequestProperty("Accept", "*/*")
-                try {
-                    val u = URI(url)
-                    setRequestProperty("Referer", "${u.scheme}://${u.host}/")
-                } catch (_: Throwable) { /* ignore */ }
-                connectTimeout = 6000
-                readTimeout = timeoutMs
-                instanceFollowRedirects = true
-            }
-        } catch (_: Throwable) { return false }
-
-        try {
-            val code = conn.responseCode
-            if (code in 400..599) return false
-            val reader = BufferedReader(InputStreamReader(conn.inputStream, "UTF-8"), 64 * 1024)
-            val buf = StringBuilder(16 * 1024)
-            val charBuf = CharArray(8192)
-            var depth = 0
-            var inStr = false
-            var escape = false
-            var started = false
-            var n: Int
-            while (reader.read(charBuf).also { n = it } != -1) {
-                for (idx in 0 until n) {
-                    val ch = charBuf[idx]
-                    if (!started) {
-                        if (ch == '[') started = true
-                        continue
-                    }
-                    if (depth == 0) {
-                        // Between items — wait for `{` to start a new item
-                        if (ch == '{') {
-                            depth = 1
-                            buf.append(ch)
-                        }
-                        // else: skip whitespace, commas, or `]` (end of array)
-                        continue
-                    }
-                    if (inStr) {
-                        buf.append(ch)
-                        if (escape) escape = false
-                        else if (ch == '\\') escape = true
-                        else if (ch == '"') inStr = false
-                        continue
-                    }
-                    when (ch) {
-                        '"' -> { inStr = true; buf.append(ch) }
-                        '{' -> { depth++; buf.append(ch) }
-                        '}' -> {
-                            buf.append(ch)
-                            depth--
-                            if (depth == 0) {
-                                onItem(buf.toString())
-                                buf.setLength(0)
-                            }
-                        }
-                        else -> buf.append(ch)
-                    }
-                }
-            }
-            reader.close()
-            return true
-        } catch (_: Throwable) {
-            return false
-        } finally {
-            try { conn.disconnect() } catch (_: Throwable) { /* ignore */ }
-        }
-    }
 
     // ═══════════════════════════════════════════════════════════════════
     //  XTREAM API HELPERS  (per-category only — never load all streams)
@@ -891,29 +719,25 @@ class XtreamIPTVProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  GLOBAL MINI-LIST PRE-FETCH  (background, fire-and-forget)
+    //  GLOBAL FULL-LIST PRE-FETCH  (background, fire-and-forget)
     //
-    //  Mirrors the OTT Navigator strategy: load the entire library ONCE
-    //  in the background when the home page opens, then filter in-memory
-    //  on every search. By the time the user types a query, cachedVodMini
-    //  / cachedSeriesMini / cachedLiveMini are populated → search is instant.
-    //
-    //  Uses streamLargeJsonArray + extractJsonString/Int to stream-parse
-    //  the response and extract ONLY the 3-4 fields search needs per
-    //  item. Memory stays flat regardless of provider size — a 130K-item
-    //  VOD list (~50MB JSON) becomes a ~10MB mini-cache, not 200MB.
+    //  Mirrors the Stremio worker's strategy: load the entire library
+    //  ONCE in the background when the home page opens, then filter
+    //  in-memory on every search. By the time the user types a query,
+    //  cachedAllVod/Series/Live are populated → search is instant.
     //
     //  - Fire-and-forget (bgScope.launch — does NOT block the caller)
     //  - Dedup'd via globalFetchRunning — concurrent calls are no-ops
-    //  - Each fetch is independently try/caught — VOD failing doesn't kill
+    //  - Each fetch is wrapped in try/catch — VOD failing doesn't kill
     //    Series/Live
     //  - Memory-guarded — aborts if free memory drops below threshold
     //  - Results cached for GLOBAL_CACHE_TTL_MS (30 min), then refreshed
+    //    on the next call
     // ═══════════════════════════════════════════════════════════════════
     private fun preloadAllStreams(c: Cfg) {
         val now = System.currentTimeMillis()
-        val fresh = (now - cachedMiniAtMs) < GLOBAL_CACHE_TTL_MS
-        val populated = cachedVodMini != null && cachedSeriesMini != null && cachedLiveMini != null
+        val fresh = (now - cachedAllAtMs) < GLOBAL_CACHE_TTL_MS
+        val populated = cachedAllVod != null && cachedAllSeries != null && cachedAllLive != null
         if (fresh && populated) return      // cache is good — nothing to do
         if (globalFetchRunning) return       // already fetching — let it finish
         globalFetchRunning = true
@@ -927,82 +751,57 @@ class XtreamIPTVProvider : MainAPI() {
 
                 // Each fetch is independently try/caught so a failure in
                 // one does NOT cancel the others (coroutineScope would
-                // cancel siblings on first throw — we avoid that by never
-                // letting an exception escape an async block).
+                // cancel siblings on first throw — we avoid that by
+                // never letting an exception escape an async block).
+                var vod: List<XVod>? = null
+                var ser: List<XSeries>? = null
+                var live: List<XLive>? = null
+
                 try {
                     coroutineScope {
-                        // ── VOD (movies) — stream and extract mini records ──
                         async {
                             try {
                                 if (!enoughMemory()) return@async
-                                val list = ArrayList<VodMini>(1024)
-                                streamLargeJsonArray(
+                                val t = RawHttp.apiGet(
                                     "$apiBase&action=get_vod_streams",
-                                    ALL_STREAMS_TIMEOUT_MS
-                                ) { itemText ->
-                                    val name = extractJsonString(itemText, "name")
-                                    val sid = extractJsonInt(itemText, "stream_id")
-                                    if (name != null && sid != null) {
-                                        val ic = extractJsonString(itemText, "stream_icon")
-                                        val ex = extractJsonString(itemText, "container_extension") ?: "mp4"
-                                        list.add(VodMini(sid, name, ic, ex))
-                                    }
-                                }
-                                if (list.isNotEmpty()) {
-                                    synchronized(globalCacheLock) { cachedVodMini = list }
-                                }
-                            } catch (_: Throwable) { /* VOD failed — keep others */ }
+                                    ALL_STREAMS_TIMEOUT_MS, 6000
+                                )
+                                vod = t?.let { tryParseJson<List<XVod>>(it) }
+                            } catch (_: Throwable) { vod = null }
                         }
-                        // ── Series — stream and extract mini records ──
                         async {
                             try {
                                 if (!enoughMemory()) return@async
-                                val list = ArrayList<SeriesMini>(1024)
-                                streamLargeJsonArray(
+                                val t = RawHttp.apiGet(
                                     "$apiBase&action=get_series",
-                                    ALL_STREAMS_TIMEOUT_MS
-                                ) { itemText ->
-                                    val name = extractJsonString(itemText, "name")
-                                    val sid = extractJsonInt(itemText, "series_id")
-                                    if (name != null && sid != null) {
-                                        val cv = extractJsonString(itemText, "cover")
-                                        list.add(SeriesMini(sid, name, cv))
-                                    }
-                                }
-                                if (list.isNotEmpty()) {
-                                    synchronized(globalCacheLock) { cachedSeriesMini = list }
-                                }
-                            } catch (_: Throwable) { /* Series failed — keep others */ }
+                                    ALL_STREAMS_TIMEOUT_MS, 6000
+                                )
+                                ser = t?.let { tryParseJson<List<XSeries>>(it) }
+                            } catch (_: Throwable) { ser = null }
                         }
-                        // ── Live — stream and extract mini records ──
                         async {
                             try {
                                 if (!enoughMemory()) return@async
-                                val list = ArrayList<LiveMini>(1024)
-                                streamLargeJsonArray(
+                                val t = RawHttp.apiGet(
                                     "$apiBase&action=get_live_streams",
-                                    ALL_STREAMS_TIMEOUT_MS
-                                ) { itemText ->
-                                    val name = extractJsonString(itemText, "name")
-                                    val sid = extractJsonInt(itemText, "stream_id")
-                                    if (name != null && sid != null) {
-                                        val ic = extractJsonString(itemText, "stream_icon")
-                                        list.add(LiveMini(sid, name, ic))
-                                    }
-                                }
-                                if (list.isNotEmpty()) {
-                                    synchronized(globalCacheLock) { cachedLiveMini = list }
-                                }
-                            } catch (_: Throwable) { /* Live failed — keep others */ }
+                                    ALL_STREAMS_TIMEOUT_MS, 6000
+                                )
+                                live = t?.let { tryParseJson<List<XLive>>(it) }
+                            } catch (_: Throwable) { live = null }
                         }
                     }
                 } catch (_: Throwable) {
                     // coroutineScope itself threw — but each async already
                     // captured its result (or null) before propagating.
+                    // Fall through to store whatever we got.
                 }
 
+                // Store whatever we got — each list independently.
                 synchronized(globalCacheLock) {
-                    cachedMiniAtMs = System.currentTimeMillis()
+                    if (vod != null) cachedAllVod = vod
+                    if (ser != null) cachedAllSeries = ser
+                    if (live != null) cachedAllLive = live
+                    cachedAllAtMs = System.currentTimeMillis()
                 }
             } catch (_: Throwable) {
                 // OOM or other — silent; next call will retry
@@ -1227,8 +1026,8 @@ class XtreamIPTVProvider : MainAPI() {
         // ── Kick off background pre-fetch of ALL streams for fast search ──
         // Fire-and-forget (dedup'd inside preloadAllStreams). Runs in parallel
         // with the category fetch below. By the time the user opens a search
-        // box and types a query, cachedVodMini/SeriesMini/LiveMini are populated →
-        // search is instant (mirrors OTT Navigator behavior).
+        // box and types a query, cachedAllVod/Series/Live are populated →
+        // search is instant (mirrors OTT Navigator / Stremio worker behavior).
         try { cfg()?.let { preloadAllStreams(it) } } catch (_: Throwable) { /* ignore */ }
 
         // ── Return from cache if already loaded (instant, no network) ──
@@ -1455,14 +1254,15 @@ class XtreamIPTVProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  SEARCH  — blazingly fast, in-memory filtering of mini-caches
+    //  SEARCH  — blazingly fast, in-memory filtering of pre-fetched lists
     //
     //  The Xtream Codes API has no native search endpoint, so we search
-    //  client-side. The trick to making it instant (matching OTT Navigator)
+    //  client-side. The trick to making it instant (matching OTT Navigator
+    //  and the Stremio worker at broad-rain-6b47.ninf-2016.workers.dev)
     //  is to PRE-FETCH the entire library ONCE in the background when the
     //  home page opens (see preloadAllStreams, triggered from
     //  getMainPageInternal). By the time the user types a search query,
-    //  cachedVodMini / cachedSeriesMini / cachedLiveMini are already
+    //  cachedAllVod / cachedAllSeries / cachedAllLive are already
     //  populated → search is just an in-memory filter (microseconds).
     //
     //  Strategy:
@@ -1470,15 +1270,14 @@ class XtreamIPTVProvider : MainAPI() {
     //  2. Trigger preloadAllStreams() (fire-and-forget, dedup'd — no-op
     //     if cache is already fresh)
     //  3. If the global cache is cold, poll briefly (≤ 2.5s) for the
-    //     first mini-list to arrive, then filter whatever is available
-    //  4. Filter cachedVodMini / cachedSeriesMini / cachedLiveMini in-memory
+    //     first list to arrive, then filter whatever is available
+    //  4. Filter cachedAllVod / cachedAllSeries / cachedAllLive in-memory
     //     (instant — zero HTTP calls during search)
     //  5. Merge, cap per-type, de-duplicate by name
     //
     //  No per-category HTTP calls. No M3U download. No external servers.
     //  First search after opening the provider: ≤ 2.5s (waiting for the
-    //     background pre-fetch to land — typically Series arrives in ~1s).
-    //  Every subsequent search: instant.
+    //  background pre-fetch to land). Every subsequent search: instant.
     // ═══════════════════════════════════════════════════════════════════
 
     /** Maximum search results to return. */
@@ -1516,67 +1315,66 @@ class XtreamIPTVProvider : MainAPI() {
         try { preloadAllStreams(c) } catch (_: Throwable) { /* ignore */ }
 
         // ── 4. If cache is cold, wait briefly for the first list to arrive ──
-        //    We poll every 100ms and break AS SOON AS any mini-list is
-        //    populated, so a warm Series cache (typical ~1s on healthy
-        //    providers) returns immediately even while VOD (typical
-        //    ~30s for 130K-item providers) is still streaming in.
-        //    Subsequent searches see the fully-populated cache → instant.
+        //    We poll every 100ms and break AS SOON AS any list is populated,
+        //    so a warm Series cache (typical ~1s) returns immediately even
+        //    while VOD (typical ~3-20s) is still loading in the background.
+        //    Subsequent searches will see the fully-populated cache → instant.
         val now = System.currentTimeMillis()
-        val cacheFresh = (now - cachedMiniAtMs) < GLOBAL_CACHE_TTL_MS
-        val cachePopulated = cachedVodMini != null || cachedSeriesMini != null || cachedLiveMini != null
+        val cacheFresh = (now - cachedAllAtMs) < GLOBAL_CACHE_TTL_MS
+        val cachePopulated = cachedAllVod != null || cachedAllSeries != null || cachedAllLive != null
         if (!cacheFresh || !cachePopulated) {
             val deadline = now + GLOBAL_FETCH_DEADLINE_MS
             while (System.currentTimeMillis() < deadline) {
-                val populated = cachedVodMini != null || cachedSeriesMini != null || cachedLiveMini != null
+                val populated = cachedAllVod != null || cachedAllSeries != null || cachedAllLive != null
                 if (populated) break
                 try { delay(100L) } catch (_: Throwable) { break }
             }
         }
 
-        // ── 5. Filter cached mini-lists in-memory (instant — zero HTTP) ──
+        // ── 5. Filter cached lists in-memory (instant — zero HTTP) ──
         val vodMatches = mutableListOf<SearchResponse>()
         val serMatches = mutableListOf<SearchResponse>()
         val liveMatches = mutableListOf<SearchResponse>()
 
-        cachedVodMini?.let { list ->
+        cachedAllVod?.let { list ->
             list.asSequence()
-                .filter { it.n.lowercase().contains(q) }
+                .filter { it.name.lowercase().contains(q) }
                 .take(SEARCH_MAX_PER_TYPE)
                 .forEach { s ->
                     vodMatches.add(
                         newMovieSearchResponse(
-                            s.n,
-                            ItemRef("m", s.sid, s.n, s.ex).toJson(),
+                            s.name,
+                            ItemRef("m", s.stream_id, s.name, s.container_extension ?: "mp4").toJson(),
                             TvType.Movie
-                        ) { posterUrl = s.ic }
+                        ) { posterUrl = s.stream_icon }
                     )
                 }
         }
-        cachedSeriesMini?.let { list ->
+        cachedAllSeries?.let { list ->
             list.asSequence()
-                .filter { it.n.lowercase().contains(q) }
+                .filter { it.name.lowercase().contains(q) }
                 .take(SEARCH_MAX_PER_TYPE)
                 .forEach { s ->
                     serMatches.add(
                         newTvSeriesSearchResponse(
-                            s.n,
-                            ItemRef("s", s.sid, s.n).toJson(),
+                            s.name,
+                            ItemRef("s", s.series_id, s.name).toJson(),
                             TvType.TvSeries
-                        ) { posterUrl = s.cv }
+                        ) { posterUrl = s.cover }
                     )
                 }
         }
-        cachedLiveMini?.let { list ->
+        cachedAllLive?.let { list ->
             list.asSequence()
-                .filter { it.n.lowercase().contains(q) }
+                .filter { it.name.lowercase().contains(q) }
                 .take(SEARCH_MAX_PER_TYPE)
                 .forEach { s ->
                     liveMatches.add(
                         newMovieSearchResponse(
-                            s.n,
-                            ItemRef("l", s.sid, s.n).toJson(),
+                            s.name,
+                            ItemRef("l", s.stream_id, s.name).toJson(),
                             TvType.Live
-                        ) { posterUrl = s.ic }
+                        ) { posterUrl = s.stream_icon }
                     )
                 }
         }
