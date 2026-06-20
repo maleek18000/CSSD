@@ -11,14 +11,12 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.supervisorScope
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.BufferedReader
@@ -28,7 +26,6 @@ import java.net.URI
 import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
-import java.util.Collections
 
 // ═══════════════════════════════════════════════════════════════════
 //  PLUGIN ENTRY POINT
@@ -77,6 +74,22 @@ data class XEpInfo(val plot: String? = null, val image: String? = null)
 
 data class ItemRef(val t: String, val id: Int, val n: String, val e: String? = null)
 data class LinkData(val t: String, val id: Int, val e: String? = null)
+
+/**
+ * Lightweight search index entry — the minimum fields needed to build a
+ * SearchResponse and match against a query.
+ *
+ * A full XVod/XSeries/XLive object (with all JSON metadata) is ~1-2 KB.
+ * This entry is ~150-250 bytes. Even 50,000 entries = ~10 MB, which fits
+ * comfortably in Android's heap and enables INSTANT in-memory search.
+ */
+data class SearchIndexEntry(
+    val name: String,
+    val type: String,       // "m" / "s" / "l"
+    val id: Int,
+    val ext: String?,       // container_extension (movies only)
+    val poster: String?     // stream_icon / cover
+)
 
 // ═══════════════════════════════════════════════════════════════════
 //  RAW HTTP CLIENT  (bypasses CloudStream's app.get to avoid 403)
@@ -199,7 +212,31 @@ object RawHttp {
 
 class XtreamIPTVProvider : MainAPI() {
 
-    override var mainUrl = "http://example.com/username/password"
+    /**
+     * Override mainUrl with a custom setter that auto-triggers search index
+     * preload whenever CloudStream assigns the URL from user settings.
+     *
+     * This is the KEY to instant search with multiple providers: CloudStream
+     * sets mainUrl at app startup (from saved settings) — our setter fires,
+     * kicks off the background preload, and by the time the user opens search
+     * the index is already built. No need to open the home page first.
+     *
+     * The initial value (placeholder) goes through the setter too, but the
+     * guard check skips it — so this is safe during construction.
+     */
+    override var mainUrl: String = "http://example.com/username/password"
+        set(value) {
+            field = value
+            // Only trigger for real URLs (not the default placeholder).
+            if (value.isNotEmpty() && value != "http://example.com/username/password") {
+                // Invalidate any old index (handles URL changes in settings)
+                // and kick off a fresh preload.
+                searchIndex = null
+                searchIndexBuilding = false
+                triggerSearchIndexPreload()
+            }
+        }
+
     override var name = "Xtream IPTV"
     override val supportedTypes = setOf(TvType.Live, TvType.Movie, TvType.TvSeries)
     override val hasMainPage = true
@@ -956,9 +993,12 @@ class XtreamIPTVProvider : MainAPI() {
                 }
 
                 if (lists.isNotEmpty()) {
+                    // Backup trigger for the search index preload.
+                    // The primary trigger is the mainUrl setter, which fires at
+                    // app startup. This call covers the edge case where the
+                    // setter fired before bgScope was ready.
+                    triggerSearchIndexPreload()
                     val response = newHomePageResponse(lists, false)
-                    // NOTE: Background preload disabled to prevent memory issues.
-                    // Search will use on-demand per-category loading instead.
                     return response
                 }
             }
@@ -1149,27 +1189,190 @@ class XtreamIPTVProvider : MainAPI() {
     private val SEARCH_MAX_RESULTS = 60
     /** Maximum matches to keep per type (movie/series/live) to ensure variety. */
     private val SEARCH_MAX_PER_TYPE = 40
-    /** Per-category fetch timeout for search (shorter than browse — fail fast). */
-    private val SEARCH_CAT_TIMEOUT_MS = 6000
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  SEARCH INDEX — preloaded in-memory index for INSTANT search
+    //
+    //  ARCHITECTURE:
+    //  The Xtream API has NO native search endpoint. The only way to get
+    //  instant search is to preload ALL streams into memory ONCE, then
+    //  filter in-memory on every search query (sub-100ms even for 50k items).
+    //
+    //  Memory cost: a SearchIndexEntry is ~150-250 bytes. Even 50,000
+    //  entries = ~10 MB. Well within Android's typical 256MB+ heap.
+    //  The full XVod/XSeries/XLive parsed objects are discarded after
+    //  extracting the lightweight index fields — GC reclaims them.
+    //
+    //  Lifecycle:
+    //  1. getMainPage() triggers triggerSearchIndexPreload() — fire-and-forget
+    //     background job. By the time the user opens search, the index is ready.
+    //  2. If search() is called before preload finishes, it builds the index
+    //     on-demand with a short timeout (one-time cost).
+    //  3. All subsequent searches filter the in-memory index — TRULY INSTANT.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /** The preloaded search index. Null = not yet built. */
+    @Volatile
+    private var searchIndex: List<SearchIndexEntry>? = null
+
+    /** True while the index is being built. Prevents duplicate concurrent builds. */
+    @Volatile
+    private var searchIndexBuilding = false
+
+    /** Prevents duplicate concurrent index builds (used by getOrBuildSearchIndex). */
+    private val searchIndexMutex = Mutex()
+
+    /** Maximum entries in the search index (memory safety cap). */
+    private val SEARCH_INDEX_MAX_ENTRIES = 100_000
+
     /**
-     * Hard cap on total search time. After this, whatever matches have been
-     * collected so far are returned (partial results). Keeps the UI responsive
-     * even if the provider is slow or has hundreds of categories.
+     * Maximum response size for bulk fetches (movies/series/live all-in-one).
+     * Big providers can return 10-30 MB per type. 50 MB is a hard safety cap.
      */
-    private val SEARCH_TOTAL_TIMEOUT_MS = 10_000L
+    private val SEARCH_BULK_MAX_BYTES = 50 * 1024 * 1024
+
+    /** Read timeout for bulk fetches — generous because responses can be large. */
+    private val SEARCH_BULK_READ_TIMEOUT_MS = 30_000
+
     /**
-     * Stop fetching more categories as soon as this many total matches are
-     * collected across all types. The user only needs a few relevant hits —
-     * no point waiting for the slowest categories once we have enough.
+     * Trigger background preload of the search index.
+     *
+     * Safe to call multiple times — the searchIndexBuilding flag prevents
+     * duplicate work.
+     *
+     * Called automatically from TWO places:
+     *   1. The mainUrl setter — fires the moment CloudStream assigns the URL
+     *      from settings (at app startup). This means the index starts building
+     *      before the user ever opens the home page or search.
+     *   2. getMainPage() — as a backup, in case the setter fired before bgScope
+     *      was initialized (shouldn't happen, but defensive).
      */
-    private val SEARCH_ENOUGH_RESULTS = 40
+    private fun triggerSearchIndexPreload() {
+        if (searchIndex != null || searchIndexBuilding) return
+        val c = cfg() ?: return  // URL not valid yet
+        searchIndexBuilding = true
+        bgScope.launch {
+            try {
+                buildSearchIndex(c)
+            } catch (_: Throwable) {
+                // Silent — search() will fall back to on-demand build.
+            } finally {
+                searchIndexBuilding = false
+            }
+        }
+    }
+
     /**
-     * Max concurrent per-category HTTP requests during search.
-     * Android's HttpURLConnection pool caps ~5 connections per host, so firing
-     * 50+ parallel requests just queues them. Limiting concurrency to 6 keeps
-     * every request fast (no queueing) while still parallelising usefully.
+     * Bulk-fetch ALL streams (movies + series + live) in 3 parallel HTTP calls
+     * and build a lightweight in-memory index.
+     *
+     * Xtream API: omit `category_id` on get_vod_streams / get_series /
+     * get_live_streams to get EVERYTHING in one response per type.
+     * 3 calls total — vs. the old N-calls-per-category approach.
+     *
+     * Memory strategy: parse full JSON, extract ONLY the lightweight
+     * SearchIndexEntry fields, then let GC reclaim the full parsed objects.
      */
-    private val SEARCH_MAX_CONCURRENT = 6
+    private suspend fun buildSearchIndex(c: Cfg): List<SearchIndexEntry>? {
+        return try {
+            if (!enoughMemory()) return null
+
+            val encUser = URLEncoder.encode(c.user, "UTF-8")
+            val encPass = URLEncoder.encode(c.pass, "UTF-8")
+            val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
+
+            // 3 parallel bulk fetches — each returns ALL items of its type.
+            // Read timeout is generous (30s) because these can be big responses.
+            val (vodText, serText, liveText) = coroutineScope {
+                val v = async { bulkFetch("$apiBase&action=get_vod_streams") }
+                val s = async { bulkFetch("$apiBase&action=get_series") }
+                val l = async { bulkFetch("$apiBase&action=get_live_streams") }
+                Triple(v.await(), s.await(), l.await())
+            }
+
+            val index = ArrayList<SearchIndexEntry>(
+                (vodText?.length ?: 0) / 200 +
+                (serText?.length ?: 0) / 200 +
+                (liveText?.length ?: 0) / 200 + 16
+            )
+
+            // Parse each type, extract lightweight fields, let GC reclaim full objects.
+            vodText?.let { tryParseJson<List<XVod>>(it) }?.forEach { s ->
+                if (index.size >= SEARCH_INDEX_MAX_ENTRIES) return@forEach
+                index.add(SearchIndexEntry(s.name, "m", s.stream_id, s.container_extension, s.stream_icon))
+            }
+            serText?.let { tryParseJson<List<XSeries>>(it) }?.forEach { s ->
+                if (index.size >= SEARCH_INDEX_MAX_ENTRIES) return@forEach
+                index.add(SearchIndexEntry(s.name, "s", s.series_id, null, s.cover))
+            }
+            liveText?.let { tryParseJson<List<XLive>>(it) }?.forEach { s ->
+                if (index.size >= SEARCH_INDEX_MAX_ENTRIES) return@forEach
+                index.add(SearchIndexEntry(s.name, "l", s.stream_id, null, s.stream_icon))
+            }
+
+            if (index.isEmpty()) return null
+            searchIndex = index
+            index
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * Get the search index, building it on-demand if not yet cached.
+     * Uses a mutex so concurrent searches don't trigger duplicate builds.
+     */
+    private suspend fun getOrBuildSearchIndex(c: Cfg): List<SearchIndexEntry>? {
+        searchIndex?.let { return it }
+        searchIndexMutex.withLock {
+            // Re-check after acquiring lock — another coroutine may have built it.
+            searchIndex?.let { return it }
+            return buildSearchIndex(c)
+        }
+    }
+
+    /**
+     * Bulk HTTP fetch with a larger size cap than RawHttp.apiGet.
+     * RawHttp caps responses at 5 MB (for per-category calls); bulk endpoints
+     * can return 10-30 MB for big providers, so we need a dedicated fetcher.
+     */
+    private suspend fun bulkFetch(url: String): String? = withContext(Dispatchers.IO) {
+        var conn: HttpURLConnection? = null
+        try {
+            val uri = URI(url)
+            val referer = "${uri.scheme}://${uri.host}/"
+            conn = URL(url).openConnection() as HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.setRequestProperty("User-Agent", "okhttp/4.12.0")
+            conn.setRequestProperty("Referer", referer)
+            conn.setRequestProperty("Accept", "*/*")
+            conn.connectTimeout = 6000
+            conn.readTimeout = SEARCH_BULK_READ_TIMEOUT_MS
+            conn.instanceFollowRedirects = true
+
+            val code = conn.responseCode
+            if (code in 400..599) return@withContext null
+
+            val reader = BufferedReader(InputStreamReader(conn.inputStream, "UTF-8"))
+            val sb = StringBuilder(1 shl 20)  // 1 MB initial capacity
+            var line: String?
+            while (reader.readLine().also { line = it } != null) {
+                sb.append(line).append("\n")
+                if (sb.length > SEARCH_BULK_MAX_BYTES) {
+                    // Hard 50 MB cap — no legitimate provider exceeds this.
+                    try { reader.close() } catch (_: Exception) {}
+                    conn.disconnect()
+                    return@withContext null
+                }
+            }
+            reader.close()
+            sb.toString()
+        } catch (_: Throwable) {
+            null
+        } finally {
+            conn?.disconnect()
+        }
+    }
 
     override suspend fun search(query: String): List<SearchResponse>? {
         val url = cleanUrl()
@@ -1177,14 +1380,15 @@ class XtreamIPTVProvider : MainAPI() {
         val q = query.trim().lowercase()
         if (q.isEmpty()) return emptyList()
 
-        // Thread-safe result buffer — multiple category fetchers write to it concurrently.
-        val results = Collections.synchronizedList(mutableListOf<SearchResponse>())
+        val results = mutableListOf<SearchResponse>()
+        val seen = HashSet<String>()
 
-        // ── 1. Search M3U cache (instant, no network) ──
+        // ── 1. Search M3U cache first (instant, no network) ──
         cachedM3U?.let { entries ->
             entries.asSequence().filter {
                 it.name.lowercase().contains(q) || it.group.lowercase().contains(q)
             }.take(SEARCH_MAX_PER_TYPE).forEach { entry ->
+                if (!seen.add(entry.name.lowercase())) return@forEach
                 val ref = EntryRef(entry.streamUrl, entry.type, entry.name, entry.group, entry.logo, entry.seriesName)
                 when (entry.type) {
                     "movie" -> results.add(newMovieSearchResponse(entry.name, ref.toJson(), TvType.Movie) { posterUrl = entry.logo })
@@ -1194,180 +1398,46 @@ class XtreamIPTVProvider : MainAPI() {
             }
         }
 
-        // If M3U cache already has plenty of results, skip the network entirely.
-        if (results.size >= SEARCH_ENOUGH_RESULTS) {
-            return dedupeAndCap(results)
-        }
-
-        // ── 2. Ensure Xtream category lists are loaded ──
+        // ── 2. Get the in-memory search index (instant after first build) ──
+        //    On first search: builds the index (3 parallel bulk fetches, ~3-8s
+        //    one-time cost). On every subsequent search: pure in-memory filter,
+        //    sub-100ms even for 50,000+ items.
+        //
+        //    The index is also preloaded in the background by getMainPage(),
+        //    so by the time the user opens search it's usually already ready —
+        //    making even the FIRST search instant.
         val c = cfg() ?: return dedupeAndCap(results)
 
-        // If categories are not yet cached, fetch them now (3 tiny parallel calls).
-        if (!hasXtreamCache()) {
-            try {
-                fetchXtreamCategories(c)?.let { (v, s, l) ->
-                    v?.let { cachedXtreamVodCats = it }
-                    s?.let { cachedXtreamSeriesCats = it }
-                    l?.let { cachedXtreamLiveCats = it }
-                }
-            } catch (_: Throwable) { /* ignore — search with whatever we have */ }
-        }
-
-        val encUser = URLEncoder.encode(c.user, "UTF-8")
-        val encPass = URLEncoder.encode(c.pass, "UTF-8")
-        val apiBase = "${c.server}/player_api.php?username=$encUser&password=$encPass"
-
-        val vodCats = cachedXtreamVodCats?.let { tryParseJson<List<XCat>>(it) } ?: emptyList()
-        val serCats = cachedXtreamSeriesCats?.let { tryParseJson<List<XCat>>(it) } ?: emptyList()
-        val liveCats = cachedXtreamLiveCats?.let { tryParseJson<List<XCat>>(it) } ?: emptyList()
-
-        // ── 3. Search every category with bounded concurrency + total timeout ──
-        //
-        //    Why this is fast (vs. the old "fire-all-then-await-all" approach):
-        //
-        //    • withTimeoutOrNull(SEARCH_TOTAL_TIMEOUT_MS) — hard 10s cap. Whatever
-        //      matches have been collected so far are returned as partial results.
-        //      The old code had NO total cap, so a single slow category could
-        //      stall the whole search for 12+ seconds, and 50+ categories in
-        //      parallel would saturate the connection pool making everything
-        //      slower — easily hitting 60s+ on big providers.
-        //
-        //    • Semaphore(SEARCH_MAX_CONCURRENT) — limits in-flight HTTP requests
-        //      to 6. Android's HttpURLConnection pool caps ~5 per host anyway,
-        //      so firing 50+ parallel requests just queues them. Bounding
-        //      concurrency keeps every individual request fast (no queueing)
-        //      while still parallelising usefully.
-        //
-        //    • Short-circuit — each fetcher checks `results.size` before AND
-        //      inside its work, and returns immediately once we have
-        //      SEARCH_ENOUGH_RESULTS matches. The remaining queued fetchers
-        //      acquire the semaphore, see the short-circuit, and return without
-        //      making any HTTP request. So once we have ~40 hits, the search
-        //      returns within milliseconds (just waiting for any in-flight
-        //      request to be cancelled by the outer timeout).
-        //
-        //    • supervisorScope — one category failing (timeout, 500, parse
-        //      error) does NOT cancel the others, unlike plain coroutineScope.
-        //
-        //    • Per-category timeout reduced to 6s (was 12s) — combined with the
-        //      10s total cap, no single slow category can dominate the search.
-        //
-        //    Second+ searches are near-instant: every category that was fetched
-        //      on the first search is now in `cachedCatStreams`, so subsequent
-        //      searches just read from memory and filter.
-        val semaphore = Semaphore(SEARCH_MAX_CONCURRENT)
-
-        suspend fun fetchAndMatchVod(catId: String) {
-            if (results.size >= SEARCH_ENOUGH_RESULTS) return
-            semaphore.withPermit {
-                if (results.size >= SEARCH_ENOUGH_RESULTS) return@withPermit
-                try {
-                    val key = "v_$catId"
-                    val streams: List<XVod>? = cachedCatStreams[key] as? List<XVod>
-                        ?: RawHttp.apiGet("$apiBase&action=get_vod_streams&category_id=$catId", SEARCH_CAT_TIMEOUT_MS)
-                            ?.let { tryParseJson<List<XVod>>(it) }
-                            ?.also { parsed ->
-                                if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
-                                    cachedCatStreams[key] = parsed
-                                }
-                            }
-                    if (streams != null) {
-                        for (s in streams) {
-                            if (s.name.lowercase().contains(q)) {
-                                results.add(newMovieSearchResponse(s.name, ItemRef("m", s.stream_id, s.name, s.container_extension ?: "mp4").toJson(), TvType.Movie) {
-                                    posterUrl = s.stream_icon
-                                })
-                                if (results.size >= SEARCH_ENOUGH_RESULTS) return
-                            }
-                        }
-                    }
-                } catch (_: Throwable) { }
-            }
-        }
-
-        suspend fun fetchAndMatchSeries(catId: String) {
-            if (results.size >= SEARCH_ENOUGH_RESULTS) return
-            semaphore.withPermit {
-                if (results.size >= SEARCH_ENOUGH_RESULTS) return@withPermit
-                try {
-                    val key = "s_$catId"
-                    val streams: List<XSeries>? = cachedCatStreams[key] as? List<XSeries>
-                        ?: RawHttp.apiGet("$apiBase&action=get_series&category_id=$catId", SEARCH_CAT_TIMEOUT_MS)
-                            ?.let { tryParseJson<List<XSeries>>(it) }
-                            ?.also { parsed ->
-                                if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
-                                    cachedCatStreams[key] = parsed
-                                }
-                            }
-                    if (streams != null) {
-                        for (s in streams) {
-                            if (s.name.lowercase().contains(q)) {
-                                results.add(newTvSeriesSearchResponse(s.name, ItemRef("s", s.series_id, s.name).toJson(), TvType.TvSeries) {
-                                    posterUrl = s.cover
-                                })
-                                if (results.size >= SEARCH_ENOUGH_RESULTS) return
-                            }
-                        }
-                    }
-                } catch (_: Throwable) { }
-            }
-        }
-
-        suspend fun fetchAndMatchLive(catId: String) {
-            if (results.size >= SEARCH_ENOUGH_RESULTS) return
-            semaphore.withPermit {
-                if (results.size >= SEARCH_ENOUGH_RESULTS) return@withPermit
-                try {
-                    val key = "l_$catId"
-                    val streams: List<XLive>? = cachedCatStreams[key] as? List<XLive>
-                        ?: RawHttp.apiGet("$apiBase&action=get_live_streams&category_id=$catId", SEARCH_CAT_TIMEOUT_MS)
-                            ?.let { tryParseJson<List<XLive>>(it) }
-                            ?.also { parsed ->
-                                if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
-                                    cachedCatStreams[key] = parsed
-                                }
-                            }
-                    if (streams != null) {
-                        for (s in streams) {
-                            if (s.name.lowercase().contains(q)) {
-                                results.add(newMovieSearchResponse(s.name, ItemRef("l", s.stream_id, s.name).toJson(), TvType.Live) {
-                                    posterUrl = s.stream_icon
-                                })
-                                if (results.size >= SEARCH_ENOUGH_RESULTS) return
-                            }
-                        }
-                    }
-                } catch (_: Throwable) { }
-            }
-        }
-
-        try {
-            // Hard total-time cap. On timeout, returns null and cancels all
-            // in-flight fetchers — we then return whatever `results` we have.
-            withTimeoutOrNull(SEARCH_TOTAL_TIMEOUT_MS) {
-                supervisorScope {
-                    val jobs = mutableListOf<Deferred<Unit>>()
-                    for (cat in vodCats) {
-                        val catId = cat.category_id ?: continue
-                        jobs.add(async { fetchAndMatchVod(catId) })
-                    }
-                    for (cat in serCats) {
-                        val catId = cat.category_id ?: continue
-                        jobs.add(async { fetchAndMatchSeries(catId) })
-                    }
-                    for (cat in liveCats) {
-                        val catId = cat.category_id ?: continue
-                        jobs.add(async { fetchAndMatchLive(catId) })
-                    }
-                    // Await all jobs. Most will return quickly: cached ones are
-                    // instant, short-circuited ones return without HTTP, and only
-                    // the in-flight ones wait for their (6s-bounded) response.
-                    jobs.forEach { runCatching { it.await() } }
-                }
-            }
+        val index = try {
+            getOrBuildSearchIndex(c)
         } catch (_: Throwable) {
-            // Last-resort safety net — should never fire because withTimeoutOrNull
-            // and supervisorScope swallow child exceptions, but keep it just in case.
+            null
+        }
+
+        if (index != null) {
+            // INSTANT in-memory filter — no network, no per-category fetches.
+            for (entry in index) {
+                if (results.size >= SEARCH_MAX_RESULTS) break
+                if (!entry.name.lowercase().contains(q)) continue
+                if (!seen.add(entry.name.lowercase())) continue
+                when (entry.type) {
+                    "m" -> results.add(newMovieSearchResponse(
+                        entry.name,
+                        ItemRef("m", entry.id, entry.name, entry.ext ?: "mp4").toJson(),
+                        TvType.Movie
+                    ) { posterUrl = entry.poster })
+                    "s" -> results.add(newTvSeriesSearchResponse(
+                        entry.name,
+                        ItemRef("s", entry.id, entry.name).toJson(),
+                        TvType.TvSeries
+                    ) { posterUrl = entry.poster })
+                    "l" -> results.add(newMovieSearchResponse(
+                        entry.name,
+                        ItemRef("l", entry.id, entry.name).toJson(),
+                        TvType.Live
+                    ) { posterUrl = entry.poster })
+                }
+            }
         }
 
         return dedupeAndCap(results)
@@ -1380,6 +1450,7 @@ class XtreamIPTVProvider : MainAPI() {
      */
     private fun dedupeAndCap(results: List<SearchResponse>): List<SearchResponse> {
         if (results.isEmpty()) return emptyList()
+        // Dedup may have already been done inline, but run it again as a safety net.
         val seen = HashSet<String>()
         val deduped = results.filter { seen.add(it.name.lowercase()) }
         return if (deduped.isEmpty()) emptyList() else deduped.take(SEARCH_MAX_RESULTS)
