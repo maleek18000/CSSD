@@ -399,6 +399,12 @@ class Arabp2 : MainAPI() {
         // Search-result format: pipe-delimited torrent metadata.
         if (url.contains("|")) return loadFromTorrentData(url)
 
+        // Category-page format: detail URL with arabp_data= parameter containing
+        // URL-encoded torrent metadata. CloudStream doesn't preserve raw pipe
+        // characters in URLs, so toSearchResult() encodes them. This is the same
+        // approach v1 uses (modernTorrentRowToSearchResult).
+        if (url.contains("arabp_data=")) return loadFromTorrentDetailUrl(url)
+
         // Fix D — check 1h show cache first.
         synchronized(showCacheLock) {
             showCache[url]?.let { (ts, response) ->
@@ -496,6 +502,37 @@ class Arabp2 : MainAPI() {
                 this.seasonNames = seasonNames
             }
         }
+    }
+
+    /**
+     * Handle URLs from torrent category pages (documentaries, Asian, Latin, etc.)
+     * that use a real torrent-detail URL with an arabp_data= query parameter
+     * containing URL-encoded torrent metadata.
+     *
+     * Decodes the metadata, reconstructs the full pipe-delimited baseData, and
+     * delegates to loadFromTorrentData(). Same approach as v1's
+     * loadFromTorrentDetailUrl.
+     */
+    private suspend fun loadFromTorrentDetailUrl(url: String): LoadResponse? {
+        val detailUrl = url.substringBefore("&arabp_data=")
+        val encodedData = url.substringAfter("arabp_data=", "")
+        val torrentData = try {
+            java.net.URLDecoder.decode(encodedData, "UTF-8")
+        } catch (e: Exception) {
+            Log.e(TAG, "loadFromTorrentDetailUrl: decode failed: ${e.message}")
+            return null
+        }
+        // torrentData format: torrentId|downloadUrl|magnetUrl|isFree|isExternal
+        val dataParts = torrentData.split("|")
+        val torrentId = dataParts.getOrNull(0) ?: "0"
+        val downloadUrl = dataParts.getOrNull(1) ?: ""
+        val magnetUrl = dataParts.getOrNull(2) ?: ""
+        val isFree = dataParts.getOrNull(3) == "1"
+        val isExternal = dataParts.getOrNull(4) == "1"
+
+        // Reconstruct baseData: torrentId|detailUrl|downloadUrl|magnetUrl|isFree|isExternal
+        val baseData = "$torrentId|$detailUrl|$downloadUrl|$magnetUrl|${if (isFree) "1" else "0"}|${if (isExternal) "1" else "0"}"
+        return loadFromTorrentData(baseData)
     }
 
     /**
@@ -636,15 +673,7 @@ class Arabp2 : MainAPI() {
                         ?: detailDoc.selectFirst("td#Title h1 a[href*=download.php]")
                     if (dlLink != null) {
                         resolvedUrl = toAbsoluteUrl(dlLink.attr("href"))
-                        // If the detail-page download link lacks &f=, append a dummy
-                        // filename. arabp2p.net's download.php requires &f= to return
-                        // the .torrent binary; without it the server returns HTML.
-                        // Working categories already have &f= in their data string
-                        // and skip this block entirely (no slowdown).
-                        if (!resolvedUrl.contains("&f=")) {
-                            resolvedUrl = "$resolvedUrl&f=torrent.torrent"
-                        }
-                        cacheResolvedUrl(torrentId, resolvedUrl)
+                        if (resolvedUrl.contains("&f=")) cacheResolvedUrl(torrentId, resolvedUrl)
                     }
                 }
             }
@@ -757,16 +786,24 @@ class Arabp2 : MainAPI() {
             fallbackTvType == TvType.TvSeries -> TvType.TvSeries
             else -> fallbackTvType
         }
+        // Use the detail page URL as the search result URL, with torrent metadata
+        // encoded as a URL parameter. CloudStream doesn't preserve raw pipe
+        // characters in URLs, so we URL-encode the pipe-delimited data. This is
+        // the same approach v1 uses (modernTorrentRowToSearchResult).
+        // torrentData format: torrentId|downloadUrl|magnetUrl|isFree|isExternal
+        val torrentData = "${info.torrentId}|${toAbsoluteUrl(info.downloadHref)}|${info.magnetHref}|${if (info.isFree) "1" else "0"}|${if (info.isExternal) "1" else "0"}"
+        val encodedData = URLEncoder.encode(torrentData, "UTF-8")
+        val searchUrl = "${info.detailHref}&arabp_data=$encodedData"
         return when (tvType) {
-            TvType.TvSeries -> newTvSeriesSearchResponse(info.displayName, info.baseData, tvType) {
+            TvType.TvSeries -> newTvSeriesSearchResponse(info.displayName, searchUrl, tvType) {
                 this.posterUrl = absPosterUrl
                 this.posterHeaders = imageHeaders
             }
-            TvType.Movie -> newMovieSearchResponse(info.displayName, info.baseData, tvType) {
+            TvType.Movie -> newMovieSearchResponse(info.displayName, searchUrl, tvType) {
                 this.posterUrl = absPosterUrl
                 this.posterHeaders = imageHeaders
             }
-            else -> newAnimeSearchResponse(info.displayName, info.baseData, tvType) {
+            else -> newAnimeSearchResponse(info.displayName, searchUrl, tvType) {
                 this.posterUrl = absPosterUrl
                 this.posterHeaders = imageHeaders
             }
