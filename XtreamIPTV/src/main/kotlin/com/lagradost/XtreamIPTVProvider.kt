@@ -73,18 +73,6 @@ data class XEpInfo(val plot: String? = null, val image: String? = null)
 data class ItemRef(val t: String, val id: Int, val n: String, val e: String? = null)
 data class LinkData(val t: String, val id: Int, val e: String? = null)
 
-// ── Stremio worker JSON shapes (for fast search via the Cloudflare worker) ──
-data class StremioCatalog(val type: String? = null, val id: String? = null, val name: String? = null)
-data class StremioManifest(val catalogs: List<StremioCatalog>? = null)
-data class StremioMeta(
-    val id: String? = null,
-    val type: String? = null,
-    val name: String? = null,
-    val poster: String? = null,
-    val description: String? = null
-)
-data class StremioSearchResponse(val metas: List<StremioMeta>? = null)
-
 // ═══════════════════════════════════════════════════════════════════
 //  RAW HTTP CLIENT  (bypasses CloudStream's app.get to avoid 403)
 //
@@ -1135,151 +1123,22 @@ class XtreamIPTVProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════
     //  SEARCH  — comprehensive parallel search across ALL categories
     //
-    //  FAST PATH (Stremio worker):
-    //  The Cloudflare worker at broad-rain-6b47.ninf-2016.workers.dev
-    //  exposes a Stremio-compatible catalog search API on top of the
-    //  user's Xtream credentials. The worker caches the entire stream
-    //  catalog in Cloudflare's edge network, so a search query is a
-    //  SINGLE HTTP call per type (movie / series / live) that returns
-    //  pre-matched results. This is the same mechanism the Stremio
-    //  plugin uses to deliver "blazingly fast" search.
+    //  The Xtream Codes API has no native search endpoint, so we must
+    //  search client-side. This implementation searches EVERY category
+    //  (movies + series + live TV) on the provider — including categories
+    //  that are NOT shown on the home screen.
     //
-    //  Worker URL format (server is hex-encoded so it can live in a path segment):
-    //    Manifest:  https://broad-rain-6b47.ninf-2016.workers.dev/{hex-server}/{user}/{pass}/manifest.json
-    //    Search:    https://broad-rain-6b47.ninf-2016.workers.dev/{hex-server}/{user}/{pass}/catalog/{type}/{id}/search={query}.json
+    //  Strategy:
+    //  1. Ensure category lists are loaded (3 tiny API calls, cached)
+    //  2. For every category in every type, fetch its streams IN PARALLEL
+    //     (cached categories are read from memory instantly)
+    //  3. Filter each category's streams by the query (case-insensitive)
+    //  4. Merge all matching results, capped per-type to avoid flooding
     //
-    //  FALLBACK:
-    //  If the worker is unreachable or returns nothing, we fall back to
-    //  the original per-category Xtream search (slower, but always works).
+    //  Memory safety: each category's stream list is parsed, filtered, and
+    //  only the small SearchResponse objects are kept — not the full lists.
+    //  The cache is bounded by MAX_CACHED_CATEGORIES to prevent OOM.
     // ═══════════════════════════════════════════════════════════════════
-
-    private val STREMIO_WORKER_HOST = "https://broad-rain-6b47.ninf-2016.workers.dev"
-
-    /** Cached Stremio manifest (parsed) — fetched once per session. */
-    private var cachedStremioManifest: StremioManifest? = null
-
-    /** Lowercase hex encoding of a string (one byte → two hex chars). */
-    private fun hexEncode(s: String): String {
-        val sb = StringBuilder(s.length * 2)
-        for (b in s.toByteArray(Charsets.UTF_8)) {
-            sb.append(String.format("%02x", b.toInt() and 0xff))
-        }
-        return sb.toString()
-    }
-
-    /**
-     * Build the Stremio worker base URL for the given Xtream credentials.
-     * Example: Cfg("http://egl-4k.xyz:80", "alice", "bob")
-     *   -> "https://broad-rain-6b47.ninf-2016.workers.dev/687474703a2f2f65676c2d346b2e78797a3a3830/alice/bob"
-     */
-    private fun stremioWorkerBaseUrl(c: Cfg): String {
-        val hex = hexEncode(c.server)
-        val encUser = URLEncoder.encode(c.user, "UTF-8")
-        val encPass = URLEncoder.encode(c.pass, "UTF-8")
-        return "$STREMIO_WORKER_HOST/$hex/$encUser/$encPass"
-    }
-
-    /**
-     * Fetch & cache the Stremio manifest. Returns null if the worker is
-     * unavailable or the manifest is unparseable.
-     */
-    private suspend fun fetchStremioManifest(c: Cfg): StremioManifest? {
-        cachedStremioManifest?.let { return it }
-        val url = "${stremioWorkerBaseUrl(c)}/manifest.json"
-        val text = RawHttp.apiGet(url, 10000) ?: return null
-        val parsed = tryParseJson<StremioManifest>(text) ?: return null
-        if (parsed.catalogs.isNullOrEmpty()) return null
-        cachedStremioManifest = parsed
-        return parsed
-    }
-
-    /**
-     * Extract a numeric Xtream stream_id from a Stremio meta id.
-     * Stremio ids are strings ("12345", "xtream-movie-12345", etc.).
-     */
-    private fun extractStreamId(id: String?): Int? {
-        if (id.isNullOrEmpty()) return null
-        id.toIntOrNull()?.let { return it }
-        val lastDash = id.lastIndexOf('-')
-        if (lastDash in 0 until id.length - 1) {
-            id.substring(lastDash + 1).toIntOrNull()?.let { return it }
-        }
-        Regex("""(\d+)""").find(id)?.let { return it.groupValues[1].toIntOrNull() }
-        return null
-    }
-
-    /**
-     * FAST SEARCH via the Stremio worker.
-     *
-     * Fires one HTTP call per catalog (movie/series/live) IN PARALLEL.
-     * The worker does the search server-side on its cached index, so
-     * each call returns only matching items — no client-side filtering
-     * of huge stream lists.
-     *
-     * Returns null if the worker is unavailable or returns no matches
-     * (so the caller can fall back to the per-category search).
-     */
-    private suspend fun searchStremioWorker(c: Cfg, query: String): List<SearchResponse>? {
-        val manifest = fetchStremioManifest(c) ?: return null
-        val catalogs = manifest.catalogs ?: return null
-        if (catalogs.isEmpty()) return null
-
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val baseUrl = stremioWorkerBaseUrl(c)
-        val results = mutableListOf<SearchResponse>()
-
-        try {
-            coroutineScope {
-                for (catalog in catalogs) {
-                    val catType = catalog.type ?: continue
-                    val catId = catalog.id ?: continue
-                    async {
-                        try {
-                            val url = "$baseUrl/catalog/$catType/$catId/search=$encodedQuery.json"
-                            val text = RawHttp.apiGet(url, 9000) ?: return@async
-                            val parsed = tryParseJson<StremioSearchResponse>(text) ?: return@async
-                            val metas = parsed.metas ?: return@async
-                            if (metas.isEmpty()) return@async
-
-                            val matched = mutableListOf<SearchResponse>()
-                            for (meta in metas) {
-                                val name = meta.name ?: continue
-                                val id = extractStreamId(meta.id) ?: continue
-                                val poster = meta.poster
-                                val response: SearchResponse? = when (catType) {
-                                    "movie" -> newMovieSearchResponse(
-                                        name,
-                                        ItemRef("m", id, name, "mp4").toJson(),
-                                        TvType.Movie
-                                    ) { posterUrl = poster }
-                                    "series" -> newTvSeriesSearchResponse(
-                                        name,
-                                        ItemRef("s", id, name).toJson(),
-                                        TvType.TvSeries
-                                    ) { posterUrl = poster }
-                                    "tv" -> newMovieSearchResponse(
-                                        name,
-                                        ItemRef("l", id, name).toJson(),
-                                        TvType.Live
-                                    ) { posterUrl = poster }
-                                    else -> null
-                                }
-                                if (response != null) matched.add(response)
-                            }
-                            if (matched.isNotEmpty()) {
-                                synchronized(results) { results.addAll(matched) }
-                            }
-                        } catch (_: Throwable) { /* one catalog failing shouldn't kill the rest */ }
-                    }
-                }
-            }
-        } catch (_: Throwable) {
-            // coroutineScope throws on first child failure — but each async has
-            // its own try/catch so this is just a safety net.
-        }
-
-        return if (results.isEmpty()) null else results
-    }
 
     /** Maximum search results to return. */
     private val SEARCH_MAX_RESULTS = 60
@@ -1309,44 +1168,11 @@ class XtreamIPTVProvider : MainAPI() {
             }
         }
 
-        // ── 2. FAST PATH: Stremio worker search (blazingly fast) ──
-        //    One HTTP call per type (movie/series/live) IN PARALLEL.
-        //    The worker caches the entire catalog in Cloudflare's edge
-        //    and returns only matching items — no client-side filtering
-        //    of huge stream lists. This is the same mechanism the Stremio
-        //    plugin uses to deliver "blazingly fast" search.
+        // ── 2. Ensure Xtream category lists are loaded ──
         val c = cfg()
         if (c == null) {
             return if (results.isEmpty()) null else results.take(SEARCH_MAX_RESULTS)
         }
-
-        try {
-            val workerResults = searchStremioWorker(c, query)
-            if (workerResults != null && workerResults.isNotEmpty()) {
-                results.addAll(workerResults)
-
-                // Ensure Xtream categories are also loaded (cheap, helps home page)
-                if (!hasXtreamCache()) {
-                    try {
-                        fetchXtreamCategories(c)?.let { (v, s, l) ->
-                            v?.let { cachedXtreamVodCats = it }
-                            s?.let { cachedXtreamSeriesCats = it }
-                            l?.let { cachedXtreamLiveCats = it }
-                        }
-                    } catch (_: Throwable) { /* non-fatal */ }
-                }
-
-                // De-duplicate by name (case-insensitive)
-                val seenFast = HashSet<String>()
-                val dedupedFast = results.filter { seenFast.add(it.name.lowercase()) }
-                return if (dedupedFast.isEmpty()) null else dedupedFast.take(SEARCH_MAX_RESULTS)
-            }
-        } catch (_: Throwable) {
-            // Worker failed — fall through to per-category fallback
-        }
-
-        // ── 3. FALLBACK: per-category Xtream search (slower but reliable) ──
-        //    Used when the worker is down or returns no results.
 
         // If categories are not yet cached, fetch them now (3 tiny parallel calls).
         if (!hasXtreamCache()) {
@@ -1367,7 +1193,7 @@ class XtreamIPTVProvider : MainAPI() {
         val serCats = cachedXtreamSeriesCats?.let { tryParseJson<List<XCat>>(it) } ?: emptyList()
         val liveCats = cachedXtreamLiveCats?.let { tryParseJson<List<XCat>>(it) } ?: emptyList()
 
-        // ── 4. Search every category IN PARALLEL (movies + series + live) ──
+        // ── 3. Search every category IN PARALLEL (movies + series + live) ──
         //    Each async block either reads from cache (instant) or fetches
         //    the per-category stream list, then filters by the query.
         //    Results are collected thread-safely into typed buffers, then
@@ -1473,7 +1299,7 @@ class XtreamIPTVProvider : MainAPI() {
             // its own try/catch via the ?:-null fallback, so this is just a safety net.
         }
 
-        // ── 5. Merge results: movies first, then series, then live ──
+        // ── 4. Merge results: movies first, then series, then live ──
         //    Cap each type so a huge movie library doesn't drown out series/live.
         results.addAll(vodMatches.take(SEARCH_MAX_PER_TYPE))
         results.addAll(serMatches.take(SEARCH_MAX_PER_TYPE))
