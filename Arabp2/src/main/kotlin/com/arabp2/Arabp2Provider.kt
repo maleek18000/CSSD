@@ -370,20 +370,35 @@ class Arabp2 : MainAPI() {
         val encoded = URLEncoder.encode(query, "UTF-8")
         val queryLower = query.lowercase().trim()
 
-        val urls = listOf(
+        // Listing pages (anime/tv/movies) — apply matchesQuery filter, same as v1.
+        // These pages return shows by actor/director/year/etc., so we filter to
+        // only shows whose title contains the query.
+        val listingUrls = listOf(
             "$mainUrl/index.php?page=anime-listing&search=$encoded" to TvType.Anime,
             "$mainUrl/index.php?page=tv-listing&search=$encoded" to TvType.TvSeries,
-            "$mainUrl/index.php?page=movies-listing&search=$encoded" to TvType.Movie,
-            "$mainUrl/index.php?page=torrents&search=$encoded&category=0&active=0" to TvType.Anime
+            "$mainUrl/index.php?page=movies-listing&search=$encoded" to TvType.Movie
         )
 
-        val deferred: List<Deferred<List<SearchResponse>>> = urls.map { (url, tvType) ->
+        val listingDeferred: List<Deferred<List<SearchResponse>>> = listingUrls.map { (url, tvType) ->
             async(Dispatchers.IO) {
                 val doc = fetchDoc(url) ?: return@async emptyList<SearchResponse>()
                 parseListingRows(doc, tvType).filter { matchesQuery(it.name, queryLower) }
             }
         }
-        deferred.awaitAll().flatten()
+
+        // Torrents page — NO matchesQuery filter, same as v1. The site's torrents
+        // search already matches the query against the torrent name; filtering
+        // again would drop results where the site matched on description/uploader/etc.
+        val torrentsUrl = "$mainUrl/index.php?page=torrents&search=$encoded&category=0&active=0"
+        val torrentsDeferred = async(Dispatchers.IO) {
+            val doc = fetchDoc(torrentsUrl) ?: return@async emptyList<SearchResponse>()
+            parseListingRows(doc, TvType.Anime)
+        }
+
+        val results = mutableListOf<SearchResponse>()
+        results.addAll(listingDeferred.awaitAll().flatten())
+        results.addAll(torrentsDeferred.await())
+        results
     }
 
     private fun matchesQuery(title: String?, queryLower: String): Boolean {
