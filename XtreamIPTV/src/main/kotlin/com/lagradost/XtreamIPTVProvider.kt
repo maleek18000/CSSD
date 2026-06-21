@@ -85,15 +85,19 @@ data class LinkData(val t: String, val id: Int, val e: String? = null)
 /**
  * Compact entry in the flat search index.
  * Holds ONLY the fields needed to build a SearchResponse — name, type,
- * id, container extension (movies), and poster URL. ~150 bytes/entry,
- * so 50k items ≈ 7.5MB — fits comfortably in memory.
+ * id, container extension (movies), poster URL, and pre-lowercased name.
+ * ~170 bytes/entry, so 50k items ≈ 8.5MB — fits comfortably in memory.
+ *
+ * nameLower is pre-computed at build time to avoid allocating a new String
+ * per entry per search (56k allocations × 2-4MB garbage per search).
  */
 data class SearchIndexEntry(
     val name: String,
     val type: String,   // "m" = movie, "s" = series, "l" = live
     val id: Int,
     val ext: String?,   // container_extension (movies only)
-    val poster: String?
+    val poster: String?,
+    val nameLower: String? = null  // pre-lowercased for fast search; null in old caches, populated on load
 )
 
 // ═══════════════════════════════════════════════════════════════════
@@ -678,7 +682,15 @@ class XtreamIPTVProvider : MainAPI() {
 
             synchronized(searchIndexLock) {
                 searchIndexEntries.clear()
-                searchIndexEntries.addAll(entries)
+                for (entry in entries) {
+                    // Populate nameLower for old cache format compatibility.
+                    // Old caches don't have nameLower — populate it here so search
+                    // is allocation-free regardless of cache format.
+                    searchIndexEntries.add(
+                        if (entry.nameLower.isNullOrEmpty()) entry.copy(nameLower = entry.name.lowercase())
+                        else entry
+                    )
+                }
                 // NOTE: Do NOT rebuild seenIndexIds here — since searchIndexComplete = true,
                 // no more entries will be added, so the dedup set is unnecessary.
                 // This saves ~1.8 MB of RAM for a 50k-item index (important on 1 GB Android TV).
@@ -965,7 +977,7 @@ class XtreamIPTVProvider : MainAPI() {
                                                 ?.let { tryParseJson<List<XVod>>(it) }
                                         if (streams != null) {
                                             addToSearchIndex(streams, "m") { s ->
-                                                SearchIndexEntry(s.name, "m", s.stream_id, s.container_extension, s.stream_icon)
+                                                SearchIndexEntry(s.name, "m", s.stream_id, s.container_extension, s.stream_icon, s.name.lowercase())
                                             }
                                         }
                                     }
@@ -985,7 +997,7 @@ class XtreamIPTVProvider : MainAPI() {
                                                 ?.let { tryParseJson<List<XSeries>>(it) }
                                         if (streams != null) {
                                             addToSearchIndex(streams, "s") { s ->
-                                                SearchIndexEntry(s.name, "s", s.series_id, null, s.cover)
+                                                SearchIndexEntry(s.name, "s", s.series_id, null, s.cover, s.name.lowercase())
                                             }
                                         }
                                     }
@@ -1005,7 +1017,7 @@ class XtreamIPTVProvider : MainAPI() {
                                                 ?.let { tryParseJson<List<XLive>>(it) }
                                         if (streams != null) {
                                             addToSearchIndex(streams, "l") { s ->
-                                                SearchIndexEntry(s.name, "l", s.stream_id, null, s.stream_icon)
+                                                SearchIndexEntry(s.name, "l", s.stream_id, null, s.stream_icon, s.name.lowercase())
                                             }
                                         }
                                     }
@@ -1095,19 +1107,16 @@ class XtreamIPTVProvider : MainAPI() {
      * This is called by search() on EVERY search. It returns whatever is
      * in the index right now (could be empty, partial, or complete).
      *
-     * The philosophy: the build runs aggressively in the background starting
-     * at app launch (see init block). By the time the user searches, the
-     * index should already have data. If it doesn't (user searches very
-     * quickly after launch), search returns null — the user can re-search
-     * a few seconds later and get results. This is better than blocking the
-     * search for 60s, which made CloudStream appear frozen.
+     * ★ Optimization: once the index is complete (searchIndexComplete = true),
+     *   return the list reference directly — NO copy, NO synchronization.
+     *   This saves ~448 KB allocation per search (56k references × 8 bytes).
+     *   Safe because once complete, no more writes happen to searchIndexEntries.
      *
-     * Note: the Stremio worker achieves ~2.5s search by re-fetching all
-     * streams per search from a Cloudflare data center (24× faster network
-     * than a phone). We can't match that on-device, so we pre-build at
-     * launch and search locally.
+     * During build (searchIndexComplete = false), return a copy to avoid
+     * ConcurrentModificationException while the build thread is adding entries.
      */
     private fun getSearchIndexSnapshot(): List<SearchIndexEntry> {
+        if (searchIndexComplete) return searchIndexEntries
         return synchronized(searchIndexLock) { searchIndexEntries.toList() }
     }
 
@@ -1653,7 +1662,11 @@ class XtreamIPTVProvider : MainAPI() {
             val liveMatches = mutableListOf<SearchResponse>()
 
             for (entry in index) {
-                if (!entry.name.lowercase().contains(q)) continue
+                // ★ Use pre-lowercased name (nameLower) for matching — avoids allocating
+                //    a new String per entry per search (56k allocations = 2-4MB garbage).
+                //    nameLower is populated at build time or during cache load.
+                val nameLower = entry.nameLower ?: entry.name.lowercase()
+                if (!nameLower.contains(q)) continue
                 when (entry.type) {
                     "m" -> if (vodMatches.size < SEARCH_MAX_PER_TYPE) {
                         vodMatches.add(newMovieSearchResponse(
