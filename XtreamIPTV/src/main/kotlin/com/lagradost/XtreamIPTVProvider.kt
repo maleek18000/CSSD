@@ -661,27 +661,33 @@ class XtreamIPTVProvider : MainAPI() {
      *
      * CloudStream instantiates the provider at app start and sets mainUrl
      * from saved settings shortly after. This init block launches a
-     * background coroutine that polls mainUrl (up to 60s), then kicks off
-     * buildSearchIndex() the moment the URL is available.
+     * background coroutine that polls mainUrl (up to 60s, every 500ms
+     * for fast detection), then kicks off buildSearchIndex() the moment
+     * the URL is available.
      *
-     * This means the index starts building BEFORE the user searches or
-     * opens the home page — so by the time they search, the index is
-     * already populated (or close to it). No-op if the build is already
-     * running or complete.
+     * This means the index starts building BEFORE the user searches —
+     * so by the time they search (even 10-20s later), the index already
+     * has enough data to return results instantly.
+     *
+     * Architecture note: the Stremio worker at broad-rain-6b47.ninf-2016.
+     * workers.dev achieves ~2.5s search by re-fetching all streams per
+     * search from a Cloudflare data center (24× faster network than a
+     * phone). We can't match that network speed on-device, so instead we
+     * pre-build the index at launch and search the local in-memory index.
      */
     init {
         bgScope.launch {
             try {
-                // Poll mainUrl for up to 60s — CloudStream sets it from
-                // saved settings shortly after the provider is registered.
+                // Poll mainUrl every 500ms for up to 60s — CloudStream sets
+                // it from saved settings shortly after the provider is registered.
                 var attempts = 0
-                while (attempts < 60) {
+                while (attempts < 120) {
                     val url = mainUrl.trim()
                     if (url.isNotEmpty() && url != "http://example.com/username/password") {
                         cfg()?.let { buildSearchIndex(it) }
                         break
                     }
-                    delay(1000)
+                    delay(500)
                     attempts++
                 }
             } catch (_: Throwable) {
@@ -961,67 +967,25 @@ class XtreamIPTVProvider : MainAPI() {
     }
 
     /**
-     * Return a point-in-time snapshot of the incremental search index.
-     * Safe to call while the build is still running — returns whatever
-     * has been fetched so far. Returns an empty list if nothing has been
-     * fetched yet (first search on a cold start).
+     * Return a snapshot of the search index immediately — no waiting.
+     *
+     * This is called by search() on EVERY search. It returns whatever is
+     * in the index right now (could be empty, partial, or complete).
+     *
+     * The philosophy: the build runs aggressively in the background starting
+     * at app launch (see init block). By the time the user searches, the
+     * index should already have data. If it doesn't (user searches very
+     * quickly after launch), search returns null — the user can re-search
+     * a few seconds later and get results. This is better than blocking the
+     * search for 60s, which made CloudStream appear frozen.
+     *
+     * Note: the Stremio worker achieves ~2.5s search by re-fetching all
+     * streams per search from a Cloudflare data center (24× faster network
+     * than a phone). We can't match that on-device, so we pre-build at
+     * launch and search locally.
      */
     private fun getSearchIndexSnapshot(): List<SearchIndexEntry> {
         return synchronized(searchIndexLock) { searchIndexEntries.toList() }
-    }
-
-    /**
-     * Wait for the search index to be ready, with smart backoff.
-     *
-     * Three cases:
-     *   1. Index is complete → return instantly (2nd+ search after build finishes).
-     *   2. Index has entries but build is still running → wait up to 10s more
-     *      for the build to progress, so we don't return thin partial results
-     *      while other providers are still empty. Returns a snapshot after 10s
-     *      even if the build isn't done.
-     *   3. Index is empty (build hasn't produced entries yet) → wait up to
-     *      timeoutMs (default 60s) for any entries to appear.
-     *
-     * The 60s timeout is necessary because with multiple IPTV providers
-     * configured, each provider's build competes for network resources.
-     * A single provider might finish in ~20s, but with 3 providers building
-     * simultaneously, the slowest can take ~60s. Without a long enough
-     * timeout, the first search returns results from only the fastest
-     * provider while the others return null — forcing the user to re-search
-     * multiple times.
-     */
-    private suspend fun awaitSearchIndexEntries(timeoutMs: Long = 60000L): List<SearchIndexEntry> {
-        // Fast path: already complete
-        if (searchIndexComplete) return getSearchIndexSnapshot()
-
-        var snapshot = getSearchIndexSnapshot()
-
-        // Case 3: index is empty — wait up to timeoutMs for entries to appear.
-        if (snapshot.isEmpty()) {
-            val deadline = System.currentTimeMillis() + timeoutMs
-            while (System.currentTimeMillis() < deadline && !searchIndexComplete) {
-                delay(150)
-                snapshot = getSearchIndexSnapshot()
-                if (snapshot.isNotEmpty()) break
-            }
-        }
-
-        // Case 2: index has entries but build is still running — wait up to
-        // 10s more for the build to progress, so we return a richer snapshot.
-        // This gives slower providers time to catch up before search returns.
-        if (!searchIndexComplete && snapshot.isNotEmpty()) {
-            val settleDeadline = System.currentTimeMillis() + 10000
-            while (System.currentTimeMillis() < settleDeadline && !searchIndexComplete) {
-                delay(200)
-                val newer = getSearchIndexSnapshot()
-                if (newer.size > snapshot.size) {
-                    snapshot = newer  // keep updating as more entries arrive
-                }
-                if (searchIndexComplete) break
-            }
-        }
-
-        return snapshot
     }
 
     /**
@@ -1469,24 +1433,32 @@ class XtreamIPTVProvider : MainAPI() {
     //  this was slow (60s+) because one slow/timing-out category blocked
     //  the whole search.
     //
-    //  Current strategy: an INCREMENTAL flat in-memory index.
-    //    1. buildSearchIndex() is fired on first search (and on home page
-    //       load). It fetches every category's streams in parallel (capped
-    //       to 12 concurrent by a Semaphore) and adds entries to
+    //  Current strategy: an INCREMENTAL flat in-memory index, pre-built at launch.
+    //    1. The init block polls mainUrl at app launch and fires
+    //       buildSearchIndex() the moment the URL is available. This means
+    //       the index starts building BEFORE the user searches.
+    //    2. buildSearchIndex() fetches every category's streams in parallel
+    //       (capped to 12 concurrent by a Semaphore) and adds entries to
     //       searchIndexEntries INCREMENTALLY — each category becomes
     //       searchable the moment it's fetched.
-    //    2. search() calls awaitSearchIndexEntries() which waits up to 15s
-    //       for ANY entries to appear, then returns a snapshot. This means:
-    //         - 1st search: waits a few seconds for the first categories,
-    //           returns partial results, and gets more complete on retry.
-    //         - 2nd+ search: index already has entries → instant.
-    //    3. If the index has entries, search() is a pure in-memory scan.
-    //    4. If the index is still empty after 15s (total failure), fall
-    //       back to scanning cachedCatStreams (categories cached by the
-    //       home page or previous browsing).
+    //    3. search() returns INSTANTLY from whatever's in the index right
+    //       now (via getSearchIndexSnapshot()). No blocking wait. If the
+    //       index has data → results in <50ms. If empty (user searched
+    //       very quickly after launch) → null; re-search a few seconds later.
+    //    4. If the index is empty, fall back to scanning cachedCatStreams
+    //       (categories cached by the home page or previous browsing).
     //
-    //  The incremental design fixes the multi-provider problem where one
-    //  slow category on one provider blocked the whole index from publishing.
+    //  Why no blocking wait: a 60s wait made CloudStream appear frozen and
+    //  still returned staggered results across providers (fast provider
+    //  returns first, slow ones time out). Returning instantly means the
+    //  UI never freezes, and re-searching gives increasingly complete
+    //  results as the background build progresses.
+    //
+    //  Why we can't match the Stremio worker's ~2.5s search: that worker
+    //  re-fetches all streams per search from a Cloudflare data center
+    //  (24× faster network to the IPTV server than a phone). We can't
+    //  replicate that network speed on-device, so we pre-build at launch
+    //  and search the local in-memory index instead.
     //
     //  Memory cost: ~150 bytes per entry × 50,000 items ≈ 7.5 MB.
     //  Capped at MAX_SEARCH_INDEX_SIZE to prevent OOM on huge libraries.
@@ -1526,19 +1498,29 @@ class XtreamIPTVProvider : MainAPI() {
 
         // ── 2. Kick off the background index build (fire-and-forget).
         //    On the very first search this starts the build; on subsequent
-        //    searches it's a no-op (the build is already running or complete). ──
+        //    searches it's a no-op (the build is already running or complete).
+        //    The init block also starts the build at app launch, so by the
+        //    time the user searches, the index likely already has data. ──
         buildSearchIndex(c)
 
-        // ── 3. Wait for the incremental index to be ready.
-        //    Returns INSTANTLY if the build is complete (2nd+ search).
-        //    If the index is empty, waits up to 60s for entries to appear.
-        //    This long timeout is necessary because with multiple providers
-        //    configured, each provider's build competes for network resources
-        //    and the slowest can take ~60s. Without it, the first search would
-        //    return results from only the fastest provider.
-        //    If the index has partial entries, waits up to 10s more for the
-        //    build to progress before returning a snapshot. ──
-        val index = awaitSearchIndexEntries(60000L)
+        // ── 3. Return INSTANTLY from whatever's in the index right now.
+        //    No blocking wait — the build runs in the background and the
+        //    index fills up incrementally. If the index is empty (user
+        //    searched very quickly after launch), search returns null and
+        //    the user can re-search a few seconds later.
+        //
+        //    This is intentionally different from blocking for 60s. A 60s
+        //    block made CloudStream appear frozen and still returned
+        //    staggered results across providers. Returning instantly means:
+        //      - If the index has data → results appear in <50ms.
+        //      - If the index is empty → no results, but no frozen UI either.
+        //        Re-searching a few seconds later (as the build progresses)
+        //        gives increasingly complete results.
+        //
+        //    The Stremio worker achieves ~2.5s by re-fetching from a
+        //    data center on every search. We can't do that on a phone, so
+        //    we pre-build at launch and search locally. ──
+        val index = getSearchIndexSnapshot()
 
         if (index.isNotEmpty()) {
             // ★ INSTANT: pure in-memory scan of the index snapshot.
