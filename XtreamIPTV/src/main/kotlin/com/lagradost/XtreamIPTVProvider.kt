@@ -18,6 +18,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
@@ -575,25 +577,43 @@ class XtreamIPTVProvider : MainAPI() {
     private val MAX_CACHED_CATEGORIES = 30
 
     // ═══════════════════════════════════════════════════════════════════
-    //  SEARCH INDEX — flat in-memory index for INSTANT search
+    //  SEARCH INDEX — flat INCREMENTAL in-memory index for instant search
     //
-    //  Built ONCE in the background (after first search or home page
-    //  load). After it's built, search() is a pure in-memory scan —
-    //  <50ms even for 100,000 items. The old approach re-fetched every
-    //  category's streams on every search query (60s+ for big libraries).
+    //  Unlike the previous design (which waited for ALL categories to
+    //  finish before publishing), this index is INCREMENTAL: each category's
+    //  entries are added to searchIndexEntries the moment they're fetched.
+    //  search() can scan a snapshot at any time — even mid-build — so the
+    //  user gets partial results instantly and increasingly complete results
+    //  as more categories arrive. This fixes the "one slow category blocks
+    //  everything" problem that caused multi-provider searches to miss results.
+    //
+    //  A Semaphore limits concurrent HTTP requests to 12 — enough for speed
+    //  but not so many that the server rate-limits or the client OOMs.
     //
     //  Memory cost: ~150 bytes/entry × 50k items ≈ 7.5MB.
     //  Capped at MAX_SEARCH_INDEX_SIZE to prevent OOM.
     // ═══════════════════════════════════════════════════════════════════
 
-    /** Flat searchable index of ALL streams across ALL categories. Null = not built yet. */
-    @Volatile private var searchIndex: List<SearchIndexEntry>? = null
+    /** Incrementally-populated flat search index. Entries are added as each category is fetched. */
+    private val searchIndexEntries = mutableListOf<SearchIndexEntry>()
+
+    /** Lock protecting searchIndexEntries + seenIndexIds. */
+    private val searchIndexLock = Any()
+
+    /** Dedup set: prevents the same stream_id appearing twice across categories. */
+    private val seenIndexIds = HashSet<Long>()
+
+    /** True once the build has finished (all categories attempted). search() skips waiting when this is true. */
+    @Volatile private var searchIndexComplete: Boolean = false
 
     /** Flag to prevent concurrent index builds. */
     private val searchIndexBuilding = AtomicBoolean(false)
 
     /** Maximum entries in the search index (memory guard against OOM on huge libraries). */
     private val MAX_SEARCH_INDEX_SIZE = 100_000
+
+    /** Max concurrent HTTP requests during index build (prevents server rate-limiting + client OOM). */
+    private val INDEX_BUILD_CONCURRENCY = 12
 
     // ═══════════════════════════════════════════════════════════════════
     //  XTREAM API HELPERS  (per-category only — never load all streams)
@@ -728,28 +748,30 @@ class XtreamIPTVProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  SEARCH INDEX BUILDERS
+    //  SEARCH INDEX BUILDERS (incremental)
     //
     //  buildSearchIndex() fetches every category's streams IN PARALLEL
-    //  (reusing cachedCatStreams when available) and collapses them into
-    //  a flat List<SearchIndexEntry>. Fire-and-forget — returns immediately,
-    //  runs in bgScope. Subsequent calls are no-ops if the index is built
-    //  or currently being built.
+    //  (limited by a Semaphore to 12 concurrent requests) and adds entries
+    //  to searchIndexEntries INCREMENTALLY — each category's entries become
+    //  searchable the moment they're fetched, not after all categories finish.
     //
-    //  awaitSearchIndex() polls the volatile field with delay(100) until
-    //  the index is published or the timeout expires. Returns instantly
-    //  if the index is already built.
+    //  This fixes the multi-provider problem where one slow category on one
+    //  provider blocked the whole index from publishing. Now search() can
+    //  return partial results immediately, and increasingly complete results
+    //  as more categories arrive.
+    //
+    //  getSearchIndexSnapshot() returns a point-in-time copy of the index,
+    //  safe to iterate even while the build is still running.
     // ═══════════════════════════════════════════════════════════════════
 
     /**
      * Build the flat search index by fetching ALL categories' streams ONCE.
-     * After this completes, search() becomes a pure in-memory scan — instant.
-     *
-     * Fire-and-forget: launches a background coroutine and returns immediately.
-     * Subsequent calls are no-ops if the index is already built or being built.
+     * Entries are added INCREMENTALLY — each category becomes searchable
+     * the moment it's fetched. Fire-and-forget: returns immediately, runs
+     * in bgScope. No-op if the index is already complete or being built.
      */
     private fun buildSearchIndex(c: Cfg) {
-        if (searchIndex != null) return
+        if (searchIndexComplete) return
         if (!searchIndexBuilding.compareAndSet(false, true)) return
 
         bgScope.launch {
@@ -771,34 +793,30 @@ class XtreamIPTVProvider : MainAPI() {
                 val serCats = cachedXtreamSeriesCats?.let { tryParseJson<List<XCat>>(it) } ?: emptyList()
                 val liveCats = cachedXtreamLiveCats?.let { tryParseJson<List<XCat>>(it) } ?: emptyList()
 
-                val index = mutableListOf<SearchIndexEntry>()
-                val seenIds = HashSet<Long>()  // dedupe across categories
+                // Concurrency limiter — prevents overwhelming the server / exhausting
+                // the client connection pool when there are 50-100+ categories.
+                val semaphore = Semaphore(INDEX_BUILD_CONCURRENCY)
 
                 try {
                     coroutineScope {
-                        // ── VOD (movies) — all categories in parallel ──
+                        // ── VOD (movies) — all categories in parallel (capped by semaphore) ──
                         for (cat in vodCats) {
                             val catId = cat.category_id ?: continue
                             val key = "v_$catId"
                             async {
                                 try {
-                                    val streams: List<XVod>? = cachedCatStreams[key] as? List<XVod>
-                                        ?: RawHttp.apiGet("$apiBase&action=get_vod_streams&category_id=$catId", 20000)
-                                            ?.let { tryParseJson<List<XVod>>(it) }
-                                            ?.also { parsed ->
-                                                if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
-                                                    cachedCatStreams[key] = parsed
+                                    semaphore.withPermit {
+                                        val streams: List<XVod>? = cachedCatStreams[key] as? List<XVod>
+                                            ?: RawHttp.apiGet("$apiBase&action=get_vod_streams&category_id=$catId", 15000)
+                                                ?.let { tryParseJson<List<XVod>>(it) }
+                                                ?.also { parsed ->
+                                                    if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
+                                                        cachedCatStreams[key] = parsed
+                                                    }
                                                 }
-                                            }
-                                    if (streams != null) {
-                                        synchronized(index) {
-                                            for (s in streams) {
-                                                if (index.size >= MAX_SEARCH_INDEX_SIZE) return@synchronized
-                                                // Dedupe by stream_id (offset by type to avoid collisions)
-                                                val dedupeKey = 1_000_000_000L + s.stream_id
-                                                if (seenIds.add(dedupeKey)) {
-                                                    index.add(SearchIndexEntry(s.name, "m", s.stream_id, s.container_extension, s.stream_icon))
-                                                }
+                                        if (streams != null) {
+                                            addToSearchIndex(streams, "m") { s ->
+                                                SearchIndexEntry(s.name, "m", s.stream_id, s.container_extension, s.stream_icon)
                                             }
                                         }
                                     }
@@ -806,28 +824,24 @@ class XtreamIPTVProvider : MainAPI() {
                             }
                         }
 
-                        // ── Series — all categories in parallel ──
+                        // ── Series — all categories in parallel (capped by semaphore) ──
                         for (cat in serCats) {
                             val catId = cat.category_id ?: continue
                             val key = "s_$catId"
                             async {
                                 try {
-                                    val streams: List<XSeries>? = cachedCatStreams[key] as? List<XSeries>
-                                        ?: RawHttp.apiGet("$apiBase&action=get_series&category_id=$catId", 20000)
-                                            ?.let { tryParseJson<List<XSeries>>(it) }
-                                            ?.also { parsed ->
-                                                if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
-                                                    cachedCatStreams[key] = parsed
+                                    semaphore.withPermit {
+                                        val streams: List<XSeries>? = cachedCatStreams[key] as? List<XSeries>
+                                            ?: RawHttp.apiGet("$apiBase&action=get_series&category_id=$catId", 15000)
+                                                ?.let { tryParseJson<List<XSeries>>(it) }
+                                                ?.also { parsed ->
+                                                    if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
+                                                        cachedCatStreams[key] = parsed
+                                                    }
                                                 }
-                                            }
-                                    if (streams != null) {
-                                        synchronized(index) {
-                                            for (s in streams) {
-                                                if (index.size >= MAX_SEARCH_INDEX_SIZE) return@synchronized
-                                                val dedupeKey = 2_000_000_000L + s.series_id
-                                                if (seenIds.add(dedupeKey)) {
-                                                    index.add(SearchIndexEntry(s.name, "s", s.series_id, null, s.cover))
-                                                }
+                                        if (streams != null) {
+                                            addToSearchIndex(streams, "s") { s ->
+                                                SearchIndexEntry(s.name, "s", s.series_id, null, s.cover)
                                             }
                                         }
                                     }
@@ -835,28 +849,24 @@ class XtreamIPTVProvider : MainAPI() {
                             }
                         }
 
-                        // ── Live TV — all categories in parallel ──
+                        // ── Live TV — all categories in parallel (capped by semaphore) ──
                         for (cat in liveCats) {
                             val catId = cat.category_id ?: continue
                             val key = "l_$catId"
                             async {
                                 try {
-                                    val streams: List<XLive>? = cachedCatStreams[key] as? List<XLive>
-                                        ?: RawHttp.apiGet("$apiBase&action=get_live_streams&category_id=$catId", 20000)
-                                            ?.let { tryParseJson<List<XLive>>(it) }
-                                            ?.also { parsed ->
-                                                if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
-                                                    cachedCatStreams[key] = parsed
+                                    semaphore.withPermit {
+                                        val streams: List<XLive>? = cachedCatStreams[key] as? List<XLive>
+                                            ?: RawHttp.apiGet("$apiBase&action=get_live_streams&category_id=$catId", 15000)
+                                                ?.let { tryParseJson<List<XLive>>(it) }
+                                                ?.also { parsed ->
+                                                    if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
+                                                        cachedCatStreams[key] = parsed
+                                                    }
                                                 }
-                                            }
-                                    if (streams != null) {
-                                        synchronized(index) {
-                                            for (s in streams) {
-                                                if (index.size >= MAX_SEARCH_INDEX_SIZE) return@synchronized
-                                                val dedupeKey = 3_000_000_000L + s.stream_id
-                                                if (seenIds.add(dedupeKey)) {
-                                                    index.add(SearchIndexEntry(s.name, "l", s.stream_id, null, s.stream_icon))
-                                                }
+                                        if (streams != null) {
+                                            addToSearchIndex(streams, "l") { s ->
+                                                SearchIndexEntry(s.name, "l", s.stream_id, null, s.stream_icon)
                                             }
                                         }
                                     }
@@ -869,15 +879,17 @@ class XtreamIPTVProvider : MainAPI() {
                     // its own try/catch, so this is just a safety net.
                 }
 
-                // Publish the index atomically. Only publish if non-empty —
-                // an empty index likely means the build failed, so leave
-                // searchIndex = null to allow a retry on the next search.
-                if (index.isNotEmpty()) {
-                    searchIndex = index.toList()
+                // Mark the build as complete. If searchIndexEntries is non-empty,
+                // the index is usable — don't retry. If it's empty (total failure),
+                // leave searchIndexComplete = false so the next search can retry.
+                synchronized(searchIndexLock) {
+                    if (searchIndexEntries.isNotEmpty()) {
+                        searchIndexComplete = true
+                    }
                 }
             } catch (_: Throwable) {
-                // OOM or other catastrophic failure — index stays null,
-                // search falls back to partial cached search.
+                // OOM or other catastrophic failure — index stays incomplete,
+                // search falls back to partial cached search. Next search retries.
             } finally {
                 searchIndexBuilding.set(false)
             }
@@ -885,20 +897,64 @@ class XtreamIPTVProvider : MainAPI() {
     }
 
     /**
-     * Wait for the search index to be built, up to [timeoutMs] milliseconds.
-     * Returns the index if built, or null if not built within the timeout.
-     * Returns instantly if the index is already built (e.g. on 2nd+ search).
+     * Thread-safe helper: add a category's parsed streams to the incremental index.
+     * Dedupes by stream_id (offset by type to avoid collisions across types).
      */
-    private suspend fun awaitSearchIndex(timeoutMs: Long = 8000L): List<SearchIndexEntry>? {
-        searchIndex?.let { return it }
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < deadline) {
-            delay(100)
-            searchIndex?.let { return it }
-            // If the build finished (success or failure), stop waiting.
-            if (!searchIndexBuilding.get()) break
+    private fun <T> addToSearchIndex(streams: List<T>, typePrefix: String, mapper: (T) -> SearchIndexEntry) {
+        val typeOffset = when (typePrefix) {
+            "m" -> 1_000_000_000L
+            "s" -> 2_000_000_000L
+            "l" -> 3_000_000_000L
+            else -> 0L
         }
-        return searchIndex
+        synchronized(searchIndexLock) {
+            for (s in streams) {
+                if (searchIndexEntries.size >= MAX_SEARCH_INDEX_SIZE) return@synchronized
+                @Suppress("UNCHECKED_CAST")
+                val id = when (typePrefix) {
+                    "m" -> (s as XVod).stream_id
+                    "s" -> (s as XSeries).series_id
+                    "l" -> (s as XLive).stream_id
+                    else -> 0
+                }
+                val dedupeKey = typeOffset + id
+                if (seenIndexIds.add(dedupeKey)) {
+                    searchIndexEntries.add(mapper(s))
+                }
+            }
+        }
+    }
+
+    /**
+     * Return a point-in-time snapshot of the incremental search index.
+     * Safe to call while the build is still running — returns whatever
+     * has been fetched so far. Returns an empty list if nothing has been
+     * fetched yet (first search on a cold start).
+     */
+    private fun getSearchIndexSnapshot(): List<SearchIndexEntry> {
+        return synchronized(searchIndexLock) { searchIndexEntries.toList() }
+    }
+
+    /**
+     * Wait for the search index to have at least one entry, up to [timeoutMs].
+     * Returns a snapshot of the index (partial if the build is still running).
+     * Returns instantly if the index is already complete or has entries.
+     * Returns an empty list if no entries appear within the timeout.
+     */
+    private suspend fun awaitSearchIndexEntries(timeoutMs: Long = 15000L): List<SearchIndexEntry> {
+        // Fast path: already complete or has entries
+        if (searchIndexComplete) return getSearchIndexSnapshot()
+        var snapshot = getSearchIndexSnapshot()
+        if (snapshot.isNotEmpty()) return snapshot
+
+        // Slow path: poll until entries appear, build completes, or timeout
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline && !searchIndexComplete) {
+            delay(150)
+            snapshot = getSearchIndexSnapshot()
+            if (snapshot.isNotEmpty()) return snapshot
+        }
+        return snapshot
     }
 
     /**
@@ -1338,7 +1394,7 @@ class XtreamIPTVProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  SEARCH  — instant in-memory search via a flat index
+    //  SEARCH  — instant in-memory search via an incremental flat index
     //
     //  The Xtream Codes API has no native search endpoint, so we must
     //  search client-side. The original implementation fetched EVERY
@@ -1346,17 +1402,24 @@ class XtreamIPTVProvider : MainAPI() {
     //  this was slow (60s+) because one slow/timing-out category blocked
     //  the whole search.
     //
-    //  New strategy: build a flat in-memory index ONCE (see buildSearchIndex),
-    //  then search it instantly on every query.
-    //    1. On first search, kick off buildSearchIndex() in the background.
-    //       It fetches every category's streams in parallel and collapses
-    //       them into a flat List<SearchIndexEntry> (name + type + id + poster).
-    //    2. awaitSearchIndex() waits up to 8s for the build to complete.
-    //       Returns instantly if the index is already built.
-    //    3. Once the index is available, search() is a pure in-memory scan —
-    //       <50ms even for 100,000 items.
-    //    4. If the index isn't ready in 8s, fall back to a fast partial
-    //       search using only cached categories (no network).
+    //  Current strategy: an INCREMENTAL flat in-memory index.
+    //    1. buildSearchIndex() is fired on first search (and on home page
+    //       load). It fetches every category's streams in parallel (capped
+    //       to 12 concurrent by a Semaphore) and adds entries to
+    //       searchIndexEntries INCREMENTALLY — each category becomes
+    //       searchable the moment it's fetched.
+    //    2. search() calls awaitSearchIndexEntries() which waits up to 15s
+    //       for ANY entries to appear, then returns a snapshot. This means:
+    //         - 1st search: waits a few seconds for the first categories,
+    //           returns partial results, and gets more complete on retry.
+    //         - 2nd+ search: index already has entries → instant.
+    //    3. If the index has entries, search() is a pure in-memory scan.
+    //    4. If the index is still empty after 15s (total failure), fall
+    //       back to scanning cachedCatStreams (categories cached by the
+    //       home page or previous browsing).
+    //
+    //  The incremental design fixes the multi-provider problem where one
+    //  slow category on one provider blocked the whole index from publishing.
     //
     //  Memory cost: ~150 bytes per entry × 50,000 items ≈ 7.5 MB.
     //  Capped at MAX_SEARCH_INDEX_SIZE to prevent OOM on huge libraries.
@@ -1396,16 +1459,18 @@ class XtreamIPTVProvider : MainAPI() {
 
         // ── 2. Kick off the background index build (fire-and-forget).
         //    On the very first search this starts the build; on subsequent
-        //    searches it's a no-op (the build is already running or done). ──
+        //    searches it's a no-op (the build is already running or complete). ──
         buildSearchIndex(c)
 
-        // ── 3. Wait briefly for the index to become available.
-        //    Returns instantly if the index is already built. On the first
-        //    search it waits up to 8s — a big improvement over the old 60s+ wait. ──
-        val index = awaitSearchIndex(8000L)
+        // ── 3. Wait for the incremental index to have entries (up to 15s).
+        //    Returns INSTANTLY if the index already has entries (2nd+ search).
+        //    On the first search, waits for the first categories to arrive,
+        //    then returns a snapshot — partial results that get more complete
+        //    on retry as more categories are fetched in the background. ──
+        val index = awaitSearchIndexEntries(15000L)
 
-        if (index != null) {
-            // ★ INSTANT: pure in-memory scan of the flat index.
+        if (index.isNotEmpty()) {
+            // ★ INSTANT: pure in-memory scan of the index snapshot.
             //    Scanning 100,000 entries takes <50ms on a mid-range phone.
             val vodMatches = mutableListOf<SearchResponse>()
             val serMatches = mutableListOf<SearchResponse>()
@@ -1452,9 +1517,9 @@ class XtreamIPTVProvider : MainAPI() {
             return if (deduped.isEmpty()) null else deduped.take(SEARCH_MAX_RESULTS)
         }
 
-        // ── 4. Index not ready yet (build still running or failed).
-        //    Fall back to a FAST partial search using ONLY cached
-        //    categories — no network calls, returns instantly. ──
+        // ── 4. Index still empty (build hasn't produced any entries yet —
+        //    total failure or extremely slow server). Fall back to scanning
+        //    cachedCatStreams (categories cached by home page or browsing). ──
         val vodMatches = mutableListOf<SearchResponse>()
         val serMatches = mutableListOf<SearchResponse>()
         val liveMatches = mutableListOf<SearchResponse>()
