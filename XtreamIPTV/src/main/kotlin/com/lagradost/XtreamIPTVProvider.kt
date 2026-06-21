@@ -36,7 +36,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 @CloudstreamPlugin
 class XtreamIPTVPlugin : Plugin() {
     override fun load(context: Context) {
+        appContext = context
         registerMainAPI(XtreamIPTVProvider())
+    }
+    companion object {
+        /** App context for file-based cache storage. Set by load() at plugin startup. */
+        @Volatile var appContext: Context? = null
     }
 }
 
@@ -616,6 +621,94 @@ class XtreamIPTVProvider : MainAPI() {
     private val INDEX_BUILD_CONCURRENCY = 12
 
     // ═══════════════════════════════════════════════════════════════════
+    //  DISK CACHE — persist search index across app restarts (3-day TTL)
+    //
+    //  After the first build, the index is saved to a JSON file in the app's
+    //  private storage. On next launch, the cache is loaded instantly (no
+    //  network) and the index is ready for search immediately.
+    //
+    //  Cache file: filesDir/xtream_search_<urlHash>.json
+    //  TTL: 3 days — after that, the cache is ignored and a fresh build runs.
+    //  Per-provider: each provider config (server+user+pass) gets its own file.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /** Cache TTL: 3 days in milliseconds. */
+    private val SEARCH_CACHE_TTL_MS = 3L * 24 * 60 * 60 * 1000
+
+    /**
+     * Get the cache file for this provider's search index.
+     * Filename is based on a hash of cleanUrl() so each provider config
+     * (server + username + password) gets its own file.
+     */
+    private fun getCacheFile(): java.io.File? {
+        val ctx = XtreamIPTVPlugin.appContext ?: return null
+        val url = cleanUrl()
+        if (url.isEmpty() || url == "http://example.com/username/password") return null
+        val hash = url.hashCode().toString().replace("-", "n")
+        return java.io.File(ctx.filesDir, "xtream_search_$hash.json")
+    }
+
+    /**
+     * Try to load the search index from the cache file.
+     * Returns true if the cache was valid and loaded successfully.
+     * Checks TTL (3 days) — expired cache is deleted and treated as miss.
+     */
+    private fun loadIndexFromCache(): Boolean {
+        val file = getCacheFile() ?: return false
+        if (!file.exists()) return false
+
+        // Check TTL using file's last-modified time
+        val age = System.currentTimeMillis() - file.lastModified()
+        if (age > SEARCH_CACHE_TTL_MS) {
+            try { file.delete() } catch (_: Throwable) {}
+            return false
+        }
+
+        try {
+            val text = file.readText()
+            val entries = tryParseJson<List<SearchIndexEntry>>(text) ?: return false
+            if (entries.isEmpty()) return false
+
+            synchronized(searchIndexLock) {
+                searchIndexEntries.clear()
+                searchIndexEntries.addAll(entries)
+                // Rebuild dedup set from loaded entries
+                seenIndexIds.clear()
+                for (entry in entries) {
+                    val typeOffset = when (entry.type) {
+                        "m" -> 1_000_000_000L
+                        "s" -> 2_000_000_000L
+                        "l" -> 3_000_000_000L
+                        else -> 0L
+                    }
+                    seenIndexIds.add(typeOffset + entry.id)
+                }
+                searchIndexComplete = true
+            }
+            return true
+        } catch (_: Throwable) {
+            // Corrupted cache file — delete and fall through to network build
+            try { file.delete() } catch (_: Throwable) {}
+            return false
+        }
+    }
+
+    /**
+     * Save the current search index to the cache file for next launch.
+     * Best-effort: silently ignores any I/O errors.
+     */
+    private fun saveIndexToCache() {
+        val file = getCacheFile() ?: return
+        try {
+            val snapshot = getSearchIndexSnapshot()
+            if (snapshot.isEmpty()) return
+            file.writeText(snapshot.toJson())
+        } catch (_: Throwable) {
+            // Disk full, permissions, etc. — cache is best-effort
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     //  XTREAM API HELPERS  (per-category only — never load all streams)
     // ═══════════════════════════════════════════════════════════════════
 
@@ -684,6 +777,14 @@ class XtreamIPTVProvider : MainAPI() {
                 while (attempts < 120) {
                     val url = mainUrl.trim()
                     if (url.isNotEmpty() && url != "http://example.com/username/password") {
+                        // ★ Try to load from disk cache first (instant, no network).
+                        //    If the cache is valid (< 3 days old), the index is ready
+                        //    immediately — no build needed. This makes search instant
+                        //    on app restart for up to 3 days after the last build.
+                        if (loadIndexFromCache()) {
+                            break  // Cache loaded — index is ready
+                        }
+                        // No valid cache — build from network
                         cfg()?.let { buildSearchIndex(it) }
                         break
                     }
@@ -927,6 +1028,12 @@ class XtreamIPTVProvider : MainAPI() {
                     if (searchIndexEntries.isNotEmpty()) {
                         searchIndexComplete = true
                     }
+                }
+
+                // ★ Save the index to disk cache for instant load on next app restart.
+                //    The cache has a 3-day TTL — after that it's rebuilt from network.
+                if (searchIndexComplete) {
+                    saveIndexToCache()
                 }
             } catch (_: Throwable) {
                 // OOM or other catastrophic failure — index stays incomplete,
