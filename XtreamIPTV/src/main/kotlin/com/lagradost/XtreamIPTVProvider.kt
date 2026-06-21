@@ -620,8 +620,12 @@ class XtreamIPTVProvider : MainAPI() {
     /** Maximum entries in the search index (memory guard against OOM on huge libraries). */
     private val MAX_SEARCH_INDEX_SIZE = 100_000
 
-    /** Max concurrent HTTP requests during index build (prevents server rate-limiting + client OOM). */
-    private val INDEX_BUILD_CONCURRENCY = 12
+    /** Max concurrent HTTP requests during index build.
+     *  Kept low (6) so the index build doesn't compete with the home page's
+     *  category-fetch calls for network bandwidth. The home page needs only
+     *  3 tiny calls (~50KB each) — if the index build hogs all connections,
+     *  the home page loads slowly. 6 concurrent leaves plenty of headroom. */
+    private val INDEX_BUILD_CONCURRENCY = 6
 
     // ═══════════════════════════════════════════════════════════════════
     //  DISK CACHE — persist search index across app restarts (3-day TTL)
@@ -780,7 +784,14 @@ class XtreamIPTVProvider : MainAPI() {
                         if (loadIndexFromCache()) {
                             break  // Cache loaded — index is ready
                         }
-                        // No valid cache — build from network
+                        // ★ No valid cache — delay the build by 2 seconds so the home
+                        //    page can load first. The home page only needs 3 tiny API
+                        //    calls (~50KB each). If we start the build immediately, it
+                        //    competes for network/CPU and the home page loads slowly.
+                        //    This 2s delay makes the home page load as fast as plugins
+                        //    like Stardima/AnimeDay (which do zero work at launch).
+                        //    The index build still finishes in the background.
+                        delay(2000)
                         cfg()?.let { buildSearchIndex(it) }
                         break
                     }
