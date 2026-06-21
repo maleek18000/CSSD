@@ -657,6 +657,41 @@ class XtreamIPTVProvider : MainAPI() {
     private val bgScope = CoroutineScope(Dispatchers.IO)
 
     /**
+     * Auto-start the search index build at CloudStream app launch.
+     *
+     * CloudStream instantiates the provider at app start and sets mainUrl
+     * from saved settings shortly after. This init block launches a
+     * background coroutine that polls mainUrl (up to 60s), then kicks off
+     * buildSearchIndex() the moment the URL is available.
+     *
+     * This means the index starts building BEFORE the user searches or
+     * opens the home page — so by the time they search, the index is
+     * already populated (or close to it). No-op if the build is already
+     * running or complete.
+     */
+    init {
+        bgScope.launch {
+            try {
+                // Poll mainUrl for up to 60s — CloudStream sets it from
+                // saved settings shortly after the provider is registered.
+                var attempts = 0
+                while (attempts < 60) {
+                    val url = mainUrl.trim()
+                    if (url.isNotEmpty() && url != "http://example.com/username/password") {
+                        cfg()?.let { buildSearchIndex(it) }
+                        break
+                    }
+                    delay(1000)
+                    attempts++
+                }
+            } catch (_: Throwable) {
+                // Silently ignore — search() and getMainPage() also trigger
+                // the build, so this is just an optimization.
+            }
+        }
+    }
+
+    /**
      * Load a few categories' streams in the background for search support.
      * Loads one category at a time with memory checks — never OOMs.
      *
@@ -936,24 +971,52 @@ class XtreamIPTVProvider : MainAPI() {
     }
 
     /**
-     * Wait for the search index to have at least one entry, up to [timeoutMs].
-     * Returns a snapshot of the index (partial if the build is still running).
-     * Returns instantly if the index is already complete or has entries.
-     * Returns an empty list if no entries appear within the timeout.
+     * Wait for the search index to be ready, with smart backoff.
+     *
+     * Three cases:
+     *   1. Index is complete → return instantly (2nd+ search after build finishes).
+     *   2. Index has entries but build is still running → wait up to 5s more
+     *      for the build to progress, so we don't return thin partial results
+     *      while other providers are still empty. Returns a snapshot after 5s
+     *      even if the build isn't done.
+     *   3. Index is empty (build hasn't produced entries yet) → wait up to
+     *      timeoutMs (default 20s) for any entries to appear.
+     *
+     * This prevents the "search stops too early" problem where a provider
+     * with a partially-built index returns instantly with 1-2 results while
+     * other providers haven't returned anything yet.
      */
-    private suspend fun awaitSearchIndexEntries(timeoutMs: Long = 15000L): List<SearchIndexEntry> {
-        // Fast path: already complete or has entries
+    private suspend fun awaitSearchIndexEntries(timeoutMs: Long = 20000L): List<SearchIndexEntry> {
+        // Fast path: already complete
         if (searchIndexComplete) return getSearchIndexSnapshot()
-        var snapshot = getSearchIndexSnapshot()
-        if (snapshot.isNotEmpty()) return snapshot
 
-        // Slow path: poll until entries appear, build completes, or timeout
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < deadline && !searchIndexComplete) {
-            delay(150)
-            snapshot = getSearchIndexSnapshot()
-            if (snapshot.isNotEmpty()) return snapshot
+        var snapshot = getSearchIndexSnapshot()
+
+        // Case 3: index is empty — wait up to timeoutMs for entries to appear.
+        if (snapshot.isEmpty()) {
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (System.currentTimeMillis() < deadline && !searchIndexComplete) {
+                delay(150)
+                snapshot = getSearchIndexSnapshot()
+                if (snapshot.isNotEmpty()) break
+            }
         }
+
+        // Case 2: index has entries but build is still running — wait up to
+        // 5s more for the build to progress, so we return a richer snapshot.
+        // This gives slower providers time to catch up before search returns.
+        if (!searchIndexComplete && snapshot.isNotEmpty()) {
+            val settleDeadline = System.currentTimeMillis() + 5000
+            while (System.currentTimeMillis() < settleDeadline && !searchIndexComplete) {
+                delay(200)
+                val newer = getSearchIndexSnapshot()
+                if (newer.size > snapshot.size) {
+                    snapshot = newer  // keep updating as more entries arrive
+                }
+                if (searchIndexComplete) break
+            }
+        }
+
         return snapshot
     }
 
@@ -1462,12 +1525,14 @@ class XtreamIPTVProvider : MainAPI() {
         //    searches it's a no-op (the build is already running or complete). ──
         buildSearchIndex(c)
 
-        // ── 3. Wait for the incremental index to have entries (up to 15s).
-        //    Returns INSTANTLY if the index already has entries (2nd+ search).
-        //    On the first search, waits for the first categories to arrive,
-        //    then returns a snapshot — partial results that get more complete
-        //    on retry as more categories are fetched in the background. ──
-        val index = awaitSearchIndexEntries(15000L)
+        // ── 3. Wait for the incremental index to be ready.
+        //    Returns INSTANTLY if the build is complete (2nd+ search).
+        //    If the index has partial entries, waits up to 5s more for the
+        //    build to progress — so all providers return at roughly the same
+        //    time with comparable results, instead of one provider returning
+        //    instantly with thin results while others are still empty.
+        //    If the index is empty, waits up to 20s for entries to appear. ──
+        val index = awaitSearchIndexEntries(20000L)
 
         if (index.isNotEmpty()) {
             // ★ INSTANT: pure in-memory scan of the index snapshot.
