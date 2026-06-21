@@ -611,6 +611,9 @@ class XtreamIPTVProvider : MainAPI() {
     /** True once the build has finished (all categories attempted). search() skips waiting when this is true. */
     @Volatile private var searchIndexComplete: Boolean = false
 
+    /** True while the init block is loading cache or starting build. search() waits briefly if this is true. */
+    @Volatile private var searchIndexInitializing: Boolean = false
+
     /** Flag to prevent concurrent index builds. */
     private val searchIndexBuilding = AtomicBoolean(false)
 
@@ -769,6 +772,7 @@ class XtreamIPTVProvider : MainAPI() {
      * pre-build the index at launch and search the local in-memory index.
      */
     init {
+        searchIndexInitializing = true
         bgScope.launch {
             try {
                 // Poll mainUrl every 500ms for up to 60s — CloudStream sets
@@ -794,6 +798,8 @@ class XtreamIPTVProvider : MainAPI() {
             } catch (_: Throwable) {
                 // Silently ignore — search() and getMainPage() also trigger
                 // the build, so this is just an optimization.
+            } finally {
+                searchIndexInitializing = false
             }
         }
     }
@@ -1610,23 +1616,23 @@ class XtreamIPTVProvider : MainAPI() {
         //    time the user searches, the index likely already has data. ──
         buildSearchIndex(c)
 
-        // ── 3. Return INSTANTLY from whatever's in the index right now.
-        //    No blocking wait — the build runs in the background and the
-        //    index fills up incrementally. If the index is empty (user
-        //    searched very quickly after launch), search returns null and
-        //    the user can re-search a few seconds later.
-        //
-        //    This is intentionally different from blocking for 60s. A 60s
-        //    block made CloudStream appear frozen and still returned
-        //    staggered results across providers. Returning instantly means:
-        //      - If the index has data → results appear in <50ms.
-        //      - If the index is empty → no results, but no frozen UI either.
-        //        Re-searching a few seconds later (as the build progresses)
-        //        gives increasingly complete results.
-        //
-        //    The Stremio worker achieves ~2.5s by re-fetching from a
-        //    data center on every search. We can't do that on a phone, so
-        //    we pre-build at launch and search locally. ──
+        // ── 3. If the index is still initializing (loading from cache or
+        //    starting build), wait briefly for it to complete.
+        //    This fixes the race condition where the user searches immediately
+        //    after app launch, before the init block has finished loading the
+        //    cache file. Without this wait, the slowest provider's cache
+        //    wouldn't be loaded yet → that provider returns no results.
+        //    The wait is capped at 5s — cache loading typically takes <2s.
+        //    If still initializing after 5s, proceed with whatever's available. ──
+        if (searchIndexInitializing && !searchIndexComplete) {
+            val initDeadline = System.currentTimeMillis() + 5000
+            while (searchIndexInitializing && !searchIndexComplete &&
+                   System.currentTimeMillis() < initDeadline) {
+                delay(100)
+            }
+        }
+
+        // ── 4. Return INSTANTLY from whatever's in the index right now. ──
         val index = getSearchIndexSnapshot()
 
         if (index.isNotEmpty()) {
