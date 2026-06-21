@@ -975,18 +975,22 @@ class XtreamIPTVProvider : MainAPI() {
      *
      * Three cases:
      *   1. Index is complete → return instantly (2nd+ search after build finishes).
-     *   2. Index has entries but build is still running → wait up to 5s more
+     *   2. Index has entries but build is still running → wait up to 10s more
      *      for the build to progress, so we don't return thin partial results
-     *      while other providers are still empty. Returns a snapshot after 5s
+     *      while other providers are still empty. Returns a snapshot after 10s
      *      even if the build isn't done.
      *   3. Index is empty (build hasn't produced entries yet) → wait up to
-     *      timeoutMs (default 20s) for any entries to appear.
+     *      timeoutMs (default 60s) for any entries to appear.
      *
-     * This prevents the "search stops too early" problem where a provider
-     * with a partially-built index returns instantly with 1-2 results while
-     * other providers haven't returned anything yet.
+     * The 60s timeout is necessary because with multiple IPTV providers
+     * configured, each provider's build competes for network resources.
+     * A single provider might finish in ~20s, but with 3 providers building
+     * simultaneously, the slowest can take ~60s. Without a long enough
+     * timeout, the first search returns results from only the fastest
+     * provider while the others return null — forcing the user to re-search
+     * multiple times.
      */
-    private suspend fun awaitSearchIndexEntries(timeoutMs: Long = 20000L): List<SearchIndexEntry> {
+    private suspend fun awaitSearchIndexEntries(timeoutMs: Long = 60000L): List<SearchIndexEntry> {
         // Fast path: already complete
         if (searchIndexComplete) return getSearchIndexSnapshot()
 
@@ -1003,10 +1007,10 @@ class XtreamIPTVProvider : MainAPI() {
         }
 
         // Case 2: index has entries but build is still running — wait up to
-        // 5s more for the build to progress, so we return a richer snapshot.
+        // 10s more for the build to progress, so we return a richer snapshot.
         // This gives slower providers time to catch up before search returns.
         if (!searchIndexComplete && snapshot.isNotEmpty()) {
-            val settleDeadline = System.currentTimeMillis() + 5000
+            val settleDeadline = System.currentTimeMillis() + 10000
             while (System.currentTimeMillis() < settleDeadline && !searchIndexComplete) {
                 delay(200)
                 val newer = getSearchIndexSnapshot()
@@ -1527,12 +1531,14 @@ class XtreamIPTVProvider : MainAPI() {
 
         // ── 3. Wait for the incremental index to be ready.
         //    Returns INSTANTLY if the build is complete (2nd+ search).
-        //    If the index has partial entries, waits up to 5s more for the
-        //    build to progress — so all providers return at roughly the same
-        //    time with comparable results, instead of one provider returning
-        //    instantly with thin results while others are still empty.
-        //    If the index is empty, waits up to 20s for entries to appear. ──
-        val index = awaitSearchIndexEntries(20000L)
+        //    If the index is empty, waits up to 60s for entries to appear.
+        //    This long timeout is necessary because with multiple providers
+        //    configured, each provider's build competes for network resources
+        //    and the slowest can take ~60s. Without it, the first search would
+        //    return results from only the fastest provider.
+        //    If the index has partial entries, waits up to 10s more for the
+        //    build to progress before returning a snapshot. ──
+        val index = awaitSearchIndexEntries(60000L)
 
         if (index.isNotEmpty()) {
             // ★ INSTANT: pure in-memory scan of the index snapshot.
