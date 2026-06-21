@@ -579,7 +579,7 @@ class XtreamIPTVProvider : MainAPI() {
      * Bounded by MAX_CACHED_CATEGORIES to prevent OOM.
      */
     private val cachedCatStreams = mutableMapOf<String, List<Any>>()
-    private val MAX_CACHED_CATEGORIES = 30
+    private val MAX_CACHED_CATEGORIES = 10
 
     // ═══════════════════════════════════════════════════════════════════
     //  SEARCH INDEX — flat INCREMENTAL in-memory index for instant search
@@ -675,17 +675,9 @@ class XtreamIPTVProvider : MainAPI() {
             synchronized(searchIndexLock) {
                 searchIndexEntries.clear()
                 searchIndexEntries.addAll(entries)
-                // Rebuild dedup set from loaded entries
-                seenIndexIds.clear()
-                for (entry in entries) {
-                    val typeOffset = when (entry.type) {
-                        "m" -> 1_000_000_000L
-                        "s" -> 2_000_000_000L
-                        "l" -> 3_000_000_000L
-                        else -> 0L
-                    }
-                    seenIndexIds.add(typeOffset + entry.id)
-                }
+                // NOTE: Do NOT rebuild seenIndexIds here — since searchIndexComplete = true,
+                // no more entries will be added, so the dedup set is unnecessary.
+                // This saves ~1.8 MB of RAM for a 50k-item index (important on 1 GB Android TV).
                 searchIndexComplete = true
             }
             return true
@@ -954,14 +946,12 @@ class XtreamIPTVProvider : MainAPI() {
                             async {
                                 try {
                                     semaphore.withPermit {
+                                        // Read from cache if available, but DON'T write back —
+                                        // the search index has all the data we need.
+                                        // This saves ~15 MB of RAM on large providers.
                                         val streams: List<XVod>? = cachedCatStreams[key] as? List<XVod>
                                             ?: RawHttp.apiGet("$apiBase&action=get_vod_streams&category_id=$catId", 15000)
                                                 ?.let { tryParseJson<List<XVod>>(it) }
-                                                ?.also { parsed ->
-                                                    if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
-                                                        cachedCatStreams[key] = parsed
-                                                    }
-                                                }
                                         if (streams != null) {
                                             addToSearchIndex(streams, "m") { s ->
                                                 SearchIndexEntry(s.name, "m", s.stream_id, s.container_extension, s.stream_icon)
@@ -982,11 +972,6 @@ class XtreamIPTVProvider : MainAPI() {
                                         val streams: List<XSeries>? = cachedCatStreams[key] as? List<XSeries>
                                             ?: RawHttp.apiGet("$apiBase&action=get_series&category_id=$catId", 15000)
                                                 ?.let { tryParseJson<List<XSeries>>(it) }
-                                                ?.also { parsed ->
-                                                    if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
-                                                        cachedCatStreams[key] = parsed
-                                                    }
-                                                }
                                         if (streams != null) {
                                             addToSearchIndex(streams, "s") { s ->
                                                 SearchIndexEntry(s.name, "s", s.series_id, null, s.cover)
@@ -1007,11 +992,6 @@ class XtreamIPTVProvider : MainAPI() {
                                         val streams: List<XLive>? = cachedCatStreams[key] as? List<XLive>
                                             ?: RawHttp.apiGet("$apiBase&action=get_live_streams&category_id=$catId", 15000)
                                                 ?.let { tryParseJson<List<XLive>>(it) }
-                                                ?.also { parsed ->
-                                                    if (cachedCatStreams.size < MAX_CACHED_CATEGORIES * 2) {
-                                                        cachedCatStreams[key] = parsed
-                                                    }
-                                                }
                                         if (streams != null) {
                                             addToSearchIndex(streams, "l") { s ->
                                                 SearchIndexEntry(s.name, "l", s.stream_id, null, s.stream_icon)
@@ -1034,6 +1014,19 @@ class XtreamIPTVProvider : MainAPI() {
                     if (searchIndexEntries.isNotEmpty()) {
                         searchIndexComplete = true
                     }
+                }
+
+                // ★ Free memory after build: clear the dedup set and category stream cache.
+                //    The search index (searchIndexEntries) has all the data needed for search.
+                //    seenIndexIds is only needed during build (to dedupe) — not after.
+                //    cachedCatStreams is only needed for category browsing — the home page
+                //    and load() will re-fetch on demand if needed.
+                //    This frees ~17 MB of RAM on a 50k-item provider (critical on 1 GB Android TV).
+                synchronized(searchIndexLock) {
+                    seenIndexIds.clear()
+                }
+                synchronized(cachedCatStreams) {
+                    cachedCatStreams.clear()
                 }
 
                 // ★ Save the index to disk cache for instant load on next app restart.
@@ -1064,6 +1057,12 @@ class XtreamIPTVProvider : MainAPI() {
         synchronized(searchIndexLock) {
             for (s in streams) {
                 if (searchIndexEntries.size >= MAX_SEARCH_INDEX_SIZE) return@synchronized
+                // Memory guard: stop adding if free RAM is critically low (< 10 MB).
+                // This prevents OOM on 1 GB Android TV devices with large providers.
+                // The partial index is still searchable — better than crashing.
+                if (searchIndexEntries.size % 500 == 0 && !enoughMemory()) {
+                    return@synchronized
+                }
                 @Suppress("UNCHECKED_CAST")
                 val id = when (typePrefix) {
                     "m" -> (s as XVod).stream_id
