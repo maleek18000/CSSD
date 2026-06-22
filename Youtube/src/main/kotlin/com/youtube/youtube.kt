@@ -476,22 +476,71 @@ class YoutubeProvider(
     }
 
     private fun extractYtInitialData(html: String): Map<String, Any>? {
-        val regex = Regex(
-            """(?:var ytInitialData|window\["ytInitialData"\])\s*=\s*(\{.*\});""",
-            RegexOption.DOT_MATCHES_ALL
+        // IMPORTANT: the regex must be NON-greedy and terminated by a real end-of-script
+        // marker. The original greedy `(\{.*\});` captured from the first `{` to the
+        // last `};` in the entire HTML, which pulled in unrelated JavaScript and made
+        // JSON parsing fail with "Extra data" — so this function returned null for
+        // playlist pages (and any page whose ytInitialData wasn't the last `};` in
+        // the document), causing the playlist `load()` handler to silently throw
+        // and CloudStream to fall back to "Coming soon".
+        val patterns = listOf(
+            // Preferred: the JSON is followed by `;</script>` (the standard YouTube layout).
+            Regex(
+                """(?:var ytInitialData|window\["ytInitialData"\])\s*=\s*(\{.*?\})\s*;\s*</script""",
+                RegexOption.DOT_MATCHES_ALL
+            ),
+            // Fallback: the JSON is followed by `;\n` and a non-JSON line (older layout).
+            Regex(
+                """(?:var ytInitialData|window\["ytInitialData"\])\s*=\s*(\{.*?\})\s*;\s*\n""",
+                RegexOption.DOT_MATCHES_ALL
+            )
         )
-        val match = try {
-            regex.find(html)
-        } catch (e: Exception) {
-            null
-        }
-        return match?.groupValues?.getOrNull(1)?.let {
+        for (regex in patterns) {
+            val match = try { regex.find(html) } catch (e: Exception) { null } ?: continue
+            val candidate = match.groupValues.getOrNull(1) ?: continue
+            // Try parsing incrementally — if the candidate has trailing garbage, trim
+            // it to the last balanced `}` before giving up.
             try {
-                parseJson<Map<String, Any>>(it)
-            } catch (e: Exception) {
-                null
+                return parseJson<Map<String, Any>>(candidate)
+            } catch (_: Exception) {
+                val balanced = trimToBalancedJson(candidate) ?: continue
+                try {
+                    return parseJson<Map<String, Any>>(balanced)
+                } catch (_: Exception) { /* try next pattern */ }
             }
         }
+        return null
+    }
+
+    /**
+     * Best-effort trim of a string that starts with `{` to a balanced JSON object.
+     * Used as a safety net when the non-greedy regex still captures a tiny bit of
+     * trailing content. Returns null if no balanced prefix can be found.
+     */
+    private fun trimToBalancedJson(s: String): String? {
+        if (s.isEmpty() || s[0] != '{') return null
+        var depth = 0
+        var inString = false
+        var escape = false
+        s.forEachIndexed { i, c ->
+            if (escape) { escape = false; return@forEachIndexed }
+            if (inString) {
+                when (c) {
+                    '\\' -> escape = true
+                    '"' -> inString = false
+                }
+            } else {
+                when (c) {
+                    '"' -> inString = true
+                    '{' -> depth++
+                    '}' -> {
+                        depth--
+                        if (depth == 0) return s.substring(0, i + 1)
+                    }
+                }
+            }
+        }
+        return null
     }
 
     private fun findConfig(html: String, key: String): String? {
@@ -505,9 +554,22 @@ class YoutubeProvider(
 
     private fun findTokenRecursive(data: Any?): String? {
         if (data is Map<*, *>) {
-            if (data.containsKey("continuationCommand")) return (data["continuationCommand"] as? Map<*, *>)?.get(
-                "token"
-            ) as? String
+            if (data.containsKey("continuationCommand")) {
+                val cmd = data["continuationCommand"] as? Map<*, *>
+                // OLD layout: token sits directly under continuationCommand
+                val directToken = cmd?.getString("token")
+                if (!directToken.isNullOrBlank()) return directToken
+                // NEW layout: token is nested one level deeper, under
+                // continuationCommand.innertubeCommand.continuationCommand.token
+                val innerToken = cmd?.getMapKey("innertubeCommand")
+                    ?.getMapKey("continuationCommand")
+                    ?.getString("token")
+                if (!innerToken.isNullOrBlank()) return innerToken
+                // Fallback: keep recursing into the continuationCommand value
+                // in case YouTube adds yet another nesting level.
+                val deeper = findTokenRecursive(cmd)
+                if (!deeper.isNullOrBlank()) return deeper
+            }
             for (v in data.values) {
                 val t = findTokenRecursive(v); if (t != null) return t
             }
@@ -524,7 +586,15 @@ class YoutubeProvider(
             val list = mutableListOf<MainPageData>()
             val isEn = lang == "en"
 
-            if (sharedPref?.getBoolean("show_trending_home", true) == true) {
+            // Read the trending toggle from the "YouTube" SharedPreferences file.
+            // As a safety net, ALSO check the app-wide default SharedPreferences
+            // (PreferenceManager.getDefaultSharedPreferences) — because the settings
+            // fragment's SwitchPreferenceCompat writes there too. If EITHER file
+            // says "off", we hide the row. This makes the toggle bulletproof even
+            // if the setOnPreferenceChangeListener in SettingsFragment somehow
+            // fails to fire.
+            val showTrending = isTrendingEnabled()
+            if (showTrending) {
                 list.add(MainPageData(if (isEn) "Trending" else "الرئيسية (Trending)", "Home"))
             }
 
@@ -538,6 +608,40 @@ class YoutubeProvider(
 
             return list
         }
+
+    /**
+     * Returns true if the trending row should be shown.
+     *
+     * Reads from BOTH:
+     *   1. The "YouTube" SharedPreferences file (what YoutubeProvider was constructed with)
+     *   2. The app-wide default SharedPreferences (where PreferenceFragmentCompat writes
+     *      by default — i.e. where the switch value lands if the listener doesn't fire)
+     *
+     * If EITHER file explicitly contains "show_trending_home" = false, we treat the
+     * toggle as OFF. This is the most robust interpretation: the user has expressed
+     * intent to hide trending in at least one place, so we hide it.
+     */
+    private fun isTrendingEnabled(): Boolean {
+        // Source 1: the "YouTube" file
+        val youTubeValue = sharedPref?.getBoolean("show_trending_home", true) ?: true
+        if (!youTubeValue) return false
+
+        // Source 2: app-wide default SharedPreferences (only if context is available)
+        try {
+            val context = AcraApplication.context
+            if (context != null) {
+                val defaultPrefs = PreferenceManager.getDefaultSharedPreferences(context)
+                // Only honour the default-prefs value if it was explicitly set
+                // (contains() == true). Otherwise we'd treat "not set" as the
+                // default true, which we already handled above.
+                if (defaultPrefs.contains("show_trending_home")) {
+                    return defaultPrefs.getBoolean("show_trending_home", true)
+                }
+            }
+        } catch (_: Exception) { /* ignore — fall back to youTubeValue */ }
+
+        return youTubeValue
+    }
     private fun getCustomHomepages(): List<CustomSection> {
         val json = sharedPref?.getString("custom_homepages_v3", "[]") ?: "[]"
         return try {
@@ -574,36 +678,30 @@ class YoutubeProvider(
 
 
         fun extractPlaylistVideos(items: List<*>) {
-            items.forEach { item ->
-                val videoMap = item as? Map<*, *>
-                val renderer = videoMap?.get("playlistVideoRenderer") as? Map<*, *>
-                if (renderer != null) {
-                    val vId = renderer["videoId"] as? String
-                    if (vId != null && seenIds.add(vId)) {
-                        val vidTitle = extractTitle(renderer["title"] as? Map<*, *>) ?: "Video"
-                        val thumb = getBestThumbnail(renderer["thumbnail"]) ?: buildThumbnailFromId(vId)
-                        val vidUrl = "$mainUrl/watch?v=$vId"
-                        val durationText = extractTitle(safeGet(renderer, "lengthText") as? Map<*, *>)
-                        val finalTitle = if (durationText != null) "{$durationText} $vidTitle" else vidTitle
-
-                        results.add(
-                            newMovieSearchResponse(finalTitle, vidUrl, TvType.Movie) {
-                                this.posterUrl = thumb
-                            }
-                        )
-                    }
+            // Delegate to the new recursive collector. The old code only inspected
+            // `playlistVideoRenderer`, which the new YouTube layout no longer emits
+            // (it uses `lockupViewModel` with `LOCKUP_CONTENT_TYPE_VIDEO` instead).
+            // The helper handles both layouts.
+            val parsed = collectPlaylistVideoItems(items)
+            parsed.forEach { renderer ->
+                val vId = renderer.videoId ?: return@forEach
+                if (seenIds.add(vId)) {
+                    val vidUrl = "$mainUrl/watch?v=$vId"
+                    val finalTitle = if (!renderer.duration.isNullOrBlank()) {
+                        "{${renderer.duration}} ${renderer.title}"
+                    } else renderer.title
+                    results.add(
+                        newMovieSearchResponse(finalTitle, vidUrl, TvType.Movie) {
+                            this.posterUrl = renderer.thumbnail ?: buildThumbnailFromId(vId)
+                        }
+                    )
                 }
             }
         }
 
         fun findPlaylistToken(items: List<*>?): String? {
             if (items == null) return null
-            for (it in items) {
-                val m = it as? Map<*, *> ?: continue
-                val token = safeGet(m, "continuationItemRenderer", "continuationEndpoint", "continuationCommand", "token") as? String
-                if (!token.isNullOrBlank()) return token
-            }
-            return null
+            return findPlaylistContinuationToken(items)
         }
 
 
@@ -632,17 +730,16 @@ class YoutubeProvider(
                 if (initialData != null) {
                     if (isPlaylist) {
 
-                        val contents = safeGet(
-                            initialData, "contents", "twoColumnBrowseResultsRenderer", "tabs", 0,
-                            "tabRenderer", "content", "sectionListRenderer", "contents",
-                            0, "itemSectionRenderer", "contents", 0,
-                            "playlistVideoListRenderer", "contents"
-                        ) as? List<*>
-
-                        if (contents != null) {
-                            extractPlaylistVideos(contents)
-                            nextContinuation = findPlaylistToken(contents)
-                        }
+                        // The new YouTube layout no longer nests the playlist items
+                        // at the hardcoded path `contents.twoColumnBrowseResultsRenderer
+                        // .tabs[0].tabRenderer.content.sectionListRenderer.contents[0]
+                        // .itemSectionRenderer.contents[0].playlistVideoListRenderer.contents`.
+                        // Instead, items live under `itemSectionRenderer.contents[*]`
+                        // as `lockupViewModel` (LOCKUP_CONTENT_TYPE_VIDEO). The recursive
+                        // collector below handles BOTH layouts, so we feed it the whole
+                        // initialData tree and let it find every video renderer.
+                        extractPlaylistVideos(listOf(initialData))
+                        nextContinuation = findPlaylistContinuationToken(initialData)
 
                         if (nextContinuation.isNullOrBlank()) {
                             val conts = findContinuationItemsRecursive(initialData)
@@ -735,6 +832,252 @@ class YoutubeProvider(
             is List<*> -> {
                 for (i in obj) {
                     val r = findContinuationItemsRecursive(i)
+                    if (r != null) return r
+                }
+            }
+        }
+        return null
+    }
+
+    // =========================================================================================
+    //  Playlist video extraction helpers
+    //  ------------------------------------------------------------------
+    //  YouTube has changed the playlist page layout multiple times. To stay
+    //  resilient, we walk the JSON tree and pick up every "video-like" renderer
+    //  we recognise:
+    //
+    //    1. NEW layout (2024+): itemSectionRenderer.contents[*].lockupViewModel
+    //       where contentType == "LOCKUP_CONTENT_TYPE_VIDEO"
+    //    2. MID layout: playlistVideoListRenderer.contents[*].playlistVideoRenderer
+    //    3. LEGACY: richItemRenderer.content.videoRenderer / gridVideoRenderer /
+    //       compactVideoRenderer (used on /videos tabs of channels and search)
+    //
+    //  Each renderer is normalised into a PlaylistVideoItem so the caller can
+    //  build Episode objects without caring which layout YouTube served.
+    // =========================================================================================
+
+    private data class PlaylistVideoItem(
+        val videoId: String?,
+        val title: String,
+        val thumbnail: String?,
+        val duration: String?
+    )
+
+    /**
+     * Walk [data] recursively and return every playlist-video renderer found,
+     * normalised to [PlaylistVideoItem]. Order is preserved (encounter order),
+     * so the result is safe to turn into a 1-indexed episode list.
+     */
+    private fun collectPlaylistVideoItems(data: Any?): List<PlaylistVideoItem> {
+        val out = mutableListOf<PlaylistVideoItem>()
+        val seenLocal = mutableSetOf<String>()
+        walkForPlaylistVideos(data, out, seenLocal)
+        return out
+    }
+
+    private fun walkForPlaylistVideos(
+        node: Any?,
+        out: MutableList<PlaylistVideoItem>,
+        seen: MutableSet<String>
+    ) {
+        when (node) {
+            is Map<*, *> -> {
+                // --- NEW layout: lockupViewModel with contentType VIDEO -----------------
+                val lockup = node.getMapKey("lockupViewModel")
+                if (lockup != null) {
+                    val ct = lockup.getString("contentType")
+                    if (ct == "LOCKUP_CONTENT_TYPE_VIDEO") {
+                        val parsed = parseLockupVideo(lockup)
+                        if (parsed.videoId != null && seen.add(parsed.videoId)) {
+                            out.add(parsed)
+                        }
+                        // Even after handling, keep recursing in case the lockup also
+                        // wraps nested renderers (rare, but cheap to check).
+                    }
+                }
+
+                // --- MID layout: playlistVideoRenderer ----------------------------------
+                val pvr = node.getMapKey("playlistVideoRenderer")
+                if (pvr != null) {
+                    val vId = pvr.getString("videoId")
+                    if (vId != null && seen.add(vId)) {
+                        out.add(parsePlaylistVideoRenderer(pvr))
+                    }
+                }
+
+                // --- LEGACY: videoRenderer / gridVideoRenderer / compactVideoRenderer ---
+                val legacy = node.getMapKey("videoRenderer")
+                    ?: node.getMapKey("gridVideoRenderer")
+                    ?: node.getMapKey("compactVideoRenderer")
+                if (legacy != null) {
+                    val vId = legacy.getString("videoId")
+                    if (vId != null && seen.add(vId)) {
+                        out.add(parseLegacyVideoRenderer(legacy))
+                    }
+                }
+
+                // Recurse into all values
+                for (v in node.values) walkForPlaylistVideos(v, out, seen)
+            }
+            is List<*> -> {
+                for (item in node) walkForPlaylistVideos(item, out, seen)
+            }
+        }
+    }
+
+    /** Extract video metadata from the new-style `lockupViewModel` (LOCKUP_CONTENT_TYPE_VIDEO). */
+    private fun parseLockupVideo(lockup: Map<*, *>): PlaylistVideoItem {
+        val contentId = lockup.getString("contentId")
+
+        // The videoId is usually the contentId, but on some A/B variants it lives
+        // under rendererContext.commandContext.onTap.innertubeCommand.watchEndpoint.videoId.
+        val watchEndpointVideoId = lockup.getMapKey("rendererContext")
+            ?.getMapKey("commandContext")
+            ?.getMapKey("onTap")
+            ?.getMapKey("innertubeCommand")
+            ?.getMapKey("watchEndpoint")
+            ?.getString("videoId")
+
+        val videoId = contentId ?: watchEndpointVideoId
+
+        // Title: metadata.lockupMetadataViewModel.title.content
+        val title = lockup.getMapKey("metadata")
+            ?.getMapKey("lockupMetadataViewModel")
+            ?.getMapKey("title")
+            ?.getString("content")
+            ?: lockup.getMapKey("metadata")
+                ?.getMapKey("lockupMetadataViewModel")
+                ?.getMapKey("title")
+                ?.let { getText(it) }
+            ?: "Video"
+
+        // Thumbnail: contentImage.thumbnailViewModel.image.sources[*].url (last = best)
+        val thumb = lockup.getMapKey("contentImage")
+            ?.getMapKey("thumbnailViewModel")
+            ?.getMapKey("image")
+            ?.getListKey("sources")
+            ?.lastOrNull()
+            ?.getString("url")
+            ?: videoId?.let { buildThumbnailFromId(it) }
+
+        // Duration: contentImage.thumbnailViewModel.overlays[*]
+        //          .thumbnailBottomOverlayViewModel.badges[*]
+        //          .thumbnailBadgeViewModel.text
+        var duration: String? = null
+        val overlays = lockup.getMapKey("contentImage")
+            ?.getMapKey("thumbnailViewModel")
+            ?.getListKey("overlays")
+        overlays?.forEach { ov ->
+            if (duration != null) return@forEach
+            val badges = ov.getMapKey("thumbnailBottomOverlayViewModel")
+                ?.getListKey("badges")
+            badges?.forEach { b ->
+                if (duration != null) return@forEach
+                val text = b.getMapKey("thumbnailBadgeViewModel")?.getString("text")
+                if (text != null && (text.contains(":") || text.matches(Regex("\\d+\\s*(second|minute|hour|sec|min|hr|ثانية|دقيقة|ساعة", RegexOption.IGNORE_CASE)))) {
+                    duration = text
+                }
+            }
+        }
+
+        return PlaylistVideoItem(
+            videoId = videoId,
+            title = title,
+            thumbnail = thumb,
+            duration = duration
+        )
+    }
+
+    /** Extract video metadata from the mid-style `playlistVideoRenderer` (older layout). */
+    private fun parsePlaylistVideoRenderer(renderer: Map<*, *>): PlaylistVideoItem {
+        val vId = renderer.getString("videoId")
+        val title = extractTitle(renderer.getMapKey("title")) ?: "Video"
+        val thumb = getBestThumbnail(renderer.getMapKey("thumbnail")) ?: vId?.let { buildThumbnailFromId(it) }
+        val duration = extractTitle(renderer.getMapKey("lengthText"))
+            ?: renderer.getMapKey("lengthText")?.getString("simpleText")
+        return PlaylistVideoItem(vId, title, thumb, duration)
+    }
+
+    /** Extract video metadata from a legacy `videoRenderer` / `gridVideoRenderer` / `compactVideoRenderer`. */
+    private fun parseLegacyVideoRenderer(renderer: Map<*, *>): PlaylistVideoItem {
+        val vId = renderer.getString("videoId")
+        val title = extractTitle(renderer.getMapKey("title"))
+            ?: extractTitle(renderer.getMapKey("headline"))
+            ?: "Video"
+        val thumb = getBestThumbnail(renderer.getMapKey("thumbnail")) ?: vId?.let { buildThumbnailFromId(it) }
+        val duration = extractTitle(renderer.getMapKey("lengthText"))
+            ?: extractTitle(renderer.getMapKey("thumbnailOverlays"))
+        return PlaylistVideoItem(vId, title, thumb, duration)
+    }
+
+    /**
+     * Find the continuation token for paginated playlist videos.
+     * Handles both the new `continuationItemViewModel.continuationCommand.innertubeCommand.continuationCommand.token`
+     * path and the legacy `continuationItemRenderer.continuationEndpoint.continuationCommand.token` path.
+     */
+    private fun findPlaylistContinuationToken(data: Any?): String? {
+        if (data == null) return null
+        return when (data) {
+            is Map<*, *> -> {
+                // Direct hit: this map IS a continuationCommand with a token
+                val directToken = data.getString("token")
+                if (!directToken.isNullOrBlank()) return directToken
+
+                // New path: continuationCommand.innertubeCommand.continuationCommand.token
+                val outer = data.getMapKey("continuationCommand")
+                if (outer != null) {
+                    val inner = outer.getMapKey("innertubeCommand")
+                        ?.getMapKey("continuationCommand")
+                    val innerToken = inner?.getString("token")
+                    if (!innerToken.isNullOrBlank()) return innerToken
+                    // Or: outer itself might have the token
+                    val outerToken = outer.getString("token")
+                    if (!outerToken.isNullOrBlank()) return outerToken
+                }
+
+                // Legacy path: continuationEndpoint.continuationCommand.token
+                val ep = data.getMapKey("continuationEndpoint")?.getMapKey("continuationCommand")
+                val epToken = ep?.getString("token")
+                if (!epToken.isNullOrBlank()) return epToken
+
+                // Recurse into children
+                for (v in data.values) {
+                    val t = findPlaylistContinuationToken(v)
+                    if (!t.isNullOrBlank()) return t
+                }
+                null
+            }
+            is List<*> -> {
+                for (i in data) {
+                    val t = findPlaylistContinuationToken(i)
+                    if (!t.isNullOrBlank()) return t
+                }
+                null
+            }
+            else -> null
+        }
+    }
+
+    /**
+     * Generic recursive search: returns the first Map<*,*> in the tree that
+     * contains the given key. Used to find `playlistMetadataRenderer`,
+     * `playlistHeaderRenderer`, etc. without hardcoding their exact paths.
+     */
+    private fun findFirstKeyRecursive(data: Any?, key: String): Map<*, *>? {
+        when (data) {
+            is Map<*, *> -> {
+                if (data.containsKey(key)) {
+                    val v = data[key]
+                    if (v is Map<*, *>) return v
+                }
+                for (v in data.values) {
+                    val r = findFirstKeyRecursive(v, key)
+                    if (r != null) return r
+                }
+            }
+            is List<*> -> {
+                for (i in data) {
+                    val r = findFirstKeyRecursive(i, key)
                     if (r != null) return r
                 }
             }
@@ -1061,43 +1404,108 @@ class YoutubeProvider(
             try {
                 val response = app.get(url, interceptor = ytInterceptor)
                 val html = response.text
-                val data = extractYtInitialData(html) ?: throw ErrorLoadingException("Failed to extract playlist data")
+                val data = extractYtInitialData(html)
+                    ?: throw ErrorLoadingException("Failed to extract playlist data (ytInitialData regex did not match). URL=$url")
 
-                val header = safeGet(data, "header", "playlistHeaderRenderer") as? Map<*, *>
-                val title = extractTitle(safeGet(header, "title") as? Map<*, *>) ?: "YouTube Playlist"
-                val ownerObj = safeGet(header, "ownerText") as? Map<*, *>
-                val author = extractTitle(ownerObj) ?: "Unknown Channel"
-                val description = extractTitle(safeGet(header, "description") as? Map<*, *>)
+                // --- Title / author / description -----------------------------------------
+                // YouTube has TWO playlist header layouts:
+                //   OLD: header.playlistHeaderRenderer.{title, ownerText, description}
+                //   NEW: header.pageHeaderRenderer.pageTitle + metadata.playlistMetadataRenderer.title
+                // We try every known path recursively and fall back gracefully.
+                val playlistMetadataRenderer = findFirstKeyRecursive(data, "playlistMetadataRenderer")
+                val playlistHeaderRenderer   = findFirstKeyRecursive(data, "playlistHeaderRenderer")
 
+                val title: String = (
+                    playlistMetadataRenderer?.let { extractTitle(it["title"] as? Map<*, *>) }
+                    ?: playlistHeaderRenderer?.let { extractTitle(it["title"] as? Map<*, *>) }
+                    ?: safeGet(data, "header", "pageHeaderRenderer", "pageTitle") as? String
+                    ?: response.document.selectFirst("meta[property=og:title]")?.attr("content")
+                ) ?: "YouTube Playlist"
+
+                val author: String = (
+                    playlistHeaderRenderer?.let { extractTitle(it["ownerText"] as? Map<*, *>) }
+                    ?: response.document.selectFirst("meta[property=og:site_name]")?.attr("content")
+                ) ?: "Unknown Channel"
+
+                val description: String? = playlistHeaderRenderer?.let {
+                    extractTitle(it["description"] as? Map<*, *>)
+                } ?: response.document.selectFirst("meta[property=og:description]")?.attr("content")
+
+                // --- API keys for continuation requests -----------------------------------
+                val apiKey = findConfig(html, "INNERTUBE_API_KEY")
+                val clientVersion = findConfig(html, "INNERTUBE_CLIENT_VERSION") ?: "2.20240725.01.00"
+                val visitorData = findConfig(html, "VISITOR_DATA")
+
+                // --- Collect the first page of playlist videos ----------------------------
                 val episodes = mutableListOf<Episode>()
-                val contents = safeGet(
-                    data, "contents", "twoColumnBrowseResultsRenderer", "tabs", 0,
-                    "tabRenderer", "content", "sectionListRenderer", "contents",
-                    0, "itemSectionRenderer", "contents", 0,
-                    "playlistVideoListRenderer", "contents"
-                ) as? List<*>
+                val seenIds = mutableSetOf<String>()
 
-                contents?.forEachIndexed { index, item ->
-                    val videoMap = item as? Map<*, *>
-                    val renderer = videoMap?.get("playlistVideoRenderer") as? Map<*, *>
-                    if (renderer != null) {
-                        val vId = renderer["videoId"] as? String
-                        if (vId != null) {
-                            val vidTitle = extractTitle(renderer["title"] as? Map<*, *>) ?: "Episode ${index + 1}"
-                            val thumb = getBestThumbnail(renderer["thumbnail"]) ?: buildThumbnailFromId(vId)
+                val firstPageItems = collectPlaylistVideoItems(data)
+                firstPageItems.forEach { renderer ->
+                    val vId = renderer.videoId ?: return@forEach
+                    if (!seenIds.add(vId)) return@forEach
+                    val vidUrl = "$mainUrl/watch?v=$vId"
+                    episodes.add(newEpisode(vidUrl) {
+                        this.name = renderer.title.ifBlank { "Episode ${episodes.size + 1}" }
+                        this.episode = episodes.size + 1
+                        this.posterUrl = renderer.thumbnail ?: buildThumbnailFromId(vId)
+                        this.description = renderer.duration?.takeIf { it.isNotBlank() }
+                            ?.let { "Duration: $it" }
+                    })
+                }
+
+                // --- Continuation: paginate the rest of the playlist (>100 videos) -------
+                var currentToken: String? = findPlaylistContinuationToken(data)
+                val maxPages = sharedPref?.getInt("channel_pages_limit", 6) ?: 6
+                var pagesFetched = 1
+
+                while (!currentToken.isNullOrBlank() && pagesFetched < maxPages && !apiKey.isNullOrBlank()) {
+                    try {
+                        pagesFetched += 1
+                        val apiUrl = "https://www.youtube.com/youtubei/v1/browse?key=$apiKey"
+                        val payload = mapOf(
+                            "context" to mapOf(
+                                "client" to mapOf(
+                                    "clientName" to "WEB",
+                                    "clientVersion" to clientVersion,
+                                    "visitorData" to (visitorData ?: ""),
+                                    "platform" to "DESKTOP"
+                                )
+                            ),
+                            "continuation" to currentToken
+                        )
+                        val headers = mapOf(
+                            "X-Youtube-Client-Name" to "WEB",
+                            "X-Youtube-Client-Version" to clientVersion
+                        )
+                        val jsonResponse = app.post(
+                            apiUrl, json = payload, headers = headers, interceptor = ytInterceptor
+                        ).parsedSafe<Map<String, Any>>() ?: break
+
+                        val contItems = collectPlaylistVideoItems(jsonResponse)
+                        contItems.forEach { renderer ->
+                            val vId = renderer.videoId ?: return@forEach
+                            if (!seenIds.add(vId)) return@forEach
                             val vidUrl = "$mainUrl/watch?v=$vId"
-                            val durationText = extractTitle(safeGet(renderer, "lengthText") as? Map<*, *>)
                             episodes.add(newEpisode(vidUrl) {
-                                this.name = vidTitle
-                                this.episode = index + 1
-                                this.posterUrl = thumb
-                                this.description = if (durationText != null) "Duration: $durationText" else null
+                                this.name = renderer.title.ifBlank { "Episode ${episodes.size + 1}" }
+                                this.episode = episodes.size + 1
+                                this.posterUrl = renderer.thumbnail ?: buildThumbnailFromId(vId)
+                                this.description = renderer.duration?.takeIf { it.isNotBlank() }
+                                    ?.let { "Duration: $it" }
                             })
                         }
+
+                        currentToken = findPlaylistContinuationToken(jsonResponse)
+                        kotlinx.coroutines.delay((SLEEP_BETWEEN * 10).toLong())
+                    } catch (e: Exception) {
+                        logError(e)
+                        break
                     }
                 }
 
-                val playlistPoster = episodes.firstOrNull()?.posterUrl ?: response.document.selectFirst("meta[property=og:image]")?.attr("content")
+                val playlistPoster = episodes.firstOrNull()?.posterUrl
+                    ?: response.document.selectFirst("meta[property=og:image]")?.attr("content")
 
                 return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                     this.posterUrl = playlistPoster
@@ -1106,7 +1514,11 @@ class YoutubeProvider(
                     this.tags = listOf(author)
                 }
             } catch (e: Exception) {
-
+                // LOG the error instead of silently swallowing it. The previous silent
+                // catch was the reason "Coming soon" appeared: when parsing failed,
+                // execution fell through to the video branch, which then threw
+                // "Invalid YouTube URL" because a `playlist?list=...` URL has no `v=`.
+                logError(e)
             }
         }
 

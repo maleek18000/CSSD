@@ -115,6 +115,23 @@ class YoutubeSettingsBottomSheet(private val sharedPref: SharedPreferences) : Bo
             trendingPref = SwitchPreferenceCompat(ctx).apply {
                 key = "show_trending_home"
                 setDefaultValue(true)
+
+                // Sync the switch's visible state from the "YouTube" SharedPreferences
+                // (the file YoutubeProvider actually reads from). Without this, the
+                // switch would reflect whatever is in the app-wide default prefs,
+                // which is a different file.
+                isChecked = sharedPref.getBoolean("show_trending_home", true)
+
+                // Persist the toggle to the "YouTube" SharedPreferences so that
+                // YoutubeProvider.mainPage actually honours it. Without this listener,
+                // PreferenceFragmentCompat writes to PreferenceManager.getDefaultSharedPreferences
+                // (app-wide), but YoutubeProvider reads from getSharedPreferences("YouTube", ...).
+                setOnPreferenceChangeListener { _, newValue ->
+                    sharedPref.edit()
+                        .putBoolean("show_trending_home", newValue as Boolean)
+                        .apply()
+                    true
+                }
             }
             homeCategory.addPreference(trendingPref)
 
