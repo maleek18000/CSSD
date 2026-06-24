@@ -143,6 +143,11 @@ open class YoutubeExtractor : ExtractorApi() {
                     val isLive = videoDetails?.optString("isLive") == "true" ||
                             videoDetails?.optString("isLiveContent") == "true" && status == "OK" && videoDetails.optString("lengthSeconds") == "0"
 
+                    // FIX: read the real video duration so the MPD's mediaPresentationDuration
+                    // matches the actual content. A wrong duration makes ExoPlayer compute
+                    // seek targets outside the byte range of the file -> 404 on seek.
+                    val durationSeconds = videoDetails?.optString("lengthSeconds")?.toLongOrNull() ?: 0L
+
                     if (isLive || streamingData.optString("hlsManifestUrl").isNotEmpty()) {
                         // === Live stream: emit HLS directly ===
                         val hls = streamingData.optString("hlsManifestUrl").takeIf { it.isNotBlank() }
@@ -162,7 +167,7 @@ open class YoutubeExtractor : ExtractorApi() {
                     if (adaptive != null && adaptive.length() > 0) {
                         val (videos, audios) = parseAdaptiveFormats(adaptive)
                         if (videos.isNotEmpty()) {
-                            builtLinks.addAll(buildAdaptiveLinks(videos, audios))
+                            builtLinks.addAll(buildAdaptiveLinks(videos, audios, durationSeconds))
                         }
                     }
 
@@ -272,6 +277,9 @@ open class YoutubeExtractor : ExtractorApi() {
                     val height = item.optInt("height", 0)
                     val width = item.optInt("width", 0)
                     if (height <= 0) continue
+                    // FIX: skip video streams without init/index range — without them
+                    // ExoPlayer cannot build a seek table and seeking fails with 404.
+                    if (initRange == null || indexRange == null) continue
                     if (!seenVideoUrls.add(url)) continue
 
                     val label = "${height}p"
@@ -323,32 +331,39 @@ open class YoutubeExtractor : ExtractorApi() {
     /** Build one ExtractorLink per (video quality, language) pair via a local DASH MPD. */
     private suspend fun buildAdaptiveLinks(
         videos: List<VideoStreamInfo>,
-        audios: List<AudioInfo>
+        audios: List<AudioInfo>,
+        durationSeconds: Long
     ): List<ExtractorLink> {
         val out = mutableListOf<ExtractorLink>()
         if (videos.isEmpty()) return out
 
         startServerIfNeeded()
 
-        val audiosByLanguage = audios.groupBy { it.language }
+        // Filter to only audios that have init/index ranges — otherwise the audio
+        // Representation in the MPD would have no SegmentBase and ExoPlayer would
+        // fail to load audio after the initial buffer.
+        val validAudios = audios.filter { it.initRange != null && it.indexRange != null }
+        val audiosByLanguage = validAudios.groupBy { it.language }.ifEmpty { audios.groupBy { it.language } }
 
         for (video in videos) {
             if (audiosByLanguage.isNotEmpty()) {
                 for ((lang, langAudios) in audiosByLanguage) {
+                    // Prefer audios that have init/index ranges (required for DASH SegmentBase).
+                    val candidate = langAudios.filter { it.initRange != null && it.indexRange != null }.ifEmpty { langAudios }
                     // Pair mp4 video with mp4 audio, webm video with webm/opus audio.
                     val bestAudio = if (video.mimeType.contains("webm")) {
-                        langAudios.sortedWith(
+                        candidate.sortedWith(
                             compareByDescending<AudioInfo> { it.mimeType.contains("webm") }
                                 .thenByDescending { it.bitrate }
                         ).firstOrNull()
                     } else {
-                        langAudios.sortedWith(
+                        candidate.sortedWith(
                             compareByDescending<AudioInfo> { it.mimeType.contains("mp4") }
                                 .thenByDescending { it.bitrate }
                         ).firstOrNull()
                     } ?: continue
 
-                    val dashXml = buildDashManifestXml(video, listOf(bestAudio))
+                    val dashXml = buildDashManifestXml(video, listOf(bestAudio), durationSeconds)
                     val localLink = registerManifestAndGetUrl(dashXml) ?: continue
                     out.add(
                         newExtractorLink(this.name, "${video.label} ($lang)", localLink, type = ExtractorLinkType.DASH) {
@@ -486,12 +501,19 @@ open class YoutubeExtractor : ExtractorApi() {
     /**
      * Build a minimal DASH MPD that references the video-only stream + one audio stream
      * via BaseURL, with SegmentBase pointing at init/index ranges.
+     *
+     * FIX: use the real video duration from videoDetails.lengthSeconds, not a hardcoded
+     * 3600s. ExoPlayer uses mediaPresentationDuration for the seek bar — a mismatch
+     * causes it to compute seek targets outside the actual byte range of the file.
      */
     private fun buildDashManifestXml(
         video: VideoStreamInfo,
-        audioList: List<AudioInfo>
+        audioList: List<AudioInfo>,
+        durationSec: Long
     ): String {
-        val durationString = "PT3600S" // placeholder; ExoPlayer will read actual duration from segments
+        // Fall back to 3600s only if the API returned no duration.
+        val safeDuration = if (durationSec > 0) durationSec else 3600L
+        val durationString = "PT${safeDuration}S"
         val sb = StringBuilder()
         sb.append("""<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" minBufferTime="PT5.0S" mediaPresentationDuration="$durationString">""")
         sb.append("<Period>")
