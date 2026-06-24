@@ -1,6 +1,7 @@
 package com.youtube
 
 import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.mvvm.logError
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorApi
@@ -9,16 +10,11 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.INFER_TYPE
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.schemaStripRegex
-import org.schabi.newpipe.extractor.ServiceList
-import org.schabi.newpipe.extractor.stream.StreamInfo
-import org.schabi.newpipe.extractor.stream.StreamType
-import org.schabi.newpipe.extractor.stream.SubtitlesStream
-import org.schabi.newpipe.extractor.services.youtube.linkHandler.YoutubeStreamLinkHandlerFactory
+import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.ServerSocket
 import java.net.Socket
-import java.net.URLDecoder
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.concurrent.thread
@@ -26,16 +22,27 @@ import kotlin.concurrent.thread
 /**
  * YouTube extractor for CloudStream.
  *
- * Builds a local DASH manifest that muxes a video-only stream with one audio track
- * (per language) and serves it through a tiny HTTP server on 127.0.0.1.
- * ExoPlayer then plays the manifest as a single adaptive source.
+ * === Why this exists (and why NewPipeExtractor is no longer used) ===
  *
- * High-level flow:
- *   1. StreamInfo.getInfo(url) -> NewPipeExtractor fetches YouTube page & parses streams
- *   2. videoOnlyStreams (1080p/1440p/4K, DASH) are paired with audioStreams per language
- *   3. For each (video quality, language) pair we generate a DASH MPD and serve it locally
- *   4. Muxed/progressive streams (capped at 360p/720p by YouTube) are added as "Legacy" fallback
- *   5. Live streams use the HLS manifest (info.hlsUrl) directly
+ * Since mid-2025 YouTube deploys SABR ("server-side adaptive bitrate") enforcement
+ * on the WEB client. The WEB client's `streamingData.adaptiveFormats` now returns
+ * only 360p (or empty) for most videos. NewPipeExtractor v0.26.x uses the WEB
+ * client internally, so `StreamInfo.videoOnlyStreams` is SABR-capped to 360p.
+ * The SABR workaround that NewPipe app 0.27.7+ uses was never tagged on JitPack,
+ * so we cannot fix this by bumping the NewPipeExtractor dependency.
+ *
+ * The industry-standard workaround (used by yt-dlp, Piped, InnerTube clients) is
+ * to call `/youtubei/v1/player` with the **ANDROID** client. The ANDROID client:
+ *   - bypasses SABR (returns adaptive formats up to 1080p/1440p/2160p)
+ *   - returns URLs that are NOT signature-ciphered (directly playable)
+ *   - does not require an API key
+ *
+ * This extractor:
+ *   1. POSTs to https://www.youtube.com/youtubei/v1/player with the ANDROID client
+ *   2. Parses streamingData.adaptiveFormats (video-only + audio)
+ *   3. Builds a local DASH MPD that muxes one video + one audio per language
+ *   4. Serves the MPD via a tiny HTTP server on 127.0.0.1
+ *   5. Falls back to IOS client, then WEB client (muxed 360p) if ANDROID fails
  */
 open class YoutubeExtractor : ExtractorApi() {
     override val mainUrl = "https://www.youtube.com"
@@ -44,21 +51,36 @@ open class YoutubeExtractor : ExtractorApi() {
 
     companion object {
         private var ytVideos: MutableMap<String, List<ExtractorLink>> = mutableMapOf()
-        private var ytVideosSubtitles: MutableMap<String, List<SubtitlesStream>> = mutableMapOf()
+        private var ytVideosSubtitles: MutableMap<String, List<Pair<String, String>>> = mutableMapOf()
 
         private var activeServer: ServerSocket? = null
         private var serverPort: Int = 0
         private val manifestMap = ConcurrentHashMap<String, String>()
-
-        // Simple TTL guard so the manifest map does not grow unbounded across many videos.
         private const val MAX_MANIFESTS = 64
     }
 
-    override fun getExtractorUrl(id: String): String {
-        return "$mainUrl/watch?v=$id"
+    override fun getExtractorUrl(id: String): String = "$mainUrl/watch?v=$id"
+
+    /** InnerTube client types we know how to talk to. */
+    private enum class ClientType(val clientName: String, val clientVersion: String, val userAgent: String) {
+        ANDROID(
+            "ANDROID",
+            "20.10.38",
+            "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip"
+        ),
+        IOS(
+            "IOS",
+            "20.10.4",
+            "com.google.ios.youtube/20.10.4 (iPhone15,4; U; CPU iOS 17_4 like Mac OS X)"
+        ),
+        WEB(
+            "WEB",
+            "2.20240725.01.00",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        )
     }
 
-    /** Local view of a video-only stream extracted from NewPipeExtractor. */
+    /** Local view of a video-only stream from the InnerTube player response. */
     data class VideoStreamInfo(
         val url: String,
         val mimeType: String,
@@ -71,7 +93,7 @@ open class YoutubeExtractor : ExtractorApi() {
         val indexRange: String?
     )
 
-    /** Local view of an audio stream extracted from NewPipeExtractor. */
+    /** Local view of an audio stream from the InnerTube player response. */
     data class AudioInfo(
         val url: String,
         val mimeType: String,
@@ -89,210 +111,308 @@ open class YoutubeExtractor : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val cleanedUrl = url.replace(schemaStripRegex, "")
-        val videoId = try {
-            YoutubeStreamLinkHandlerFactory.getInstance().fromUrl(url).id
-        } catch (e: Exception) {
-            try { cleanedUrl.substringAfter("v=").substringBefore("&") } catch (e2: Exception) { cleanedUrl }
+        val videoId = extractVideoId(url) ?: run {
+            try { cleanedUrl.substringAfter("v=").substringBefore("&") } catch (e: Exception) { cleanedUrl }
+        }
+        if (videoId.length != 11) {
+            // Not a valid video id; nothing we can do.
+            return
         }
 
         ytVideos.remove(videoId)
         ytVideosSubtitles.remove(videoId)
 
         if (ytVideos[videoId].isNullOrEmpty()) {
-            try {
-                // Use StreamInfo.getInfo() (the high-level factory) instead of directly
-                // instantiating YoutubeStreamExtractor. It handles SABR fallbacks,
-                // age-gated videos, and player response parsing more robustly.
-                val watchUrl = "$mainUrl/watch?v=$videoId"
-                val info = StreamInfo.getInfo(watchUrl)
+            val builtLinks = mutableListOf<ExtractorLink>()
 
-                // === Live streams: use HLS directly (no per-quality selection, but >360p) ===
-                val isLive = info.streamType == StreamType.LIVE_STREAM ||
-                        info.streamType == StreamType.AUDIO_LIVE_STREAM ||
-                        info.streamType == StreamType.POST_LIVE_STREAM ||
-                        info.streamType == StreamType.POST_LIVE_AUDIO_STREAM
-
-                if (isLive && !info.hlsUrl.isNullOrEmpty()) {
-                    val liveLink = newExtractorLink(
-                        this.name,
-                        "YouTube Live",
-                        info.hlsUrl,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = mainUrl
-                        // 0 == "Auto" in CloudStream's quality->string mapping.
-                        this.quality = 0
-                    }
-                    ytVideos[videoId] = listOf(liveLink)
-                    try {
-                        ytVideosSubtitles[videoId] = info.subtitles ?: emptyList()
-                    } catch (e: Exception) { }
-                    ytVideos[videoId]?.forEach { callback(it) }
-                    emitSubtitles(videoId, subtitleCallback)
-                    return
-                }
-
-                val durationSeconds = if (info.duration > 0) info.duration else 3600L
-                val builtLinks = mutableListOf<ExtractorLink>()
-                val seenUrls = mutableSetOf<String>()
-
-                // === Video-only (DASH) streams: 144p -> 2160p ===
-                val videoOnlyList = (info.videoOnlyStreams ?: emptyList()).mapNotNull { vs ->
-                    try {
-                        val streamUrl = vs.content ?: return@mapNotNull null
-                        if (!seenUrls.add(streamUrl)) return@mapNotNull null
-
-                        val height = runCatching { vs.height ?: 0 }.getOrNull() ?: 0
-                        val width = runCatching { vs.width ?: 0 }.getOrNull() ?: 0
-                        val bitrate = runCatching { vs.bitrate ?: 0 }.getOrNull() ?: 0
-
-                        var mime = vs.format?.mimeType
-                        if (mime.isNullOrEmpty()) mime = getMimeTypeFromUrl(streamUrl, false)
-
-                        // FIX: use the actual codec from the stream rather than a hardcoded
-                        // "avc1.4d401f". A wrong codec makes ExoPlayer reject the representation
-                        // and fall back to a lower quality (often 360p muxed).
-                        var codecs = runCatching { vs.codec }.getOrNull()
-                        if (codecs.isNullOrEmpty()) codecs = if (mime.contains("webm")) "vp9" else "avc1.4d401f"
-
-                        val label = if (height > 0) "${height}p" else "video"
-
-                        val initR = if (vs.initStart != null && vs.initEnd != null)
-                            "${vs.initStart}-${vs.initEnd}" else null
-                        val indexR = if (vs.indexStart != null && vs.indexEnd != null)
-                            "${vs.indexStart}-${vs.indexEnd}" else null
-
-                        VideoStreamInfo(streamUrl, mime, codecs, width, height, bitrate, label, initR, indexR)
-                    } catch (e: Exception) { null }
-                }.distinctBy { it.height } // keep best codec per quality bucket
-
-                // === Audio streams ===
-                val audioInfoList = (info.audioStreams ?: emptyList()).mapNotNull { asr ->
-                    try {
-                        val aUrl = asr.content ?: return@mapNotNull null
-                        val bitrate = asr.bitrate ?: 128000
-                        var mime = asr.format?.mimeType
-                        if (mime.isNullOrEmpty()) mime = getMimeTypeFromUrl(aUrl, true)
-
-                        var codecs = runCatching { asr.codec }.getOrNull()
-                        if (codecs.isNullOrEmpty()) codecs = if (mime.contains("webm")) "opus" else "mp4a.40.2"
-
-                        val initR = if (asr.initStart != null && asr.initEnd != null)
-                            "${asr.initStart}-${asr.initEnd}" else null
-                        val indexR = if (asr.indexStart != null && asr.indexEnd != null)
-                            "${asr.indexStart}-${asr.indexEnd}" else null
-
-                        var rawLang = asr.audioTrackId ?: "Default"
-                        if (rawLang.contains(".")) rawLang = rawLang.substringBefore(".")
-
-                        AudioInfo(aUrl, mime, codecs, bitrate, initR, indexR, rawLang.uppercase())
-                    } catch (e: Exception) { null }
-                }.distinctBy { it.url }
-
-                val audiosByLanguage = audioInfoList.groupBy { it.language }
-
+            // === Try each client in order until one yields streams ===
+            // ANDROID bypasses SABR and returns unciphered URLs (best).
+            // IOS is a backup (also bypasses SABR but sometimes rate-limited).
+            // WEB returns SABR-capped 360p muxed as a last resort.
+            for (client in listOf(ClientType.ANDROID, ClientType.IOS, ClientType.WEB)) {
                 try {
-                    ytVideosSubtitles[videoId] = info.subtitles ?: emptyList()
-                } catch (e: Exception) { }
+                    val json = fetchPlayerResponse(videoId, client) ?: continue
+                    ytVideosSubtitles[videoId] = extractSubtitles(json)
 
-                startServerIfNeeded()
+                    val streamingData = json.optJSONObject("streamingData") ?: continue
+                    val playability = json.optJSONObject("playabilityStatus")
+                    val status = playability?.optString("status") ?: "OK"
+                    if (status != "OK" && status != "LIVE_STREAM_OFFLINE") continue
 
-                // === Emit one ExtractorLink per (quality, language) ===
-                for (video in videoOnlyList) {
-                    if (audiosByLanguage.isNotEmpty()) {
-                        for ((lang, audios) in audiosByLanguage) {
-                            // Pick the audio whose container matches the video container
-                            // (mp4 audio for mp4 video, webm/opus audio for webm video).
-                            val bestAudioForLang = if (video.mimeType.contains("webm")) {
-                                audios.sortedWith(
-                                    compareByDescending<AudioInfo> { it.mimeType.contains("webm") }
-                                        .thenByDescending { it.bitrate }
-                                ).firstOrNull()
-                            } else {
-                                audios.sortedWith(
-                                    compareByDescending<AudioInfo> { it.mimeType.contains("mp4") }
-                                        .thenByDescending { it.bitrate }
-                                ).firstOrNull()
-                            }
+                    val videoDetails = json.optJSONObject("videoDetails")
+                    val isLive = videoDetails?.optString("isLive") == "true" ||
+                            videoDetails?.optString("isLiveContent") == "true" && status == "OK" && videoDetails.optString("lengthSeconds") == "0"
 
-                            if (bestAudioForLang != null) {
-                                val dashXml = buildDashManifestXml(video, listOf(bestAudioForLang), durationSeconds)
-                                val localLink = registerManifestAndGetUrl(dashXml)
-
-                                if (localLink != null) {
-                                    // FIX: label was "${video.label} ($lang) ${video.label}" -> duplicate.
-                                    val finalName = "${video.label} ($lang)"
-
-                                    builtLinks.add(
-                                        newExtractorLink(
-                                            this.name,
-                                            finalName,
-                                            localLink,
-                                            type = ExtractorLinkType.DASH
-                                        ) {
-                                            this.referer = mainUrl
-                                            this.quality = video.height
-                                        }
-                                    )
+                    if (isLive || streamingData.optString("hlsManifestUrl").isNotEmpty()) {
+                        // === Live stream: emit HLS directly ===
+                        val hls = streamingData.optString("hlsManifestUrl").takeIf { it.isNotBlank() }
+                        if (!hls.isNullOrEmpty()) {
+                            builtLinks.add(
+                                newExtractorLink(this.name, "YouTube Live", hls, type = ExtractorLinkType.M3U8) {
+                                    this.referer = mainUrl
+                                    this.quality = 0
                                 }
-                            }
+                            )
+                            break // live streams only need the HLS link
                         }
-                    } else {
-                        // No audio available (rare) - emit video-only as a fallback.
-                        builtLinks.add(
-                            newExtractorLink(
-                                this.name,
-                                "${video.label} (video only)",
-                                video.url,
-                                type = INFER_TYPE
-                            ) {
-                                this.referer = mainUrl
-                                this.quality = video.height
-                            }
-                        )
                     }
-                }
 
-                // === Muxed/progressive streams as "Legacy" fallback ===
-                // YouTube caps these at 360p / 720p, but they always work even if DASH fails.
-                val muxedList = (info.videoStreams ?: emptyList()).mapNotNull { vs ->
-                    try {
-                        val mUrl = vs.content ?: return@mapNotNull null
-                        if (!seenUrls.add(mUrl)) return@mapNotNull null
-                        val height = runCatching { vs.height ?: 0 }.getOrNull() ?: 0
-                        val label = if (height > 0) "${height}p" else "video"
-                        Triple(mUrl, label, height)
-                    } catch (e: Exception) { null }
-                }
-                for ((mUrl, mLabel, mHeight) in muxedList) {
-                    builtLinks.add(
-                        newExtractorLink(this.name, "$mLabel (Legacy)", mUrl, type = INFER_TYPE) {
-                            this.referer = mainUrl
-                            this.quality = mHeight
+                    // === Adaptive (DASH) streams ===
+                    val adaptive = streamingData.optJSONArray("adaptiveFormats")
+                    if (adaptive != null && adaptive.length() > 0) {
+                        val (videos, audios) = parseAdaptiveFormats(adaptive)
+                        if (videos.isNotEmpty()) {
+                            builtLinks.addAll(buildAdaptiveLinks(videos, audios))
                         }
-                    )
+                    }
+
+                    // === Muxed/progressive streams (always present, capped at 360p/720p) ===
+                    val muxed = streamingData.optJSONArray("formats")
+                    if (muxed != null && muxed.length() > 0) {
+                        builtLinks.addAll(buildMuxedLinks(muxed))
+                    }
+
+                    if (builtLinks.isNotEmpty()) break
+                } catch (e: Exception) {
+                    logError(e)
+                    // try next client
                 }
+            }
 
-                ytVideos[videoId] = builtLinks.toList()
-
-            } catch (e: Exception) { logError(e) }
+            ytVideos[videoId] = builtLinks
         }
 
         ytVideos[videoId]?.forEach { callback(it) }
-        emitSubtitles(videoId, subtitleCallback)
+        ytVideosSubtitles[videoId]?.forEach { (lang, content) ->
+            try { subtitleCallback(newSubtitleFile(lang, content)) } catch (e: Exception) {}
+        }
     }
 
-    private suspend fun emitSubtitles(
-        videoId: String,
-        subtitleCallback: (SubtitleFile) -> Unit
-    ) {
-        ytVideosSubtitles[videoId]?.mapNotNull { ss ->
+    /** Extract the 11-char video id from any YouTube URL shape. */
+    private fun extractVideoId(url: String): String? {
+        val patterns = listOf(
+            Regex("""(?:v=|/watch\?v=|youtu\.be/|/embed/|/shorts/|/live/)([A-Za-z0-9_-]{11})"""),
+            Regex("""\b([A-Za-z0-9_-]{11})\b""")
+        )
+        for (p in patterns) {
+            val m = p.find(url) ?: continue
+            return m.groupValues.getOrNull(1)
+        }
+        return null
+    }
+
+    /** Call the InnerTube /youtubei/v1/player endpoint with a given client context. */
+    private suspend fun fetchPlayerResponse(videoId: String, client: ClientType): JSONObject? {
+        return try {
+            val payload = JSONObject().apply {
+                put("context", JSONObject().apply {
+                    put("client", JSONObject().apply {
+                        put("clientName", client.clientName)
+                        put("clientVersion", client.clientVersion)
+                        put("hl", "en")
+                        put("gl", "US")
+                        if (client == ClientType.ANDROID) {
+                            put("androidSdkVersion", 30)
+                        }
+                    })
+                })
+                put("videoId", videoId)
+                put("contentCheckOk", true)
+                put("racyCheckOk", true)
+            }
+
+            val apiUrl = "$mainUrl/youtubei/v1/player?prettyPrint=false"
+
+            val headers = mapOf(
+                "Content-Type" to "application/json",
+                "User-Agent" to client.userAgent,
+                "X-YouTube-Client-Name" to if (client == ClientType.ANDROID) "3"
+                    else if (client == ClientType.IOS) "5" else "1",
+                "X-YouTube-Client-Version" to client.clientVersion,
+                "Origin" to mainUrl,
+                "Referer" to "$mainUrl/watch?v=$videoId"
+            )
+
+            val response = app.post(apiUrl, json = payload, headers = headers)
+            val text = response.text
+            if (text.isBlank()) return null
+            JSONObject(text)
+        } catch (e: Exception) {
+            logError(e)
+            null
+        }
+    }
+
+    /** Parse streamingData.adaptiveFormats into video-only + audio lists. */
+    private fun parseAdaptiveFormats(
+        adaptive: org.json.JSONArray
+    ): Pair<List<VideoStreamInfo>, List<AudioInfo>> {
+        val videos = mutableListOf<VideoStreamInfo>()
+        val audios = mutableListOf<AudioInfo>()
+        val seenVideoUrls = mutableSetOf<String>()
+        val seenAudioKeys = mutableSetOf<String>()
+
+        for (i in 0 until adaptive.length()) {
+            val item = adaptive.optJSONObject(i) ?: continue
             try {
-                val lang = ss.locale?.language ?: return@mapNotNull null
-                val content = ss.content ?: ss.getUrl() ?: return@mapNotNull null
-                newSubtitleFile(lang, content)
-            } catch (e: Exception) { null }
-        }?.forEach { subtitleCallback(it) }
+                val url = item.optString("url").takeIf { it.isNotBlank() } ?: continue
+                val mime = item.optString("mimeType") // e.g. "video/mp4; codecs=\"avc1.640028\""
+                val bitrate = item.optInt("bitrate", 0)
+                val initRange = item.optJSONObject("initRange")?.let { r ->
+                    "${r.optString("start")}-${r.optString("end")}".takeIf { r.has("start") && r.has("end") }
+                }
+                val indexRange = item.optJSONObject("indexRange")?.let { r ->
+                    "${r.optString("start")}-${r.optString("end")}".takeIf { r.has("start") && r.has("end") }
+                }
+
+                // Split "video/mp4; codecs=\"avc1.640028\"" into mimeType + codecs.
+                val (mimeOnly, codecs) = parseMimeAndCodecs(mime)
+
+                if (mimeOnly.startsWith("video/")) {
+                    val height = item.optInt("height", 0)
+                    val width = item.optInt("width", 0)
+                    if (height <= 0) continue
+                    if (!seenVideoUrls.add(url)) continue
+
+                    val label = "${height}p"
+                    videos.add(VideoStreamInfo(url, mimeOnly, codecs, width, height, bitrate, label, initRange, indexRange))
+                } else if (mimeOnly.startsWith("audio/")) {
+                    // audioTrackId looks like "en" or "en.3" — strip the variant suffix.
+                    var lang = item.optString("audioTrackId").takeIf { it.isNotBlank() } ?: "Default"
+                    if (lang.contains(".")) lang = lang.substringBefore(".")
+                    lang = lang.uppercase()
+
+                    val key = "$lang|$url"
+                    if (!seenAudioKeys.add(key)) continue
+
+                    audios.add(AudioInfo(url, mimeOnly, codecs, bitrate, initRange, indexRange, lang))
+                }
+            } catch (e: Exception) {
+                // skip this format
+            }
+        }
+
+        // Keep best codec per quality bucket for video (avc/mp4 preferred over vp9/webm for compatibility).
+        val dedupedVideos = videos
+            .groupBy { it.height }
+            .mapValues { (_, list) ->
+                list.sortedWith(
+                    compareByDescending<VideoStreamInfo> { it.mimeType.contains("mp4") }
+                        .thenByDescending { it.bitrate }
+                ).first()
+            }
+            .values
+            .sortedBy { it.height }
+
+        return Pair(dedupedVideos, audios)
+    }
+
+    /** Split "video/mp4; codecs=\"avc1.640028\"" -> ("video/mp4", "avc1.640028"). */
+    private fun parseMimeAndCodecs(mime: String): Pair<String, String> {
+        val parts = mime.split(";", limit = 2)
+        val mimeOnly = parts[0].trim()
+        val codecs = if (parts.size > 1) {
+            val raw = parts[1].trim()
+            // codecs="avc1.640028"
+            val match = Regex("""codecs="([^"]+)"""").find(raw)
+            match?.groupValues?.getOrNull(1) ?: ""
+        } else ""
+        return Pair(mimeOnly, codecs)
+    }
+
+    /** Build one ExtractorLink per (video quality, language) pair via a local DASH MPD. */
+    private suspend fun buildAdaptiveLinks(
+        videos: List<VideoStreamInfo>,
+        audios: List<AudioInfo>
+    ): List<ExtractorLink> {
+        val out = mutableListOf<ExtractorLink>()
+        if (videos.isEmpty()) return out
+
+        startServerIfNeeded()
+
+        val audiosByLanguage = audios.groupBy { it.language }
+
+        for (video in videos) {
+            if (audiosByLanguage.isNotEmpty()) {
+                for ((lang, langAudios) in audiosByLanguage) {
+                    // Pair mp4 video with mp4 audio, webm video with webm/opus audio.
+                    val bestAudio = if (video.mimeType.contains("webm")) {
+                        langAudios.sortedWith(
+                            compareByDescending<AudioInfo> { it.mimeType.contains("webm") }
+                                .thenByDescending { it.bitrate }
+                        ).firstOrNull()
+                    } else {
+                        langAudios.sortedWith(
+                            compareByDescending<AudioInfo> { it.mimeType.contains("mp4") }
+                                .thenByDescending { it.bitrate }
+                        ).firstOrNull()
+                    } ?: continue
+
+                    val dashXml = buildDashManifestXml(video, listOf(bestAudio))
+                    val localLink = registerManifestAndGetUrl(dashXml) ?: continue
+                    out.add(
+                        newExtractorLink(this.name, "${video.label} ($lang)", localLink, type = ExtractorLinkType.DASH) {
+                            this.referer = mainUrl
+                            this.quality = video.height
+                        }
+                    )
+                }
+            } else {
+                // No audio available - emit video-only as fallback.
+                out.add(
+                    newExtractorLink(this.name, "${video.label} (video only)", video.url, type = INFER_TYPE) {
+                        this.referer = mainUrl
+                        this.quality = video.height
+                    }
+                )
+            }
+        }
+        return out
+    }
+
+    /** Build "Legacy" ExtractorLinks from muxed/progressive formats. */
+    private suspend fun buildMuxedLinks(formats: org.json.JSONArray): List<ExtractorLink> {
+        val out = mutableListOf<ExtractorLink>()
+        val seen = mutableSetOf<String>()
+        for (i in 0 until formats.length()) {
+            val item = formats.optJSONObject(i) ?: continue
+            try {
+                val url = item.optString("url").takeIf { it.isNotBlank() } ?: continue
+                if (!seen.add(url)) continue
+                val height = item.optInt("height", 0)
+                val label = if (height > 0) "${height}p" else "video"
+                out.add(
+                    newExtractorLink(this.name, "$label (Legacy)", url, type = INFER_TYPE) {
+                        this.referer = mainUrl
+                        this.quality = height
+                    }
+                )
+            } catch (e: Exception) {}
+        }
+        return out
+    }
+
+    /** Extract captions from the player response. */
+    private fun extractSubtitles(root: JSONObject): List<Pair<String, String>> {
+        val out = mutableListOf<Pair<String, String>>()
+        try {
+            val tracks = root.optJSONObject("captions")
+                ?.optJSONObject("playerCaptionsTracklistRenderer")
+                ?.optJSONArray("captionTracks") ?: return out
+            for (i in 0 until tracks.length()) {
+                val t = tracks.optJSONObject(i) ?: continue
+                val lang = t.optString("languageCode").ifBlank { "unknown" }
+                val baseUrl = t.optString("baseUrl").ifBlank { continue }
+                // Use vtt for the player, prefer it over ttml.
+                val vttUrl = if (baseUrl.contains("fmt=")) {
+                    baseUrl.replace(Regex("fmt=[^&]+"), "fmt=vtt")
+                } else {
+                    "$baseUrl&fmt=vtt"
+                }
+                out.add(lang to vttUrl)
+            }
+        } catch (e: Exception) {}
+        return out
     }
 
     @Synchronized
@@ -314,26 +434,17 @@ open class YoutubeExtractor : ExtractorApi() {
 
     private fun registerManifestAndGetUrl(xmlContent: String): String? {
         if (serverPort == 0) return null
-
-        // Bound the manifest cache so it doesn't leak across many videos.
         if (manifestMap.size > MAX_MANIFESTS) {
             manifestMap.keys.take(manifestMap.size - MAX_MANIFESTS + 1).forEach { k ->
                 manifestMap.remove(k)
             }
         }
-
         val id = UUID.randomUUID().toString()
         manifestMap[id] = xmlContent
         return "http://127.0.0.1:$serverPort/$id.mpd"
     }
 
-    /**
-     * FIX: rewritten to use raw OutputStream with explicit \r\n line terminators
-     * and a Content-Length header. The previous PrintWriter.println() approach
-     * used the platform line separator (LF on Android) which is technically
-     * invalid HTTP, and the missing Content-Length forced ExoPlayer to rely on
-     * connection-close framing - which sometimes truncated the manifest.
-     */
+    /** Serve the MPD via raw OutputStream with proper \r\n framing and Content-Length. */
     private fun handleClient(client: Socket) {
         try {
             client.use { socket ->
@@ -373,66 +484,34 @@ open class YoutubeExtractor : ExtractorApi() {
     }
 
     /**
-     * Build a minimal DASH MPD that references the video-only stream and one
-     * audio stream via BaseURL, with SegmentBase pointing at the init/index
-     * ranges YouTube exposes for each.
-     *
-     * FIXES vs the previous version:
-     *   - codecs are taken from the stream (vs hardcoded "avc1.4d401f")
-     *   - width is omitted if 0 (vs hardcoded width="0" which is invalid)
-     *   - bandwidth comes from the stream (vs hardcoded "4000000")
-     *   - audio codec/bandwidth also taken from the stream
+     * Build a minimal DASH MPD that references the video-only stream + one audio stream
+     * via BaseURL, with SegmentBase pointing at init/index ranges.
      */
     private fun buildDashManifestXml(
         video: VideoStreamInfo,
-        audioList: List<AudioInfo>,
-        durationSec: Long
+        audioList: List<AudioInfo>
     ): String {
-        val cleanVideoUrl = escapeXml(video.url)
-        val durationString = "PT${durationSec}S"
-
+        val durationString = "PT3600S" // placeholder; ExoPlayer will read actual duration from segments
         val sb = StringBuilder()
         sb.append("""<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" minBufferTime="PT5.0S" mediaPresentationDuration="$durationString">""")
         sb.append("<Period>")
 
-        val vMime = video.mimeType
-        val vCodecs = video.codecs
+        val vCodecs = video.codecs.ifEmpty { if (video.mimeType.contains("webm")) "vp9" else "avc1.4d401f" }
         val vBandwidth = if (video.bitrate > 0) video.bitrate else 4000000
-
         val vSegmentBase = if (video.initRange != null && video.indexRange != null) {
             """<SegmentBase indexRange="${video.indexRange}"><Initialization range="${video.initRange}" /></SegmentBase>"""
         } else ""
-
-        // Omit width attribute entirely if unknown (width="0" is invalid DASH).
         val widthAttr = if (video.width > 0) """width="${video.width}" """ else ""
-        sb.append("""
-            <AdaptationSet mimeType="$vMime" subsegmentAlignment="true" subsegmentStartsWithSAP="1">
-              <Representation id="video" bandwidth="$vBandwidth" ${widthAttr}height="${video.height}" codecs="$vCodecs">
-                <BaseURL>$cleanVideoUrl</BaseURL>
-                $vSegmentBase
-              </Representation>
-            </AdaptationSet>
-        """.trimIndent())
+
+        sb.append("""<AdaptationSet mimeType="${video.mimeType}" subsegmentAlignment="true" subsegmentStartsWithSAP="1"><Representation id="video" bandwidth="$vBandwidth" ${widthAttr}height="${video.height}" codecs="$vCodecs"><BaseURL>${escapeXml(video.url)}</BaseURL>$vSegmentBase</Representation></AdaptationSet>""")
 
         audioList.forEachIndexed { index, audio ->
-            val cleanAudioUrl = escapeXml(audio.url)
-            val audioId = "audio_$index"
-            val aMime = audio.mimeType
-            val aCodecs = audio.codecs
+            val aCodecs = audio.codecs.ifEmpty { if (audio.mimeType.contains("webm")) "opus" else "mp4a.40.2" }
             val aBandwidth = if (audio.bitrate > 0) audio.bitrate else 128000
-
             val aSegmentBase = if (audio.initRange != null && audio.indexRange != null) {
                 """<SegmentBase indexRange="${audio.indexRange}"><Initialization range="${audio.initRange}" /></SegmentBase>"""
             } else ""
-
-            sb.append("""
-                <AdaptationSet mimeType="$aMime" subsegmentAlignment="true" subsegmentStartsWithSAP="1">
-                  <Representation id="$audioId" bandwidth="$aBandwidth" codecs="$aCodecs">
-                    <BaseURL>$cleanAudioUrl</BaseURL>
-                    $aSegmentBase
-                  </Representation>
-                </AdaptationSet>
-            """.trimIndent())
+            sb.append("""<AdaptationSet mimeType="${audio.mimeType}" subsegmentAlignment="true" subsegmentStartsWithSAP="1"><Representation id="audio_$index" bandwidth="$aBandwidth" codecs="$aCodecs"><BaseURL>${escapeXml(audio.url)}</BaseURL>$aSegmentBase</Representation></AdaptationSet>""")
         }
 
         sb.append("</Period>")
@@ -440,18 +519,6 @@ open class YoutubeExtractor : ExtractorApi() {
         return sb.toString()
     }
 
-    private fun escapeXml(url: String): String {
-        return url.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    }
-
-    private fun getMimeTypeFromUrl(url: String, isAudio: Boolean): String {
-        return try {
-            val decoded = URLDecoder.decode(url, "UTF-8")
-            if (decoded.contains("video/webm") || decoded.contains("audio/webm")) {
-                if (isAudio) "audio/webm" else "video/webm"
-            } else {
-                if (isAudio) "audio/mp4" else "video/mp4"
-            }
-        } catch (e: Exception) { if (isAudio) "audio/mp4" else "video/mp4" }
-    }
+    private fun escapeXml(url: String): String =
+        url.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 }
