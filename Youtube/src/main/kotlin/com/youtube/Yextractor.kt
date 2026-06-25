@@ -50,13 +50,14 @@ open class YoutubeExtractor : ExtractorApi() {
     override val name = "YouTube"
 
     companion object {
-        private var ytVideos: MutableMap<String, List<ExtractorLink>> = mutableMapOf()
-        private var ytVideosSubtitles: MutableMap<String, List<Pair<String, String>>> = mutableMapOf()
+        // NOTE: Removed ytVideos/ytVideosSubtitles caches — they were broken
+        // (always removed before check → 0% hit rate) and leaked memory
+        // (never cleared old entries). Each getUrl call now builds links fresh.
 
         private var activeServer: ServerSocket? = null
         private var serverPort: Int = 0
         private val manifestMap = ConcurrentHashMap<String, String>()
-        private const val MAX_MANIFESTS = 64
+        private const val MAX_MANIFESTS = 32  // lowered from 64 — only current video needed
     }
 
     override fun getExtractorUrl(id: String): String = "$mainUrl/watch?v=$id"
@@ -119,76 +120,70 @@ open class YoutubeExtractor : ExtractorApi() {
             return
         }
 
-        ytVideos.remove(videoId)
-        ytVideosSubtitles.remove(videoId)
+        val builtLinks = mutableListOf<ExtractorLink>()
+        var subtitles: List<Pair<String, String>> = emptyList()
 
-        if (ytVideos[videoId].isNullOrEmpty()) {
-            val builtLinks = mutableListOf<ExtractorLink>()
+        // === Try each client in order until one yields streams ===
+        // ANDROID bypasses SABR and returns unciphered URLs (best).
+        // IOS is a backup (also bypasses SABR but sometimes rate-limited).
+        // WEB returns SABR-capped 360p muxed as a last resort.
+        for (client in listOf(ClientType.ANDROID, ClientType.IOS, ClientType.WEB)) {
+            try {
+                val json = fetchPlayerResponse(videoId, client) ?: continue
+                subtitles = extractSubtitles(json)
 
-            // === Try each client in order until one yields streams ===
-            // ANDROID bypasses SABR and returns unciphered URLs (best).
-            // IOS is a backup (also bypasses SABR but sometimes rate-limited).
-            // WEB returns SABR-capped 360p muxed as a last resort.
-            for (client in listOf(ClientType.ANDROID, ClientType.IOS, ClientType.WEB)) {
-                try {
-                    val json = fetchPlayerResponse(videoId, client) ?: continue
-                    ytVideosSubtitles[videoId] = extractSubtitles(json)
+                val streamingData = json.optJSONObject("streamingData") ?: continue
+                val playability = json.optJSONObject("playabilityStatus")
+                val status = playability?.optString("status") ?: "OK"
+                if (status != "OK" && status != "LIVE_STREAM_OFFLINE") continue
 
-                    val streamingData = json.optJSONObject("streamingData") ?: continue
-                    val playability = json.optJSONObject("playabilityStatus")
-                    val status = playability?.optString("status") ?: "OK"
-                    if (status != "OK" && status != "LIVE_STREAM_OFFLINE") continue
+                val videoDetails = json.optJSONObject("videoDetails")
+                val isLive = videoDetails?.optString("isLive") == "true" ||
+                        (videoDetails?.optString("isLiveContent") == "true" && status == "OK" && videoDetails.optString("lengthSeconds") == "0")
 
-                    val videoDetails = json.optJSONObject("videoDetails")
-                    val isLive = videoDetails?.optString("isLive") == "true" ||
-                            videoDetails?.optString("isLiveContent") == "true" && status == "OK" && videoDetails.optString("lengthSeconds") == "0"
+                // FIX: read the real video duration so the MPD's mediaPresentationDuration
+                // matches the actual content. A wrong duration makes ExoPlayer compute
+                // seek targets outside the byte range of the file -> 404 on seek.
+                val durationSeconds = videoDetails?.optString("lengthSeconds")?.toLongOrNull() ?: 0L
 
-                    // FIX: read the real video duration so the MPD's mediaPresentationDuration
-                    // matches the actual content. A wrong duration makes ExoPlayer compute
-                    // seek targets outside the byte range of the file -> 404 on seek.
-                    val durationSeconds = videoDetails?.optString("lengthSeconds")?.toLongOrNull() ?: 0L
-
-                    if (isLive || streamingData.optString("hlsManifestUrl").isNotEmpty()) {
-                        // === Live stream: emit HLS directly ===
-                        val hls = streamingData.optString("hlsManifestUrl").takeIf { it.isNotBlank() }
-                        if (!hls.isNullOrEmpty()) {
-                            builtLinks.add(
-                                newExtractorLink(this.name, "YouTube Live", hls, type = ExtractorLinkType.M3U8) {
-                                    this.referer = mainUrl
-                                    this.quality = 0
-                                }
-                            )
-                            break // live streams only need the HLS link
-                        }
+                if (isLive || streamingData.optString("hlsManifestUrl").isNotEmpty()) {
+                    // === Live stream: emit HLS directly ===
+                    val hls = streamingData.optString("hlsManifestUrl").takeIf { it.isNotBlank() }
+                    if (!hls.isNullOrEmpty()) {
+                        builtLinks.add(
+                            newExtractorLink(this.name, "YouTube Live", hls, type = ExtractorLinkType.M3U8) {
+                                this.referer = mainUrl
+                                this.quality = 0
+                            }
+                        )
+                        break // live streams only need the HLS link
                     }
-
-                    // === Adaptive (DASH) streams ===
-                    val adaptive = streamingData.optJSONArray("adaptiveFormats")
-                    if (adaptive != null && adaptive.length() > 0) {
-                        val (videos, audios) = parseAdaptiveFormats(adaptive)
-                        if (videos.isNotEmpty()) {
-                            builtLinks.addAll(buildAdaptiveLinks(videos, audios, durationSeconds))
-                        }
-                    }
-
-                    // === Muxed/progressive streams (always present, capped at 360p/720p) ===
-                    val muxed = streamingData.optJSONArray("formats")
-                    if (muxed != null && muxed.length() > 0) {
-                        builtLinks.addAll(buildMuxedLinks(muxed))
-                    }
-
-                    if (builtLinks.isNotEmpty()) break
-                } catch (e: Exception) {
-                    logError(e)
-                    // try next client
                 }
-            }
 
-            ytVideos[videoId] = builtLinks
+                // === Adaptive (DASH) streams ===
+                val adaptive = streamingData.optJSONArray("adaptiveFormats")
+                if (adaptive != null && adaptive.length() > 0) {
+                    val (videos, audios) = parseAdaptiveFormats(adaptive)
+                    if (videos.isNotEmpty()) {
+                        builtLinks.addAll(buildAdaptiveLinks(videos, audios, durationSeconds))
+                    }
+                }
+
+                // === Muxed/progressive streams (always present, capped at 360p/720p) ===
+                val muxed = streamingData.optJSONArray("formats")
+                if (muxed != null && muxed.length() > 0) {
+                    builtLinks.addAll(buildMuxedLinks(muxed))
+                }
+
+                if (builtLinks.isNotEmpty()) break
+            } catch (e: Exception) {
+                logError(e)
+                // try next client
+            }
         }
 
-        ytVideos[videoId]?.forEach { callback(it) }
-        ytVideosSubtitles[videoId]?.forEach { (lang, content) ->
+        builtLinks.forEach { callback(it) }
+        subtitles.forEach { (lang, content) ->
             try { subtitleCallback(newSubtitleFile(lang, content)) } catch (e: Exception) {}
         }
     }
@@ -407,24 +402,71 @@ open class YoutubeExtractor : ExtractorApi() {
         return out
     }
 
-    /** Extract captions from the player response. */
+    /**
+     * Extract captions + auto-translations from the player response.
+     *
+     * Uses the API's translationLanguages field (typically 10-30 real languages)
+     * instead of a hardcoded 158-language list (most of which 404).
+     */
     private fun extractSubtitles(root: JSONObject): List<Pair<String, String>> {
         val out = mutableListOf<Pair<String, String>>()
+        val seenUrls = mutableSetOf<String>()
         try {
-            val tracks = root.optJSONObject("captions")
-                ?.optJSONObject("playerCaptionsTracklistRenderer")
-                ?.optJSONArray("captionTracks") ?: return out
+            val tracklist = root.optJSONObject("captions")
+                ?.optJSONObject("playerCaptionsTracklistRenderer") ?: return out
+
+            val tracks = tracklist.optJSONArray("captionTracks") ?: return out
+            if (tracks.length() == 0) return out
+
+            // Pick the first English track as the base for auto-translation,
+            // falling back to the first track.
+            var baseTrack = tracks.optJSONObject(0)
+            for (i in 0 until tracks.length()) {
+                val t = tracks.optJSONObject(i) ?: continue
+                if (t.optString("languageCode") == "en") {
+                    baseTrack = t
+                    break
+                }
+            }
+            val baseUrl = baseTrack.optString("baseUrl").ifBlank { return out }
+            val baseLang = baseTrack.optString("languageCode", "original").lowercase()
+
+            // Add the actual caption tracks (real subtitles, not auto-translated)
             for (i in 0 until tracks.length()) {
                 val t = tracks.optJSONObject(i) ?: continue
                 val lang = t.optString("languageCode").ifBlank { "unknown" }
-                val baseUrl = t.optString("baseUrl").ifBlank { continue }
-                // Use vtt for the player, prefer it over ttml.
-                val vttUrl = if (baseUrl.contains("fmt=")) {
-                    baseUrl.replace(Regex("fmt=[^&]+"), "fmt=vtt")
+                val url = t.optString("baseUrl").ifBlank { continue }
+                val vttUrl = if (url.contains("fmt=")) {
+                    url.replace(Regex("fmt=[^&]+"), "fmt=vtt")
                 } else {
-                    "$baseUrl&fmt=vtt"
+                    "$url&fmt=vtt"
                 }
-                out.add(lang to vttUrl)
+                if (seenUrls.add(vttUrl)) {
+                    val name = t.optJSONObject("name")?.optString("simpleText") ?: lang
+                    out.add("$name ($lang)" to vttUrl)
+                }
+            }
+
+            // Add auto-translations using the API's translationLanguages field.
+            // This returns ~10-30 real languages that YouTube actually supports,
+            // instead of the old hardcoded 158-language list (most of which 404).
+            val translationLangs = tracklist.optJSONArray("translationLanguages")
+            if (translationLangs != null) {
+                for (i in 0 until translationLangs.length()) {
+                    val tl = translationLangs.optJSONObject(i) ?: continue
+                    val targetLang = tl.optString("languageCode").ifBlank { continue }
+                    if (targetLang.equals(baseLang, ignoreCase = true)) continue
+
+                    val autoUrl = if (baseUrl.contains("fmt=")) {
+                        baseUrl.replace(Regex("fmt=[^&]+"), "fmt=vtt") + "&tlang=$targetLang"
+                    } else {
+                        "$baseUrl&fmt=vtt&tlang=$targetLang"
+                    }
+                    if (seenUrls.add(autoUrl)) {
+                        val targetName = tl.optJSONObject("languageName")?.optString("simpleText") ?: targetLang
+                        out.add("$baseLang → $targetName" to autoUrl)
+                    }
+                }
             }
         } catch (e: Exception) {}
         return out

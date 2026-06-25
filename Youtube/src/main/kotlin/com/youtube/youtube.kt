@@ -45,6 +45,17 @@ class YoutubeProvider(
 
         private val homeShorts = mutableListOf<Episode>()
         private val searchShorts = mutableListOf<Episode>()
+
+        // Cap shorts lists to prevent unbounded memory growth on low-RAM devices.
+        // When the list exceeds the cap, the oldest half is removed.
+        private const val MAX_SHORTS = 100
+
+        private fun addShortCapped(list: MutableList<Episode>, episode: Episode) {
+            list.add(episode)
+            if (list.size > MAX_SHORTS) {
+                list.subList(0, MAX_SHORTS / 2).clear()
+            }
+        }
     }
 
     private var isSearchContext = false
@@ -82,13 +93,38 @@ class YoutubeProvider(
     }
 
     private val ytInterceptor = YouTubeInterceptor(sharedPref)
-    private val safariUserAgent =
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15"
 
     private var savedContinuationToken: String? = null
     private var savedVisitorData: String? = null
     private var savedApiKey: String? = null
     private var savedClientVersion: String? = null
+
+    // Cache INNERTUBE config values to avoid re-parsing them from HTML on
+    // every home page section load. These values are stable for days/weeks.
+    private var innerTubeConfigCache: InnerTubeConfig? = null
+    private data class InnerTubeConfig(val apiKey: String, val clientVersion: String, val visitorData: String?)
+
+    /**
+     * Extract and cache INNERTUBE_API_KEY, INNERTUBE_CLIENT_VERSION, and VISITOR_DATA
+     * from the watch page HTML. Only parses once per session — subsequent calls
+     * return the cached values.
+     */
+    private fun getInnerTubeConfig(html: String): InnerTubeConfig {
+        innerTubeConfigCache?.let { return it }
+        val config = InnerTubeConfig(
+            apiKey = findConfig(html, "INNERTUBE_API_KEY") ?: "",
+            clientVersion = findConfig(html, "INNERTUBE_CLIENT_VERSION") ?: "2.20240725.01.00",
+            visitorData = findConfig(html, "VISITOR_DATA")
+        )
+        if (config.apiKey.isNotBlank()) {
+            innerTubeConfigCache = config
+            // Also update the legacy fields for code that still uses them
+            savedApiKey = config.apiKey
+            savedClientVersion = config.clientVersion
+            savedVisitorData = config.visitorData
+        }
+        return config
+    }
 
     @Suppress("PropertyName")
     private data class PlayerResponse(@JsonProperty("streamingData") val streamingData: StreamingData?)
@@ -306,7 +342,7 @@ class YoutubeProvider(
                 val finalUrl = "$mainUrl/shorts/$videoId$contextTag"
 
                 if (currentList.none { it.data == finalUrl }) {
-                    currentList.add(newEpisode(finalUrl) {
+                    addShortCapped(currentList, newEpisode(finalUrl) {
                         this.name = title
                         this.posterUrl = poster
                         this.episode = episodeNum
@@ -382,7 +418,7 @@ class YoutubeProvider(
                     val finalUrl = "$mainUrl/shorts/$videoId$contextTag"
                     poster = "https://i.ytimg.com/vi/$videoId/oar2.jpg"
                     if (currentList.none { it.data == finalUrl }) {
-                        currentList.add(newEpisode(finalUrl) {
+                        addShortCapped(currentList, newEpisode(finalUrl) {
                             this.name = title
                             this.posterUrl = poster
                             this.episode = episodeNum
@@ -664,9 +700,6 @@ class YoutubeProvider(
         }
     }
 
-    private fun resetContinuation() {
-        savedContinuationToken = null
-    }
 
     private val continuationTokens = mutableMapOf<String, String>()
 
@@ -725,9 +758,8 @@ class YoutubeProvider(
 
                 val html = app.get(targetUrl, interceptor = ytInterceptor).text
 
-                savedApiKey = findConfig(html, "INNERTUBE_API_KEY")
-                savedClientVersion = findConfig(html, "INNERTUBE_CLIENT_VERSION") ?: "2.20240725.01.00"
-                savedVisitorData = findConfig(html, "VISITOR_DATA")
+                // Use cached INNERTUBE config — only parses HTML once per session
+                getInnerTubeConfig(html)
 
                 val initialData = extractYtInitialData(html)
                 if (initialData != null) {
@@ -1161,20 +1193,6 @@ class YoutubeProvider(
         }
     }
 
-    private val collectedShorts = mutableListOf<Episode>()
-
-    private fun addShortToCache(title: String, url: String, poster: String?) {
-
-        if (collectedShorts.none { it.data == url }) {
-            collectedShorts.add(
-                newEpisode(url) {
-                    this.name = title
-                    this.posterUrl = poster
-                    this.episode = collectedShorts.size + 1
-                }
-            )
-        }
-    }
 
     private fun safeGet(data: Any?, vararg keys: Any): Any? {
         var current = data
@@ -1629,35 +1647,6 @@ class YoutubeProvider(
         }
     }
 
-    private fun sha1(input: String): String {
-        val md = java.security.MessageDigest.getInstance("SHA-1")
-        val bytes = md.digest(input.toByteArray())
-        return bytes.joinToString("") { "%02x".format(it) }
-    }
-
-    private fun getSapisidHash(
-        sapisid: String,
-        origin: String = "https://www.youtube.com"
-    ): String {
-        val timestamp = (System.currentTimeMillis() / 1000).toString()
-        val msg = "$timestamp $sapisid $origin"
-        val hash = sha1(msg)
-        return "SAPISIDHASH ${timestamp}_$hash"
-    }
-    private fun extractYoutubeIdSafe(input: String): String {
-        return when {
-            input.contains("youtu.be/") ->
-                input.substringAfter("youtu.be/").substringBefore("?")
-
-            input.contains("watch?v=") ->
-                input.substringAfter("watch?v=").substringBefore("&")
-
-            input.contains("/shorts/") ->
-                input.substringAfter("/shorts/").substringBefore("?")
-
-            else -> input
-        }
-    }
 
 
 
@@ -1715,90 +1704,12 @@ class YoutubeProvider(
             com.youtube.YoutubeExtractor().getUrl(fullUrl, null, subtitleCallback, callback)
         }
 
-        try {
-            val apiUrl = "$mainUrl/youtubei/v1/player"
-
-            val payload = mapOf(
-                "context" to mapOf(
-                    "client" to mapOf(
-                        "clientName" to "WEB",
-                        "clientVersion" to "2.20240725.01.00",
-                        "hl" to "en",
-                        "gl" to "US"
-                    )
-                ),
-                "videoId" to videoId
-            )
-
-            val responseText = app.post(apiUrl, json = payload, interceptor = ytInterceptor).text
-
-            if (responseText.isNotBlank()) {
-                val root = JSONObject(responseText)
-                val captions = root.optJSONObject("captions")
-                val tracklist = captions?.optJSONObject("playerCaptionsTracklistRenderer")
-                val captionTracks = tracklist?.optJSONArray("captionTracks")
-
-                if (captionTracks != null && captionTracks.length() > 0) {
-                    val seenSubs = mutableSetOf<String>()
-
-                    var baseTrack = captionTracks.optJSONObject(0)
-                    var baseLangCode = ""
-
-                    for (i in 0 until captionTracks.length()) {
-                        val t = captionTracks.optJSONObject(i)
-                        val lang = t.optString("languageCode")
-                        if (lang == "en") {
-                            baseTrack = t
-                            break
-                        }
-                    }
-
-                    val baseUrl = baseTrack.optString("baseUrl", "")
-                    baseLangCode = baseTrack.optString("languageCode", "original").lowercase()
-
-                    for (i in 0 until captionTracks.length()) {
-                        val track = captionTracks.optJSONObject(i)
-                        val name = track.optJSONObject("name")?.optString("simpleText") ?: ""
-                        val lang = track.optString("languageCode")
-                        val url = track.optString("baseUrl")
-
-                        val vttUrl = "$url&fmt=vtt"
-                        if (!seenSubs.contains(vttUrl)) {
-                            seenSubs.add(vttUrl)
-                            val displayTitle = "$name ($lang)"
-                            subtitleCallback(SubtitleFile(displayTitle, vttUrl))
-                        }
-                    }
-
-                    if (baseUrl.isNotEmpty()) {
-                        val autoLangs = listOf(
-                            "aa","ab","af","ak","am","ar","as","ay","az","ba","be","bg","bho","bn","bo","br","bs","ca","ceb","co","crs",
-                            "cs","cy","da","de","dv","dz","ee","el","en","eo","es","et","eu","fa","fi","fil","fj","fo","fr","fy","ga",
-                            "gaa","gd","gl","gn","gu","gv","ha","haw","he","hi","hmn","hr","ht","hu","hy","id","ig","is","it","iu","iw",
-                            "ja","jv","ka","kha","kk","kl","km","kn","ko","kri","ku","ky","la","lb","lg","ln","lo","lt","lua","luo","lv",
-                            "mfe","mg","mi","mk","ml","mn","mr","ms","mt","my","ne","new","nl","no","nso","ny","oc","om","or","os","pa",
-                            "pam","pl","ps","pt","pt-BR","pt-PT","qu","rn","ro","ru","rw","sa","sd","sg","si","sk","sl","sm","sn","so","sq",
-                            "sr","ss","st","su","sv","sw","ta","te","tg","th","ti","tk","tn","to","tr","ts","tt","tum","ug","uk","ur","uz",
-                            "ve","vi","war","wo","xh","yi","yo","zh-Hans","zh-Hant","zu"
-                        )
-
-                        for (targetLang in autoLangs) {
-                            if (targetLang.equals(baseLangCode, true)) continue
-
-                            val autoUrl = "$baseUrl&fmt=vtt&tlang=$targetLang"
-
-                            if (!seenSubs.contains(autoUrl)) {
-                                seenSubs.add(autoUrl)
-                                val displayName = "$baseLangCode → $targetLang"
-                                subtitleCallback(SubtitleFile(displayName, autoUrl))
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) {
-
-        }
+        // Subtitles are already extracted by YoutubeExtractor.extractSubtitles()
+        // (called inside getUrl above). No second /youtubei/v1/player call needed.
+        // The old code made a duplicate API call here just for captions and
+        // generated ~158 fake auto-translation URLs (most of which 404).
+        // YoutubeExtractor now handles subtitles correctly using the API's
+        // translationLanguages field.
 
         return true
     }
@@ -1811,450 +1722,6 @@ class YoutubeProvider(
 
 
 
-    private suspend fun loadLinksAdvanced(
-        videoId: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val fullUrl = "https://www.youtube.com/watch?v=$videoId"
-
-
-        try {
-            val apiUrl = "$mainUrl/youtubei/v1/player"
-            val payload = mapOf(
-                "context" to mapOf(
-                    "client" to mapOf(
-                        "clientName" to "3",
-                        "clientVersion" to "19.29.35",
-                        "hl" to "en",
-                        "gl" to "US"
-                    )
-                ),
-                "videoId" to videoId
-            )
-
-            val responseText = app.post(apiUrl, json = payload, interceptor = ytInterceptor).text
-
-            if (responseText.isNotBlank()) {
-                val root = JSONObject(responseText)
-                val captions = root.optJSONObject("captions")
-                val tracklist = captions?.optJSONObject("playerCaptionsTracklistRenderer")
-                val captionTracks = tracklist?.optJSONArray("captionTracks")
-
-                if (captionTracks != null && captionTracks.length() > 0) {
-                    val seenSubs = mutableSetOf<String>()
-
-                    var baseTrack = captionTracks.optJSONObject(0)
-                    var baseLangCode = ""
-
-                    for (i in 0 until captionTracks.length()) {
-                        val t = captionTracks.optJSONObject(i)
-                        val lang = t.optString("languageCode")
-                        if (lang == "en") {
-                            baseTrack = t
-                            break
-                        }
-                    }
-
-                    val baseUrl = baseTrack.optString("baseUrl", "")
-                    baseLangCode = baseTrack.optString("languageCode", "original").lowercase()
-
-                    for (i in 0 until captionTracks.length()) {
-                        val track = captionTracks.optJSONObject(i)
-                        val name = track.optJSONObject("name")?.optString("simpleText") ?: ""
-                        val lang = track.optString("languageCode")
-                        val url = track.optString("baseUrl")
-
-                        val ttmlUrl = "$url&fmt=ttml"
-                        if (!seenSubs.contains(ttmlUrl)) {
-                            seenSubs.add(ttmlUrl)
-                            val displayTitle = "$name ($lang)"
-                            subtitleCallback(SubtitleFile(displayTitle, ttmlUrl))
-                        }
-                    }
-
-                    if (baseUrl.isNotEmpty()) {
-                        val autoLangs = listOf(
-                            "aa","ab","af","ak","am","ar","as","ay","az","ba","be","bg","bho","bn","bo","br","bs","ca","ceb","co","crs",
-                            "cs","cy","da","de","dv","dz","ee","el","en","eo","es","et","eu","fa","fi","fil","fj","fo","fr","fy","ga",
-                            "gaa","gd","gl","gn","gu","gv","ha","haw","he","hi","hmn","hr","ht","hu","hy","id","ig","is","it","iu","iw",
-                            "ja","jv","ka","kha","kk","kl","km","kn","ko","kri","ku","ky","la","lb","lg","ln","lo","lt","lua","luo","lv",
-                            "mfe","mg","mi","mk","ml","mn","mr","ms","mt","my","ne","new","nl","no","nso","ny","oc","om","or","os","pa",
-                            "pam","pl","ps","pt","pt-BR","pt-PT","qu","rn","ro","ru","rw","sa","sd","sg","si","sk","sl","sm","sn","so","sq",
-                            "sr","ss","st","su","sv","sw","ta","te","tg","th","ti","tk","tn","to","tr","ts","tt","tum","ug","uk","ur","uz",
-                            "ve","vi","war","wo","xh","yi","yo","zh-Hans","zh-Hant","zu"
-                        )
-
-                        for (targetLang in autoLangs) {
-                            if (targetLang.equals(baseLangCode, true)) continue
-
-                            val autoUrl = "$baseUrl&fmt=ttml&tlang=$targetLang"
-                            if (!seenSubs.contains(autoUrl)) {
-                                seenSubs.add(autoUrl)
-                                val displayName = "$baseLangCode → $targetLang"
-                                subtitleCallback(SubtitleFile(displayName, autoUrl))
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) {
-
-        }
-
-        return true
-    }
-
-
-
-    private suspend fun loadLinksClassic(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-
-
-
-            fun logLarge(tag: String, text: String) {
-                var i = 0
-                val max = 4000
-                while (i < text.length) {
-                    val end = minOf(i + max, text.length)
-
-                    i = end
-                }
-            }
-
-            fun addParamsToUrl(base: String, params: Map<String, String>): String {
-                val sep = if (base.contains("?")) "&" else "?"
-                return base + sep + params.map { "${it.key}=${URLEncoder.encode(it.value, "utf-8")}" }.joinToString("&")
-            }
-
-            val ALL_LANGS = listOf(
-                "aa","ab","af","ak","am","ar","as","ay","az","ba","be","bg","bho","bn","bo","br","bs","ca","ceb","co","crs",
-                "cs","cy","da","de","dv","dz","ee","el","en","eo","es","et","eu","fa","fi","fil","fj","fo","fr","fy","ga",
-                "gaa","gd","gl","gn","gu","gv","ha","haw","he","hi","hmn","hr","ht","hu","hy","id","ig","is","it","iu","iw",
-                "ja","jv","ka","kha","kk","kl","km","kn","ko","kri","ku","ky","la","lb","lg","ln","lo","lt","lua","luo","lv",
-                "mfe","mg","mi","mk","ml","mn","mr","ms","mt","my","ne","new","nl","no","nso","ny","oc","om","or","os","pa",
-                "pam","pl","ps","pt","pt-BR","pt-PT","qu","rn","ro","ru","rw","sa","sd","sg","si","sk","sl","sm","sn","so","sq",
-                "sr","ss","st","su","sv","sw","ta","te","tg","th","ti","tk","tn","to","tr","ts","tt","tum","ug","uk","ur","uz",
-                "ve","vi","war","wo","xh","yi","yo","zh-Hans","zh-Hant","zu"
-            )
-
-            try {
-
-
-                val videoId = data.extractYoutubeId() ?: run {
-                    if (data.length == 11 && data.matches(Regex("[A-Za-z0-9_-]{11}"))) {
-                        data
-                    } else {
-
-                        return false
-                    }
-                }
-
-                val safariHeaders = mapOf(
-                    "User-Agent" to safariUserAgent,
-                    "Accept-Language" to "en-US,en;q=0.5"
-                )
-                val watchUrl = "$mainUrl/watch?v=$videoId&hl=en"
-
-                val watchHtml = app.get(watchUrl, headers = safariHeaders).text
-
-                val ytcfgJsonString = try {
-                    val regex =
-                        Regex("""ytcfg\.set\(\s*(\{.*?\})\s*\)\s*;""", RegexOption.DOT_MATCHES_ALL)
-                    val m = regex.find(watchHtml)
-                    m?.groupValues?.getOrNull(1)
-                        ?: watchHtml.substringAfter("ytcfg.set(", "").substringBefore(");")
-                            .takeIf { it.trim().startsWith("{") }
-                } catch (e: Exception) {
-
-                    null
-                }
-
-                if (ytcfgJsonString.isNullOrBlank()) {
-
-                    return false
-                }
-
-                val apiKey = findConfig(ytcfgJsonString, "INNERTUBE_API_KEY")
-                val clientVersion =
-                    findConfig(ytcfgJsonString, "INNERTUBE_CLIENT_VERSION") ?: "2.20240725.01.00"
-                val visitorData = findConfig(ytcfgJsonString, "VISITOR_DATA")
-
-                if (apiKey.isNullOrBlank() || visitorData.isNullOrBlank()) {
-
-                    return false
-                }
-
-                val clientMap = mapOf(
-                    "hl" to "en",
-                    "gl" to "US",
-                    "clientName" to "WEB",
-                    "clientVersion" to clientVersion,
-                    "userAgent" to safariUserAgent,
-                    "visitorData" to visitorData,
-                    "platform" to "DESKTOP"
-                )
-                val finalContext = mapOf("client" to clientMap)
-                val payload = mapOf("context" to finalContext, "videoId" to videoId)
-
-                val apiUrl = "$mainUrl/youtubei/v1/player?key=$apiKey"
-
-                val postHeaders = mutableMapOf<String, String>()
-                postHeaders.putAll(safariHeaders)
-                postHeaders["Content-Type"] = "application/json"
-                postHeaders["X-Youtube-Client-Name"] = "WEB"
-                postHeaders["X-Youtube-Client-Version"] = clientVersion
-                if (!visitorData.isNullOrBlank()) postHeaders["X-Goog-Visitor-Id"] = visitorData
-
-
-
-
-                val cookieBuilder = StringBuilder()
-                val savedVis = sharedPref?.getString("VISITOR_INFO1_LIVE", null)
-                if (!savedVis.isNullOrBlank()) {
-                    cookieBuilder.append("VISITOR_INFO1_LIVE=$savedVis; ")
-                } else {
-                    cookieBuilder.append("VISITOR_INFO1_LIVE=fzYjM8PCwjw; ")
-                }
-
-                val authKeys = listOf("SID", "HSID", "SSID", "APISID", "SAPISID")
-                var sapisidVal: String? = null
-
-                authKeys.forEach { key ->
-                    val value = sharedPref?.getString(key, null)
-                    if (!value.isNullOrBlank()) {
-                        cookieBuilder.append("$key=$value; ")
-                        if (key == "SAPISID") sapisidVal = value
-                    }
-                }
-
-                cookieBuilder.append("PREF=f6=40000000&hl=en; CONSENT=YES+fx.456722336;")
-                postHeaders["Cookie"] = cookieBuilder.toString()
-
-                if (!sapisidVal.isNullOrBlank()) {
-                    try {
-                        val origin = "https://www.youtube.com"
-                        val hash = getSapisidHash(sapisidVal!!, origin)
-                        postHeaders["Authorization"] = hash
-                        postHeaders["X-Origin"] = origin
-                        postHeaders["Origin"] = origin
-                        postHeaders["X-Goog-AuthUser"] = "0"
-
-                    } catch (e: Exception) {
-
-                    }
-                }
-
-
-
-
-                val responseText = app.post(apiUrl, headers = postHeaders, json = payload).text
-                logLarge(name, "PLAYER API Response (first 55k chars):\n${responseText.take(55000)}")
-
-
-
-                try {
-                    val root = org.json.JSONObject(responseText)
-                    val captions = root.optJSONObject("captions")
-                    val tracklist = captions?.optJSONObject("playerCaptionsTracklistRenderer")
-                    val captionTracks = tracklist?.optJSONArray("captionTracks")
-
-                    if (captionTracks != null && captionTracks.length() > 0) {
-
-                        var preferredIndex = -1
-                        for (i in 0 until captionTracks.length()) {
-                            val track = captionTracks.optJSONObject(i) ?: continue
-                            val lang = track.optString("languageCode", "")
-                            if (lang.equals("en", ignoreCase = true)) {
-                                preferredIndex = i
-                                break
-                            }
-                        }
-                        if (preferredIndex == -1) preferredIndex = 0
-
-                        val baseTrack = captionTracks.optJSONObject(preferredIndex)
-                        val baseUrl = baseTrack.optString("baseUrl", "")
-                        val baseLang = baseTrack.optString("languageCode", "")
-                        val baseName = baseTrack.optJSONObject("name")?.optString("simpleText", baseLang) ?: baseLang
-
-                        val seenSubs = mutableSetOf<String>()
-
-                        val targets = ALL_LANGS.toMutableList()
-                        val trackTranslation = baseTrack.optJSONArray("translationLanguages")
-                        if (trackTranslation != null && trackTranslation.length() > 0) {
-                            targets.clear()
-                            for (i in 0 until trackTranslation.length()) {
-                                val t = trackTranslation.optJSONObject(i)
-                                val code = t?.optString("languageCode", "")
-                                if (!code.isNullOrBlank()) targets.add(code)
-                            }
-                        }
-
-                        val originals = listOf(
-                            addParamsToUrl(baseUrl, mapOf("fmt" to "vtt")),
-                            addParamsToUrl(baseUrl, mapOf("fmt" to "srt"))
-                        )
-                        for (u in originals) {
-                            if (u !in seenSubs) {
-                                seenSubs.add(u)
-                                subtitleCallback(SubtitleFile("$baseName ($baseLang)", u))
-                            }
-                        }
-
-                        for (tlang in targets) {
-                            if (tlang.equals(baseLang, ignoreCase = true)) continue
-
-                            val tvtt = addParamsToUrl(baseUrl, mapOf("fmt" to "vtt", "tlang" to tlang))
-                            val tsrt = addParamsToUrl(baseUrl, mapOf("fmt" to "srt", "tlang" to tlang))
-
-                            listOf(tvtt, tsrt).forEach { u ->
-                                if (u !in seenSubs) {
-                                    seenSubs.add(u)
-                                    subtitleCallback(SubtitleFile("$baseLang → $tlang", u))
-                                }
-                            }
-                        }
-
-                        for (i in 0 until captionTracks.length()) {
-                            if (i == preferredIndex) continue
-                            val tr = captionTracks.optJSONObject(i) ?: continue
-                            val url = tr.optString("baseUrl", "")
-                            val lang = tr.optString("languageCode", "")
-                            val name = tr.optJSONObject("name")?.optString("simpleText", lang) ?: lang
-
-                            val vtt = addParamsToUrl(url, mapOf("fmt" to "vtt"))
-                            val srt = addParamsToUrl(url, mapOf("fmt" to "srt"))
-
-                            for (u in listOf(vtt, srt)) {
-                                if (u !in seenSubs) {
-                                    seenSubs.add(u)
-                                    subtitleCallback(SubtitleFile("$name ($lang)", u))
-                                }
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-
-                }
-
-
-
-
-
-                val playerResponse = try {
-                    parseJson<PlayerResponse>(responseText)
-                } catch (e: Exception) {
-
-                    null
-                }
-
-                if (playerResponse == null) {
-
-                    return false
-                }
-
-                val hlsUrl = playerResponse.streamingData?.hlsManifestUrl
-                if (!hlsUrl.isNullOrBlank()) {
-
-                    callback(
-                        newExtractorLink(this.name, "M3U AUTO", hlsUrl) {
-                            this.referer = mainUrl
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-
-                    try {
-
-                        val masterM3u8 = app.get(hlsUrl, referer = mainUrl).text
-                        val lines = masterM3u8.lines()
-
-
-                        lines.filter { it.startsWith("#EXT-X-MEDIA") && it.contains("TYPE=SUBTITLES") }
-                            .forEach { line ->
-                                val subUri = parseM3u8Tag(line, "URI")
-                                val subName = parseM3u8Tag(line, "NAME")
-                                val subLang = parseM3u8Tag(line, "LANGUAGE")
-
-                                if (subUri != null) {
-                                    val displayName = subName ?: subLang ?: "Subtitle (HLS)"
-
-                                    subtitleCallback(SubtitleFile(displayName, subUri))
-                                }
-                            }
-
-
-                        lines.forEachIndexed { index, line ->
-                            if (line.startsWith("#EXT-X-STREAM-INF")) {
-                                val infoLine = line
-                                val urlLine =
-                                    lines.getOrNull(index + 1)?.takeIf { it.startsWith("http") }
-                                        ?: return@forEachIndexed
-
-                                val resolution = parseM3u8Tag(infoLine, "RESOLUTION")
-                                val resolutionHeight = resolution?.substringAfter("x")?.plus("p") ?: ""
-
-                                val audioId = parseM3u8Tag(infoLine, "YT-EXT-AUDIO-CONTENT-ID")
-                                val lang = audioId?.substringBefore('.')?.uppercase()
-
-                                val ytTags = parseM3u8Tag(infoLine, "YT-EXT-XTAGS")
-                                val audioType = when {
-                                    ytTags?.contains("dubbed") == true -> "Dubbed"
-                                    ytTags?.contains("original") == true -> "Original"
-                                    else -> null
-                                }
-
-                                val nameBuilder = StringBuilder()
-                                nameBuilder.append(resolutionHeight)
-                                if (lang != null) {
-                                    nameBuilder.append(" ($lang")
-                                    if (audioType != null) {
-                                        nameBuilder.append(" - $audioType")
-                                    }
-                                    nameBuilder.append(")")
-                                }
-
-                                val streamName = nameBuilder.toString().trim()
-
-                                if (streamName.isNotBlank()) {
-                                    callback(
-                                        newExtractorLink(this.name, streamName, urlLine) {
-                                            this.referer = mainUrl
-                                            this.quality = getQualityFromName(resolutionHeight)
-                                        }
-                                    )
-
-                                }
-                            }
-                        }
-                    } catch (e: Exception) {
-
-                    }
-
-                    return true
-                } else {
-
-                    return false
-                }
-
-            } catch (e: Exception) {
-
-                logError(e)
-                return false
-            }
-        }
-
-
-    private fun parseM3u8Tag(tag: String, key: String): String? {
-
-        val regex = Regex("""$key=("([^"]*)"|([^,]*))""")
-        val match = regex.find(tag)
-        return match?.groupValues?.get(2)?.ifBlank { null }
-            ?: match?.groupValues?.get(3)?.ifBlank { null }
-    }
 
     private fun String.extractYoutubeId(): String? {
         val regex = Regex("""(?:v=|\/videos\/|embed\/|youtu\.be\/|shorts\/)([A-Za-z0-9_-]{11})""")

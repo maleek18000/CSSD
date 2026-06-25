@@ -782,5 +782,17 @@ class YoutubeSettingsBottomSheet(private val sharedPref: SharedPreferences) : Bo
                 }
             }
         }
+
+        // Prevent WebView memory leak — without this, the Activity and native
+        // renderer threads are leaked every time the login dialog is opened.
+        override fun onDestroyView() {
+            try {
+                if (::webView.isInitialized) {
+                    (webView.parent as? android.view.ViewGroup)?.removeView(webView)
+                    webView.destroy()
+                }
+            } catch (_: Exception) {}
+            super.onDestroyView()
+        }
     }
 }
