@@ -1,7 +1,10 @@
 package com.lagradost.cloudstream3.ar.youtube
 
 import org.json.JSONObject
+import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.util.Log
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
@@ -1668,9 +1671,35 @@ class YoutubeProvider(
         val videoId = data.extractYoutubeId() ?: data
         val fullUrl = "https://www.youtube.com/watch?v=$videoId"
 
-
-
+        // === SmartTube default player (YouTube plugin only) ===
+        // If SmartTube is installed, launch it directly and cancel link loading.
+        // This makes one-click play open SmartTube instantly — no source picker,
+        // no internal player, no buffering issues.
+        // The CancellationException stops the link loading silently (no toast).
+        // This only affects the YouTube plugin — other plugins are unaffected.
         val context = AcraApplication.context
+        if (context != null) {
+            val smartTubePackage = getSmartTubePackage(context)
+            if (smartTubePackage != null) {
+                try {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(fullUrl)).apply {
+                        setPackage(smartTubePackage)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(intent)
+                    // Cancel the coroutine — this stops link loading silently.
+                    // ResultViewModel2 catches CancellationException and does nothing.
+                    throw kotlinx.coroutines.CancellationException("Launched SmartTube")
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e  // re-throw to propagate cancellation
+                } catch (e: Exception) {
+                    logError(e)
+                    // If launching SmartTube failed, fall through to internal player
+                }
+            }
+        }
+
+        // === Fallback: internal player (if SmartTube not installed or launch failed) ===
         val playerType = if (context != null) {
             val prefs = PreferenceManager.getDefaultSharedPreferences(context)
             prefs.getString("youtube_player_type", "advanced")
@@ -2230,6 +2259,29 @@ class YoutubeProvider(
     private fun String.extractYoutubeId(): String? {
         val regex = Regex("""(?:v=|\/videos\/|embed\/|youtu\.be\/|shorts\/)([A-Za-z0-9_-]{11})""")
         return regex.find(this)?.groupValues?.getOrNull(1)
+    }
+
+    /**
+     * Check if SmartTube is installed and return its package name.
+     * Supports three flavors: stable, beta, fdroid.
+     * Returns null if none are installed.
+     */
+    private fun getSmartTubePackage(context: android.content.Context): String? {
+        val packages = listOf(
+            "org.smarttube.stable",
+            "org.smarttube.beta",
+            "app.smarttube.fdroid"
+        )
+        val pm = context.packageManager
+        for (pkg in packages) {
+            try {
+                pm.getPackageInfo(pkg, 0)
+                return pkg
+            } catch (e: PackageManager.NameNotFoundException) {
+                // not installed, try next
+            }
+        }
+        return null
     }
 }
 
