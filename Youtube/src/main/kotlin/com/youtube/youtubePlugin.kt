@@ -14,6 +14,14 @@ class YoutubeTokenPlugin: Plugin() {
 
         registerMainAPI(com.lagradost.cloudstream3.ar.youtube.YoutubeProvider(sharedPref))
 
+        // Register SmartTube as an external player option.
+        // When you long-press a YouTube video, "Play in SmartTube" appears
+        // in the menu (only if SmartTube is installed).
+        // Three flavors are registered; only the installed one(s) will show.
+        registerVideoClickAction(SmartTubeStableAction())
+        registerVideoClickAction(SmartTubeBetaAction())
+        registerVideoClickAction(SmartTubeFdroidAction())
+
         openSettings = { ctx ->
 
             val activity = ctx as? AppCompatActivity
@@ -25,25 +33,3 @@ class YoutubeTokenPlugin: Plugin() {
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
