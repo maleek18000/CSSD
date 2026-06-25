@@ -1661,23 +1661,24 @@ class YoutubeProvider(
         val fullUrl = "https://www.youtube.com/watch?v=$videoId"
 
         // === SmartTube default player (YouTube plugin only) ===
-        // If SmartTube is installed, launch it directly and cancel link loading.
-        // This makes one-click play open SmartTube instantly — no source picker,
-        // no internal player, no buffering issues.
-        // The CancellationException stops the link loading silently (no toast).
-        // This only affects the YouTube plugin — other plugins are unaffected.
+        // If SmartTube is installed, launch it directly using the vnd.youtube://
+        // scheme. This is the same scheme YouTube's own app uses — SmartTube
+        // receives the video ID directly and starts playback instantly, without
+        // having to load and parse the watch page (which was causing ~15s delay).
         val context = AcraApplication.context
         if (context != null) {
             val smartTubePackage = getSmartTubePackage(context)
             if (smartTubePackage != null) {
                 try {
-                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(fullUrl)).apply {
+                    // Use vnd.youtube:// scheme for instant playback.
+                    // Falls back to the watch URL if the scheme isn't supported.
+                    val launchUri = Uri.parse("vnd.youtube://$videoId")
+                    val intent = Intent(Intent.ACTION_VIEW, launchUri).apply {
                         setPackage(smartTubePackage)
                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     }
                     context.startActivity(intent)
                     // Cancel the coroutine — this stops link loading silently.
-                    // ResultViewModel2 catches CancellationException and does nothing.
                     throw kotlinx.coroutines.CancellationException("Launched SmartTube")
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e  // re-throw to propagate cancellation
